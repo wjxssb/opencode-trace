@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { Store } from './store.js';
-import { atomic, bytes, stable, hash, identity, callKey, locator, mutationPaths, canonical, overlaps, messageID, messageRole, unwrap } from './util.js';
+import { atomic, bytes, stable, hash, identity, callKey, locator, mutationPaths, canonical, overlaps, messageID, messageRole, messageContentFingerprint, unwrap } from './util.js';
 import { compactGuidance, compactions, saveCompact } from './compact.js';
 
 const NOTE_KINDS = ['fact', 'finding', 'decision', 'unresolved', 'handoff', 'correction'];
@@ -75,7 +75,10 @@ export class Trace {
       if (!id || !role) continue;
       // Persist only completed assistant messages, or admitted user messages.
       if (role === 'assistant' && !(row.time?.completed || row.info?.time?.completed || row.finish)) continue;
-      const key = stable([sid, id]);
+      // Distinct completed revisions of one message ID are separate evidence;
+      // identical content replays (including volatile envelope differences)
+      // dedupe through the content fingerprint.
+      const key = stable([sid, id, messageContentFingerprint(row)]);
       if (this.messageSeen.has(key)) continue;
       await this.store.record('message.persisted', { sessionID: sid, messageID: id, role, ...(row.agent ? { agent: row.agent } : {}) }, row);
       this.messageSeen.add(key);
@@ -141,7 +144,7 @@ export class Trace {
     const superseded = new Set(s.notes.flatMap(n => n.supersedes ?? []));
     const peers = [...this.store.sessions.values()].filter(p => p.sessionID !== sid).sort((a, b) => b.lastActivity - a.lastActivity || a.sessionID.localeCompare(b.sessionID));
     return { schema: 1, workspace: this.store.workspace, sessionID: sid, agent: s.agent ?? null, parentID: s.parentID ?? null,
-      current_intent: s.intent, observation: observation(s), unresolved: s.notes.filter(n => n.kind === 'unresolved' && !superseded.has(n.ref)).slice(-8),
+      current_intent: s.intent, intent_conflicts: (s.intent_conflicts ?? []).slice(-4), observation: observation(s), unresolved: s.notes.filter(n => n.kind === 'unresolved' && !superseded.has(n.ref)).slice(-8),
       notes: s.notes.filter(n => n.kind !== 'unresolved' && !superseded.has(n.ref)).slice(-8), compact: s.compact,
       recent: s.recent.filter(e => e.type === 'tool.after' && !e.tool?.startsWith('trace_')).slice(-8),
       advisories: s.conflicts.slice(-4).map(a => ({ ...a, peer_observations: a.peers.filter(id => id !== sid).map(id => ({ sessionID: id, ...observation(this.store.session(id)) })) })),
@@ -187,10 +190,17 @@ export class Trace {
     // The exact messages are durable message.persisted events above. Avoid
     // copying the cumulative ID prefix on every turn (quadratic storage).
     const event = await this.store.record('context.checkpoint', identity(e), {
-      messageCount: ids.length, messageIDsSha256: hash(stable(ids)), messageIDsTail: ids.slice(-8), recall
-    }, { recallBytes: bytes(recall) });
+      stage: 'prepared', messageCount: ids.length, messageIDsSha256: hash(stable(ids)), messageIDsTail: ids.slice(-8), recall
+    }, { stage: 'prepared', recallBytes: bytes(recall) });
     await atomic(path.join(this.store.root, 'recall', `${hash(e.sessionID)}.json`), stable({ ref: event.ref, text: recall }));
-    return recall;
+    // 'prepared' alone never proves the model saw this text; index.js records
+    // 'context.applied' only after the recall was actually appended to the
+    // host hook object.
+    return { recall, checkpoint: event.ref };
+  }
+  async markContextApplied(e, { recall, checkpoint }) {
+    await this.store.record('context.applied', identity(e),
+      { stage: 'hook_applied', checkpoint, recallBytes: bytes(recall) }, { stage: 'hook_applied', checkpoint });
   }
   async lifecycle(event) {
     const data = event.properties ?? event.data ?? {};

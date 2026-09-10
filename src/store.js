@@ -11,6 +11,12 @@ export class Store {
     this.workspace = workspace; this.base = root; this.warning = warning;
     this.sessions = new Map(); this.seen = new Set(); this.watchJobs = new Set();
     this.watchRefs = new Set(); this.maxWatchJobs = 16; this.missedWatchEvents = 0;
+    // Completed tool calls, rebuilt from every ingested tool.after event.
+    // Terminal evidence must not depend on the bounded pending display window:
+    // a late out-of-order tool.before (watch overflow, reconcile batch order)
+    // must never reopen a finished call. callKeys are 64-hex digests, not
+    // outputs, so the in-memory set stays small for realistic sessions.
+    this.terminalCalls = new Set();
   }
   async init() {
     this.workspace = await canonical(this.workspace);
@@ -86,7 +92,7 @@ export class Store {
     }
   }
   session(id) {
-    if (!this.sessions.has(id)) this.sessions.set(id, { sessionID: id, recent: [], notes: [], conflicts: [], pending: {}, compact: null, intent: null, lastActivity: 0 });
+    if (!this.sessions.has(id)) this.sessions.set(id, { sessionID: id, recent: [], notes: [], conflicts: [], intent_conflicts: [], pending: {}, compact: null, intent: null, lastActivity: 0 });
     return this.sessions.get(id);
   }
   async blob(value, encoding = 'json') {
@@ -142,17 +148,35 @@ export class Store {
     if (!sid) return;
     const s = this.session(sid), item = { ref: event.ref, type: event.type, at: event.at, tool: event.tool, status: event.status, source: event.source, outputs: event.outputs };
     s.recent = keep(s.recent, item, 32);
-    if (event.at >= s.lastActivity) {
-      Object.assign(s, event.host); s.lastActivity = event.at;
+    // Deterministic precedence: observation time first, then the content-hash
+    // ref as an explicit tie-break (same pattern as compaction ordering).
+    // Arrival order is never treated as causality, so out-of-order watch,
+    // reconcile batches and restarts converge to the identical projection.
+    if (!s.identityRef || event.at > s.lastActivity || (event.at === s.lastActivity && event.ref.localeCompare(s.identityRef) > 0)) {
+      Object.assign(s, event.host); s.lastActivity = event.at; s.identityRef = event.ref;
     }
     if (event.type === 'trace.note') s.notes = keep(s.notes, { ...item, ...event.note }, 64);
-    if (event.type === 'trace.intent' && event.at >= (s.intent?.at ?? 0)) s.intent = { ...item, ...event.intent };
-    if (event.type === 'tool.before') {
-      // after can arrive first through filesystem watch; never reopen a terminal call.
-      const terminal = s.pending[event.callKey]?.terminal;
-      if (!terminal) s.pending[event.callKey] = { ...item, paths: event.paths, callKey: event.callKey };
+    if (event.type === 'trace.intent') {
+      const cur = s.intent;
+      // Same-millisecond intents are concurrent declarations with no provable
+      // order: keep the conflict visible instead of silently collapsing them,
+      // and never claim the tie-break is a semantic "latest decision".
+      if (cur && cur.at === event.at && cur.ref !== event.ref) {
+        const refs = [event.ref, cur.ref].sort();
+        s.intent_conflicts = keep(s.intent_conflicts, { ref: refs.join('~'), at: event.at, refs }, 8);
+      }
+      if (!cur || event.at > cur.at || (event.at === cur.at && event.ref.localeCompare(cur.ref) > 0)) s.intent = { ...item, ...event.intent };
     }
-    if (event.type === 'tool.after') s.pending[event.callKey] = { terminal: true, at: event.at };
+    if (event.type === 'tool.before') {
+      // after can arrive first through filesystem watch or reconcile batches;
+      // never reopen a terminal call. Terminal evidence is rebuilt from every
+      // ingested tool.after and outlives the bounded pending display window.
+      if (!s.pending[event.callKey]?.terminal && !this.terminalCalls.has(event.callKey)) s.pending[event.callKey] = { ...item, paths: event.paths, callKey: event.callKey };
+    }
+    if (event.type === 'tool.after') {
+      this.terminalCalls.add(event.callKey);
+      s.pending[event.callKey] = { terminal: true, at: event.at };
+    }
     // Completed entries are only replay guards; retain a bounded window, not outputs.
     const completed = Object.entries(s.pending).filter(([, v]) => v.terminal).sort((a, b) => b[1].at - a[1].at);
     for (const [key] of completed.slice(128)) delete s.pending[key];
@@ -166,7 +190,7 @@ export class Store {
       if (!s.compact || a > b || (a === b && candidate.host_message_id.localeCompare(s.compact.host_message_id) > 0)) s.compact = candidate;
     }
     if (event.type === 'session.lifecycle') {
-      if (event.at >= (s.observation?.at ?? 0)) {
+      if (!s.observation || event.at > s.observation.at || (event.at === s.observation.at && event.ref.localeCompare(s.observation.ref) > 0)) {
         s.lifecycle = event.lifecycle;
         s.observation = { lifecycle: event.lifecycle, at: event.at, ref: event.ref, hostEventID: event.hostEventID ?? null };
       }

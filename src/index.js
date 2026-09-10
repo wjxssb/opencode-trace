@@ -12,8 +12,13 @@ export default {
     };
     await register('prompt', () => ctx.session.hook('prompt', e => trace.safe('prompt', () => trace.prompt(e))));
     await register('context', () => ctx.session.hook('context', async e => {
-      const text = await trace.safe('context', () => trace.context(e));
-      if (text && Array.isArray(e.system)) e.system.push({ type: 'text', text });
+      const out = await trace.safe('context', () => trace.context(e));
+      if (out?.recall && Array.isArray(e.system)) {
+        e.system.push({ type: 'text', text: out.recall });
+        // Evidence that the recall was actually appended to this hook object,
+        // made durable before the host dispatches the model request.
+        await trace.safe('context.applied', () => trace.markContextApplied(e, out));
+      }
     }));
     await register('before', () => ctx.tool.hook('execute.before', e => trace.safe('before', () => trace.before(e))));
     await register('after', () => ctx.tool.hook('execute.after', e => trace.safe('after', () => trace.after(e))));

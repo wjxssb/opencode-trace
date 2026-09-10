@@ -21,6 +21,24 @@ export const messageRole = m => m?.role ?? m?.info?.role ?? (['user', 'assistant
 export const textFromMessage = m => typeof m?.text === 'string' ? m.text : typeof m?.content === 'string' ? m.content :
   (m?.parts ?? m?.content ?? m?.info?.parts ?? []).filter(p => p?.type === 'text').map(p => p.text ?? '').join('');
 
+// V2 messages carry no revision field (Session.Message has time only), so
+// observed versions of one message ID are told apart by a stable content
+// projection. Volatile envelope fields (time, metadata, providerState, cost,
+// tokens, snapshot) never create a false revision, and identical replays keep
+// the same fingerprint.
+export function messageContentFingerprint(row) {
+  const rawParts = [row?.parts, row?.info?.parts, row?.content].find(Array.isArray) ?? [];
+  const parts = rawParts.filter(p => p && typeof p === 'object').map(p => ({
+    type: p.type ?? null, id: p.id ?? null, name: p.name ?? null, text: p.text ?? null,
+    tool: p.tool ?? null, callID: p.callID ?? null, state: p.state === undefined ? null : p.state,
+  }));
+  return hash(stable({
+    role: messageRole(row), text: textFromMessage(row) ?? null,
+    files: row?.files ?? null, agents: row?.agents ?? null, skills: row?.skills ?? null,
+    agent: row?.agent ?? null, finish: row?.finish ?? null, parts,
+  }));
+}
+
 // Resolve existing ancestors too, so two new files under a symlinked directory match.
 export async function canonical(filename) {
   const absolute = path.resolve(filename);
