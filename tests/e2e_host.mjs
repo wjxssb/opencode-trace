@@ -154,18 +154,25 @@ try {
   ];
   await fs.writeFile(controlPath, JSON.stringify({ ...cases, orchestrate: { operations: [
     { name: 'trace_plan', arguments: { steps: planSteps } },
-  ] }, step: {} }));
+  ] }, step: { operations: [
+    { name: 'trace_step_result', arguments: { status: 'success', summary: 'examination finished as instructed' } },
+  ] } }));
   await promptAndSettle(A.id, 'TRACE_CASE=orchestrate run the plan, then finish.');
   store = await openStore();
   const stepRows = [...store.index.values()].filter(e => e.type === 'trace.step');
   const stepStates = await Promise.all(stepRows.map(async r => ({ ...(JSON.parse((await store.readBlob(r.payloadRef)).toString())), ref: r.ref, at: r.at })));
-  const succeeded = stepStates.filter(s => s.state === 'succeeded');
-  check('C: three native steps succeeded', succeeded.length === 3, `states: ${stepStates.map(s => s.state).join(',')}`);
-  const joinRow = succeeded.find(s => s.step === 'join');
+  // settled != success: the turn finishing is execution evidence only; the
+  // outcome exists because each worker submitted a structured trace_step_result.
+  const settled = stepStates.filter(s => s.state === 'settled');
+  const workerGood = settled.filter(s => s.outcome === 'worker_reported_success');
+  check('C: three native steps settled', settled.length === 3, `states: ${stepStates.map(s => `${s.state}:${s.outcome ?? '-'}`).join(',')}`);
+  check('C: all three outcomes are worker-reported success (never inferred from the turn)', workerGood.length === 3);
+  check('C: worker result evidence recorded per step', [...store.index.values()].filter(e => e.type === 'trace.step.result').length === 3);
+  const joinRow = workerGood.find(s => s.step === 'join');
   const scanStarted = stepStates.find(s => s.step === 'scan' && s.state === 'started');
   const joinStarted = stepStates.find(s => s.step === 'join' && s.state === 'started');
-  check('C: join ran after its dependencies', joinRow && scanStarted && joinStarted && joinStarted.at >= scanStarted.at);
-  check('C: native bindings recorded', succeeded.every(s => typeof s.sessionID === 'string' && s.sessionID.startsWith('ses')));
+  check('C: join ran only after worker-reported-success dependencies', joinRow && scanStarted && joinStarted && joinStarted.at >= scanStarted.at);
+  check('C: native bindings recorded', settled.every(s => typeof s.sessionID === 'string' && s.sessionID.startsWith('ses')));
   const sessionsAfterFirst = (await api('GET', '/api/session')).data?.length ?? 0;
   check('C: three child sessions created natively', sessionsAfterFirst - sessionsBefore === 3, `${sessionsAfterFirst - sessionsBefore}`);
   await promptAndSettle(A.id, 'TRACE_CASE=orchestrate run the same plan again, then finish.');
@@ -177,8 +184,14 @@ try {
   // denied by its real host agent permissions, and trace never records a
   // successful edit for it.
   await fs.writeFile(controlPath, JSON.stringify({ ...cases,
-    edit_ok: { operations: [{ name: 'write', arguments: { path: 'made.txt', content: 'ok' } }] },
-    edit_deny: { operations: [{ name: 'write', arguments: { path: 'blocked.txt', content: 'nope' } }] },
+    edit_ok: { operations: [
+      { name: 'write', arguments: { path: 'made.txt', content: 'ok' } },
+      { name: 'trace_step_result', arguments: { status: 'success', summary: 'file created as instructed' } },
+    ] },
+    edit_deny: { operations: [
+      { name: 'write', arguments: { path: 'blocked.txt', content: 'nope' } },
+      { name: 'trace_step_result', arguments: { status: 'failure', summary: 'the requested write was denied; the task did not happen' } },
+    ] },
     orchestrate_roles: { operations: [
       { name: 'trace_plan', arguments: { steps: [
         { id: 'writer', text: 'TRACE_CASE=edit_ok create the file, then finish.', agent: 'build' },
@@ -193,10 +206,16 @@ try {
     if (e.type === 'trace.plan') plans.push(data);
     if (e.type === 'trace.step' && data.agent) roleSteps.push(data);
   }
-  const writerStep = roleSteps.find(s => s.step === 'writer' && s.state === 'succeeded');
-  const readerStep = roleSteps.find(s => s.step === 'reader' && s.state === 'succeeded');
+  const writerStep = roleSteps.find(s => s.step === 'writer' && s.state === 'settled');
+  const readerStep = roleSteps.find(s => s.step === 'reader' && s.state === 'settled');
   check('D: agent-bound steps bound real host agents', !!writerStep && !!readerStep && readerStep.agent === 'reviewer' && writerStep.agent === 'build',
     `writer:${writerStep?.agent ?? 'missing'} reader:${readerStep?.agent ?? 'missing'}`);
+  // The audit's anti-example closed: the reviewer's turn settles normally,
+  // but the worker itself reports the denied task as a failure. Native tool
+  // denial and DAG task success are never conflated again.
+  check('D: worker-reported outcome splits turn settledness from task success',
+    writerStep?.outcome === 'worker_reported_success' && readerStep?.outcome === 'worker_reported_failure',
+    `writer:${writerStep?.outcome ?? '-'} reader:${readerStep?.outcome ?? '-'}`);
   const editOutcomes = [];
   for (const e of store.index.values()) {
     if (e.type !== 'tool.after' || e.tool !== 'write') continue;

@@ -4,7 +4,7 @@ import * as fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { Store } from '../src/store.js';
-import { Trace } from '../src/trace.js';
+import { Trace, DEEP_CHUNK_BYTES } from '../src/trace.js';
 import { atomic, stable } from '../src/util.js';
 
 async function fixture(t) {
@@ -153,6 +153,70 @@ test('P5.1: deep scan is chunk-bounded - a huge blob cannot bypass the byte budg
   const exact = await trace.store.expand(page2.hits[0].blob_ref, page2.hits[0].byte_offset, 64);
   assert.ok(exact.exact_utf8.startsWith('CHUNKED-NEEDLE-END'), 'exact bytes at the reported offset');
   assert.ok(page2.coverage.deep_scan.scanned_bytes <= 2 * 1024 * 1024 + 262200, 'second page stays chunk-bounded too');
+});
+
+test('P5.2: deep cursor stores the consumed prefix - no byte range falls between two pages', async t => {
+  const { trace } = await fixture(t);
+  const NEEDLE = 'GAPNEEDLE2097152';
+  // Probe: the payload embeds the content text after a fixed JSON prefix.
+  // Measure that prefix so the main event places the payload-blob needle
+  // exactly inside the forbidden gap [logical consumed, old physical cursor).
+  const probe = await trace.after({ ...host('s1', 'prb1'), tool: 'read', input: { filePath: 'prb.log' }, status: 'completed', result: { content: [{ type: 'text', text: `PREFIXPROBE-TOP${'Z'.repeat(5000)}` }] } });
+  const locate = async (ref, needleText) => {
+    const needle = Buffer.from(needleText, 'utf8');
+    let pos = 0, carry = Buffer.alloc(0), carryStart = 0;
+    for (;;) {
+      const { chunk, read } = await trace.store.readBlobRange(ref, pos, 262144);
+      if (read <= 0) return -1;
+      const window = Buffer.concat([carry, chunk.subarray(0, read)]);
+      const at = window.indexOf(needle);
+      if (at >= 0) return carryStart + at;
+      carryStart = pos + read - (needle.length - 1);
+      carry = window.subarray(window.length - (needle.length - 1));
+      pos += read;
+    }
+  };
+  const prefix = await locate(probe.payload.ref, 'PREFIXPROBE-TOP');
+  assert.ok(prefix > 0 && prefix < 4096, `payload prefix measured (${prefix})`);
+  // The needle lands at exactly 2097200 in the payload blob: inside the gap
+  // [2097152, 2097272) that a cursor storing physical read bytes would skip.
+  const textOffset = 2097200 - prefix;
+  const giant = 'X'.repeat(textOffset) + NEEDLE + 'Y'.repeat(200000);
+  const main = await trace.after({ ...host('s1', 'gap1'), tool: 'read', input: { filePath: 'gap.log' }, status: 'completed', result: { content: [{ type: 'text', text: giant }] } });
+  const payloadOffset = await locate(main.payload.ref, NEEDLE);
+  const budget = 2 * 1024 * 1024;
+  assert.equal(payloadOffset, 2097200, 'payload needle sits exactly at the boundary regression point');
+  assert.ok(payloadOffset >= budget && payloadOffset + NEEDLE.length <= budget + DEEP_CHUNK_BYTES, 'needle inside the consumed/physical gap region');
+  const page1 = await trace.find({ text: NEEDLE, deep: true, deep_budget_bytes: budget });
+  assert.equal(page1.hits.length, 0, 'page 1 legitimately misses: the needle starts past the last full window');
+  const decoded = JSON.parse(Buffer.from(page1.next_cursor, 'base64url').toString('utf8'));
+  assert.equal(decoded.skip[0].bytes, budget, 'the cursor stores the CONSUMED prefix, not physical read bytes');
+  const page2 = await trace.find({ text: NEEDLE, deep: true, deep_budget_bytes: budget, cursor: page1.next_cursor });
+  const payloadHit = page2.hits.find(h => h.blob_ref === main.payload.ref);
+  const outputHit = page2.hits.find(h => h.blob_ref === main.outputs[0].ref);
+  assert.ok(payloadHit, 'the gap-resident needle is found on page 2');
+  assert.ok(outputHit, 'the same needle in the exact output blob is found too');
+  assert.equal(payloadHit.byte_offset, 2097200, 'exact byte offset');
+  assert.equal(outputHit.byte_offset, textOffset, 'the raw text blob has no JSON prefix');
+  for (const hit of [payloadHit, outputHit]) {
+    const exact = await trace.store.expand(hit.blob_ref, hit.byte_offset, NEEDLE.length);
+    assert.equal(exact.exact_utf8, NEEDLE);
+    assert.equal(exact.sha256, hit.blob_ref === main.payload.ref ? main.payload.sha256 : main.outputs[0].sha256, 'full blob hash verified');
+  }
+}, { timeout: 120000 });
+
+test('P5.2: a needle straddling a chunk boundary is found exactly once per blob', async t => {
+  const { trace } = await fixture(t);
+  const BOUNDARY = 'BOUNDARY-NEEDLE';
+  const padded = 'A'.repeat(262130) + BOUNDARY + 'B'.repeat(1000);
+  const made = await trace.after({ ...host('s1', 'edge'), tool: 'read', input: { filePath: 'edge.log' }, status: 'completed', result: { content: [{ type: 'text', text: padded }] } });
+  const deep = await trace.find({ text: BOUNDARY, deep: true });
+  const outHits = deep.hits.filter(h => h.blob_ref === made.outputs[0].ref);
+  assert.equal(outHits.length, 1, 'overlap windows must not duplicate or drop a boundary-straddling match');
+  assert.equal(outHits[0].byte_offset, 262130);
+  const exact = await trace.store.expand(outHits[0].blob_ref, outHits[0].byte_offset, BOUNDARY.length);
+  assert.equal(exact.exact_utf8, BOUNDARY);
+  assert.equal(exact.sha256, made.outputs[0].sha256);
 });
 
 test('P2: index distinguishes no-result from catch-up; store failure degrades find without blocking tools', async t => {

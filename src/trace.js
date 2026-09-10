@@ -24,6 +24,7 @@ function chunkOccurrences(chunk, needle, text, max) {
   return out;
 }
 const DEEP_CHUNK = 262144;
+export const DEEP_CHUNK_BYTES = DEEP_CHUNK;
 
 const observation = session => ({
   intent_declared_status: session.intent?.status ?? null,
@@ -272,22 +273,25 @@ export class Trace {
     const hits = []; let scannedBytes = 0, scannedBlobs = 0, scannedEvents = 0, last = null, lastScanned = [], brokeEarly = false;
     // Bounded chunk scanning: each read is at most DEEP_CHUNK + needle length,
     // so a multi-gigabyte blob can never bypass the byte budget into RAM.
-    // Overlapping reads keep needle matches from straddling chunk boundaries.
+    // The cursor stores the CONSUMED prefix (chunk steps without the overlap
+    // tail): overlap bytes belong to the read window, never to consumed
+    // history, so no byte range can fall between two pages.
     const scanBlob = async (entry, blobRef) => {
-      let pos = skipOf(blobRef), scanned = 0;
+      const start = skipOf(blobRef);
+      let pos = start;
       while (scannedBytes < budget) {
         const want = DEEP_CHUNK + needle.length - 1;
         const { chunk, read } = await this.store.readBlobRange(blobRef, pos, want);
-        if (read <= 0) return { scanned, done: true };
-        scannedBytes += read; scanned += read;
+        if (read <= 0) return { consumed: pos - start, done: true };
+        scannedBytes += read;
         for (const local of chunkOccurrences(chunk, needle, text, 2)) {
           hits.push({ event_ref: entry.ref, blob_ref: blobRef, byte_offset: pos + local,
             snippet: chunk.subarray(Math.max(0, local - 48), local + needle.length + 96).toString('utf8') });
         }
         pos += Math.min(read, DEEP_CHUNK);
-        if (read < want) return { scanned, done: true };
+        if (read < want) return { consumed: pos - start, done: true };
       }
-      return { scanned, done: false };
+      return { consumed: pos - start, done: false };
     };
     for (const entry of entries) {
       // The cursor entry itself is always re-admitted; its already-scanned
@@ -302,9 +306,9 @@ export class Trace {
           if (scannedBytes >= budget) { complete = false; brokeEarly = true; break; }
           let outcome;
           try { outcome = await scanBlob(entry, blobRef); }
-          catch (error) { this.warning('find_deep', error); outcome = { scanned: 0, done: true }; }
+          catch (error) { this.warning('find_deep', error); outcome = { consumed: 0, done: true }; }
           scannedBlobs++;
-          lastScanned.push({ ref: blobRef, bytes: fromByte + outcome.scanned });
+          lastScanned.push({ ref: blobRef, bytes: fromByte + outcome.consumed });
           if (hits.length >= limit) { complete = false; brokeEarly = true; break; }
         }
         if (!complete) break;
@@ -372,6 +376,17 @@ export class Trace {
     if (!row) return null;
     return { entry: row, data: JSON.parse((await this.store.readBlob(row.payloadRef)).toString()) };
   }
+  threadExists(thread_id) {
+    for (const entry of this.store.index.values()) if (entry.type === 'trace.message' && entry.thread === thread_id) return true;
+    return false;
+  }
+  threadHasParticipant(thread_id, sessionID) {
+    for (const entry of this.store.index.values()) {
+      if (entry.type !== 'trace.message' || entry.thread !== thread_id) continue;
+      if (entry.sessionID === sessionID || (entry.recipients ?? []).includes(sessionID)) return true;
+    }
+    return false;
+  }
   async send(input = {}, host) {
     if (!host?.sessionID) throw new Error('Host session identity unavailable');
     const sender = host.sessionID;
@@ -385,7 +400,8 @@ export class Trace {
     const type = Trace.MAIL_TYPES.includes(input.type) ? input.type : 'note';
     const source_refs = input.source_refs ? await this.refs(input.source_refs) : [];
     const delivery = input.delivery === 'steer' ? 'steer' : 'queue';
-    let in_reply_to = null, thread_id = typeof input.thread_id === 'string' && /^thr_[a-f0-9]{32}$/.test(input.thread_id) ? input.thread_id : null;
+    if (input.thread_id != null && (typeof input.thread_id !== 'string' || !/^thr_[a-f0-9]{32}$/.test(input.thread_id))) throw new Error('Invalid thread_id');
+    let in_reply_to = null, thread_id = typeof input.thread_id === 'string' ? input.thread_id : null;
     let proposal = null, proposalData = null, parentData = null;
     if (input.in_reply_to != null) {
       const parent = await this.resolveMail(String(input.in_reply_to));
@@ -412,14 +428,11 @@ export class Trace {
     if (proposalData && !proposalData.recipients.includes(sender)) throw new Error('Only an addressee of the proposal may accept, reject or counter it');
     if ((type === 'accept' || type === 'reject' || type === 'counter') && !proposal) throw new Error(`${type} requires an explicit proposal reference`);
     if (thread_id) {
-      const threadRows = this.store.findEntries({ thread: thread_id, type: 'trace.message' }, null, 256);
-      if (!threadRows.length) throw new Error('Unknown thread_id in this workspace');
-      // Joining an existing thread requires existing membership: the sender
-      // must already be a participant (root sender or addressee) of it.
-      if (in_reply_to || input.thread_id != null) {
-        const member = threadRows.some(r => r.sessionID === sender || (r.recipients ?? []).includes(sender));
-        if (!member) throw new Error('Sender is not a participant of this thread');
-      }
+      if (!this.threadExists(thread_id)) throw new Error('Unknown thread_id in this workspace');
+      // Joining an existing thread requires existing membership, derived from
+      // any recorded message in the thread - not a bounded window, so
+      // late-joined participants keep their evidence.
+      if ((in_reply_to || input.thread_id != null) && !this.threadHasParticipant(thread_id, sender)) throw new Error('Sender is not a participant of this thread');
     }
     const message_id = `msgx_${hash(stable([sender, recipients, text, randomUUID()])).slice(0, 32)}`;
     thread_id = thread_id ?? `thr_${hash(stable([sender, [...recipients].sort(), randomUUID()])).slice(0, 32)}`;
@@ -437,74 +450,90 @@ export class Trace {
     return { ok: true, message_id, thread_id, message_ref: event.ref, receipts,
       evidence_levels: 'persisted always; host_admitted per delivery receipt; context_observed/recipient_ack/reply_recorded are derived in trace_inbox' };
   }
-  // Two-phase delivery WAL: the attempt is durable before the host call, the
-  // result after it. A crash in between leaves attempt-without-result, which
-  // is UNKNOWN and is never auto-retried (only reconciled from evidence).
+  // Two-phase delivery WAL with attempt ids: the attempt is durable before
+  // the host call, the result after it, and every result names the exact
+  // attempt it concludes. Only the newest attempt is authoritative, so a
+  // crash window can never be masked by an older retracted attempt.
   async deliverWithWal(recipient, envelope, delivery, ids, host) {
-    const attempt = await this.store.record('trace.delivery', identity(host), {
-      message_id: ids.message_id, thread_id: ids.thread_id, recipient, phase: 'attempt', state: 'attempted', method: `prompt:${delivery}`,
+    const attempt_id = randomUUID();
+    await this.store.record('trace.delivery', identity(host), {
+      message_id: ids.message_id, thread_id: ids.thread_id, recipient, attempt_id,
+      phase: 'attempt', state: 'attempted', method: `prompt:${delivery}`,
     }, { message_id: ids.message_id, thread_id: ids.thread_id, recipient });
     const result = await this.deliverTo(recipient, envelope, delivery);
     if (result.attempted === false) {
-      // Nothing reached the host: the attempt record is retracted as
-      // never-attempted so a later sweep may deliver safely.
+      // Nothing reached the host: this attempt is retracted as never-started
+      // so a later sweep may deliver safely under a fresh attempt id.
       await this.store.record('trace.delivery', identity(host), {
-        message_id: ids.message_id, thread_id: ids.thread_id, recipient, phase: 'result', state: 'not_attempted', method: result.detail, inbox_id: null,
+        message_id: ids.message_id, thread_id: ids.thread_id, recipient, attempt_id,
+        phase: 'result', state: 'not_attempted', method: result.detail, inbox_id: null,
       }, { message_id: ids.message_id, thread_id: ids.thread_id, recipient });
-      return { recipient, state: 'unknown', delivery_ref: null };
+      return { recipient, state: 'unknown', delivery_ref: null, attempt_id };
     }
     const record = await this.store.record('trace.delivery', identity(host), {
-      message_id: ids.message_id, thread_id: ids.thread_id, recipient, phase: 'result', state: result.state, method: result.detail, inbox_id: result.inboxID ?? null,
+      message_id: ids.message_id, thread_id: ids.thread_id, recipient, attempt_id,
+      phase: 'result', state: result.state, method: result.detail, inbox_id: result.inboxID ?? null,
     }, { message_id: ids.message_id, thread_id: ids.thread_id, recipient });
-    return { recipient, state: result.state, delivery_ref: record.ref, ...(result.inboxID ? { host_inbox_id: result.inboxID } : {}) };
+    return { recipient, state: result.state, delivery_ref: record.ref, attempt_id, ...(result.inboxID ? { host_inbox_id: result.inboxID } : {}) };
   }
   // Resolve the durable delivery outcome for (message, recipient) from the
-  // attempt/result WAL. attempt-without-result is a crash window: UNKNOWN
-  // unless the recipient's own persisted transcript proves admission. A
-  // 'not_attempted' result voids its attempt: the send never reached the host
-  // and a later sweep may deliver safely.
+  // attempt/result WAL, pairing strictly by attempt_id. The newest attempt
+  // decides: result present -> that state; result not_attempted -> safely
+  // deliverable; result missing -> crash window (UNKNOWN unless the
+  // recipient's own persisted transcript proves admission).
   async deliveryOutcome(message_id, recipient, viewer = null) {
-    const rows = this.store.findEntries({ message: message_id, type: 'trace.delivery', recipient }, null, 64);
+    const rows = this.store.findEntries({ message: message_id, type: 'trace.delivery', recipient }, null, 128);
     if (!rows.length) return { state: 'missing_delivery_record' };
-    let attempt = null, result = null, voided = false;
+    const byAttempt = new Map();
+    let legacyAttempt = null, legacyResult = null;
     for (const row of rows) {
       try { const data = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
-        if (data.phase === 'attempt') attempt = { ...data, ref: row.ref, at: row.at };
-        else if (data.phase === 'result' && data.state === 'not_attempted') voided = true;
-        else if (data.phase === 'result') result = { ...data, ref: row.ref, at: row.at };
-        else if (data.phase === undefined) result = { ...data, ref: row.ref, at: row.at, legacy: true };
+        if (data.attempt_id) {
+          const slot = byAttempt.get(data.attempt_id) ?? { attempt: null, result: null, at: 0 };
+          if (data.phase === 'attempt') { slot.attempt = { ...data, ref: row.ref, at: row.at }; slot.at = Math.max(slot.at, row.at); }
+          else if (data.phase === 'result') slot.result = { ...data, ref: row.ref, at: row.at };
+          else slot.result = { ...data, ref: row.ref, at: row.at, legacy: true };
+          byAttempt.set(data.attempt_id, slot);
+        } else if (data.phase === 'attempt') legacyAttempt = { ...data, ref: row.ref, at: row.at };
+        else if (data.state === 'not_attempted') legacyAttempt = null; // retracted legacy attempt
+        else legacyResult = { ...data, ref: row.ref, at: row.at };
       } catch (error) { this.warning('trace_delivery', error); }
     }
-    if (result) return { state: result.state, delivery_ref: result.ref, host_inbox_id: result.inbox_id ?? null,
-      ...(result.method === 'reconciled:transcript' ? { reconciled: true } : {}) };
-    // A retracted attempt never reached the host: safe to (re)deliver later.
-    if (!attempt || voided) return { state: 'missing_delivery_record' };
-    // Crash window: the host call may already have succeeded. Reconcile from
-    // the strongest local evidence - the recipient session's own persisted
-    // admitted prompt containing this message id.
+    let newest = null;
+    for (const [id, slot] of byAttempt) if (slot.attempt && (!newest || slot.at > newest.at)) newest = slot;
+    if (!newest && (legacyAttempt || legacyResult)) newest = { attempt: legacyAttempt, result: legacyResult, at: legacyAttempt?.at ?? 0 };
+    if (!newest?.attempt) return { state: 'missing_delivery_record' };
+    const result = newest.result;
+    if (result) {
+      if (result.state === 'not_attempted') return { state: 'missing_delivery_record' };
+      return { state: result.state, delivery_ref: result.ref, host_inbox_id: result.inbox_id ?? null,
+        ...(result.method === 'reconciled:transcript' ? { reconciled: true } : {}) };
+    }
+    // Crash window on the newest attempt: the host call may already have
+    // succeeded. Reconcile from the strongest local evidence - the recipient
+    // session's own persisted admitted prompt containing this message id.
     const admitted = this.store.findEntries({ type: 'message.persisted', session: recipient, text: message_id }, null, 2);
     if (admitted.length && viewer) {
       const record = await this.store.record('trace.delivery', { sessionID: viewer }, {
-        message_id, thread_id: attempt.thread_id, recipient, phase: 'result', state: 'host_admitted',
-        method: 'reconciled:transcript', inbox_id: null,
-      }, { message_id, thread_id: attempt.thread_id, recipient });
+        message_id, thread_id: newest.attempt.thread_id, recipient, attempt_id: newest.attempt.attempt_id,
+        phase: 'result', state: 'host_admitted', method: 'reconciled:transcript', inbox_id: null,
+      }, { message_id, thread_id: newest.attempt.thread_id, recipient });
       return { state: 'host_admitted', delivery_ref: record.ref, host_inbox_id: null, reconciled: true };
     }
-    return { state: 'unknown_crash_window', attempt_ref: attempt.ref };
+    return { state: 'unknown_crash_window', attempt_ref: newest.attempt.ref };
   }
   async inbox(input = {}, host) {
     if (!host?.sessionID) throw new Error('Host session identity unavailable');
     const viewer = host.sessionID;
     await this.store.reconcile();
     const thread = typeof input.thread_id === 'string' && /^thr_[a-f0-9]{32}$/.test(input.thread_id) ? input.thread_id : null;
-    // Newest window: a growing mailbox must always surface recent mail.
-    const rows = this.store.findEntriesNewest(thread ? { type: 'trace.message', thread } : { type: 'trace.message' }, 96);
+    // Viewer-scoped newest window: other sessions' traffic must never push a
+    // participant's own mail out of the bounded view.
+    const rows = this.store.findEntriesNewest({ type: 'trace.message', ...(thread ? { thread } : {}), mailParticipant: viewer }, 96);
     const inbox = [], outbox = [];
     for (const row of rows) {
       const mail = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
       const sent = row.sessionID === viewer;
-      const involved = sent || (mail.recipients ?? []).includes(viewer);
-      if (!involved) continue;
       const acks = this.store.findEntries({ message: mail.message_id, type: 'trace.ack' }, null, 16).map(a => a.sessionID);
       const replies = this.store.findEntries({ reply_to: mail.message_id, type: 'trace.message' }, null, 16).map(r => r.ref);
       const observedRefs = this.store.findEntries({ type: 'message.persisted', session: viewer, text: mail.message_id }, null, 2).map(r => r.ref);
@@ -612,16 +641,22 @@ export class Trace {
       return true;
     };
     for (const s of steps) if (!visit(s.id)) throw new Error('Dependency cycle detected');
-    // All recorded terminal states are reused on resume. failed/unsupported
-    // are terminal too: a failed step may have had side effects, so automatic
-    // re-execution would risk duplicating them. Explicit retry_failed opts in
-    // to a fresh attempt while the old attempt evidence remains.
+    // All recorded terminal states are reused on resume - including settled
+    // steps whose worker reported failure or submitted nothing, and legacy
+    // succeeded rows (now re-read as settled/unknown). A failed step may have
+    // had side effects, so automatic re-execution would duplicate them.
+    // retry_failed opts in to a fresh attempt; old attempt evidence remains.
     const retryFailed = input.retry_failed === true;
     const previous = new Map();
     for (const row of this.store.findEntries({ type: 'trace.step', plan: plan_id }, null, 256)) {
       try { const data = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
-        const terminal = ['succeeded', 'cancelled'].includes(data.state) || (!retryFailed && ['failed', 'unsupported'].includes(data.state));
-        if (data.version === version && terminal) previous.set(data.step, { ...data, ref: row.ref });
+        let exec = data.state;
+        if (exec === 'succeeded') exec = 'settled'; // legacy rows predate outcome evidence
+        const outcome = exec === 'settled' ? (data.outcome ?? 'unknown') : null;
+        const reRunOnRetry = exec !== 'settled' || outcome !== 'worker_reported_success';
+        const terminal = ['settled', 'cancelled', 'transport_failed', 'unsupported', 'succeeded', 'failed'].includes(data.state)
+          && (!retryFailed || !reRunOnRetry);
+        if (data.version === version && terminal) previous.set(data.step, { ...data, state: exec, outcome, ref: row.ref });
       } catch (error) { this.warning('trace_plan', error); }
     }
     const planEvent = await this.store.record('trace.plan', identity(host), {
@@ -633,17 +668,19 @@ export class Trace {
     const runStep = async step => {
       const done = previous.get(step.id);
       if (done) {
-        results.push({ id: step.id, state: `already_${done.state}`, sessionID: done.sessionID ?? null, evidence_ref: done.ref, reused: true });
-        states.set(step.id, done.state);
+        const display = done.state === 'settled' ? `already_settled(${done.outcome ?? 'unknown'})` : `already_${done.state}`;
+        results.push({ id: step.id, execution: done.state, outcome: done.outcome ?? null, sessionID: done.sessionID ?? null, evidence_ref: done.ref, reused: true, state: display });
+        states.set(step.id, { execution: done.state, outcome: done.outcome ?? null });
         return;
       }
       const depStates = await Promise.all((step.depends_on ?? []).map(id => runners.get(id)));
-      if (depStates.some(s => s !== 'succeeded')) {
+      if (depStates.some(d => !(d?.execution === 'settled' && d?.outcome === 'worker_reported_success'))) {
         const record = await this.store.record('trace.step', identity(host), {
-          plan_id, version, step: step.id, state: 'cancelled', reason: 'dependency did not succeed',
+          plan_id, version, step: step.id, state: 'cancelled',
+          reason: 'dependency_not_successful: dependencies did not settle with worker-reported success',
         }, { plan_id, step: step.id });
-        results.push({ id: step.id, state: 'cancelled', evidence_ref: record.ref, reused: false });
-        states.set(step.id, 'cancelled');
+        results.push({ id: step.id, execution: 'cancelled', outcome: null, evidence_ref: record.ref, reused: false, state: 'cancelled' });
+        states.set(step.id, { execution: 'cancelled', outcome: null });
         return;
       }
       const sessionApi = this.ctx.session;
@@ -651,8 +688,8 @@ export class Trace {
         const record = await this.store.record('trace.step', identity(host), {
           plan_id, version, step: step.id, state: 'unsupported', reason: 'host client lacks native session primitives',
         }, { plan_id, step: step.id });
-        results.push({ id: step.id, state: 'unsupported', evidence_ref: record.ref, reused: false });
-        states.set(step.id, 'unsupported');
+        results.push({ id: step.id, execution: 'unsupported', outcome: null, evidence_ref: record.ref, reused: false, state: 'unsupported' });
+        states.set(step.id, { execution: 'unsupported', outcome: null });
         return;
       }
       if (step.agent !== undefined && typeof sessionApi.switchAgent !== 'function') {
@@ -660,38 +697,66 @@ export class Trace {
           plan_id, version, step: step.id, state: 'unsupported', reason: 'host client cannot bind a step agent (no switchAgent)',
           ...(step.agent ? { agent: step.agent } : {}),
         }, { plan_id, step: step.id });
-        results.push({ id: step.id, state: 'unsupported', evidence_ref: record.ref, reused: false });
-        states.set(step.id, 'unsupported');
+        results.push({ id: step.id, execution: 'unsupported', outcome: null, evidence_ref: record.ref, reused: false, state: 'unsupported' });
+        states.set(step.id, { execution: 'unsupported', outcome: null });
         return;
       }
-      const created = unwrap(await sessionApi.create({ title: `trace-plan ${plan_id.slice(5, 14)}/${step.id}` }));
-      const sid = created?.id ?? null;
-      if (step.agent !== undefined) await unwrap(await sessionApi.switchAgent({ sessionID: sid, agent: step.agent }));
-      await this.store.record('trace.step', identity(host), {
-        plan_id, version, step: step.id, state: 'started', sessionID: sid, native: 'session.create+prompt+wait',
-        ...(step.agent !== undefined ? { agent: step.agent } : {}),
-      }, { plan_id, step: step.id });
+      // Full attempt state machine: create, agent binding, start journal,
+      // prompt, wait, collect and worker-result resolution each have a phase,
+      // and every failure records its phase, the child session id and the
+      // attempt id, with best-effort cleanup. Each execution is a fresh
+      // attempt; old attempt evidence is never rewritten.
+      const attempt_id = randomUUID();
+      let phase = 'create', sid = null;
       try {
+        const created = unwrap(await sessionApi.create({ title: `trace-plan ${plan_id.slice(5, 14)}/${step.id}` }));
+        sid = created?.id ?? null;
+        if (step.agent !== undefined) { phase = 'bind_agent'; await unwrap(await sessionApi.switchAgent({ sessionID: sid, agent: step.agent })); }
+        phase = 'start';
+        await this.store.record('trace.step', identity(host), {
+          plan_id, version, step: step.id, state: 'started', sessionID: sid, attempt_id, native: 'session.create+prompt+wait',
+          ...(step.agent !== undefined ? { agent: step.agent } : {}),
+        }, { plan_id, step: step.id, worker: sid });
+        phase = 'prompt';
         await unwrap(await sessionApi.prompt({ sessionID: sid, text: step.text }));
+        phase = 'wait';
         await sessionApi.wait({ sessionID: sid });
+        phase = 'collect';
         const context = unwrap(await sessionApi.context({ sessionID: sid })) ?? [];
         const last = context.filter(m => messageRole(m) === 'assistant' && (m.time?.completed || m.finish)).at(-1) ?? null;
+        // A settled turn is not task success: only the worker's own
+        // structured trace.step.result decides the outcome. Identity comes
+        // from the child session binding, so the worker cannot report for
+        // another step.
+        phase = 'result';
+        const submittedRows = this.store.findEntries({ type: 'trace.step.result', session: sid }, null, 8);
+        let submitted = null;
+        for (const row of submittedRows) {
+          const data = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
+          if (data.plan_id === plan_id && data.step === step.id && data.attempt_id === attempt_id) submitted = { ...data, ref: row.ref };
+        }
+        const outcome = !submitted ? 'unknown'
+          : submitted.status === 'success' ? 'worker_reported_success'
+          : submitted.status === 'failure' ? 'worker_reported_failure' : 'unknown';
         const record = await this.store.record('trace.step', identity(host), {
-          plan_id, version, step: step.id, state: 'succeeded', sessionID: sid,
+          plan_id, version, step: step.id, state: 'settled', outcome, sessionID: sid, attempt_id,
           ...(step.agent !== undefined ? { agent: step.agent } : {}),
+          ...(submitted ? { result_ref: submitted.ref, worker_summary: (submitted.summary ?? '').slice(0, 512), worker_source_refs: submitted.source_refs ?? [] } : {}),
           evidence: { last_message_id: messageID(last) ?? null, output_preview: last ? textFromMessage(last).slice(0, 512) : null,
-            note: 'exact transcript is persisted as message.persisted events of the bound session' },
+            note: 'settled means the child turn finished; outcome carries task success only from the worker structured result' },
         }, { plan_id, step: step.id });
-        results.push({ id: step.id, state: 'succeeded', sessionID: sid, evidence_ref: record.ref, reused: false });
-        states.set(step.id, 'succeeded');
+        results.push({ id: step.id, execution: 'settled', outcome, sessionID: sid, attempt_id, evidence_ref: record.ref, reused: false, state: `settled(${outcome})` });
+        states.set(step.id, { execution: 'settled', outcome });
       } catch (error) {
         this.warning('trace_plan', error);
-        try { await sessionApi.interrupt?.({ sessionID: sid }); } catch {}
+        if (sid && phase !== 'create') { try { await sessionApi.interrupt?.({ sessionID: sid }); } catch {} }
+        const state = ['prompt', 'wait', 'collect', 'result'].includes(phase) ? 'transport_failed' : 'failed';
         const record = await this.store.record('trace.step', identity(host), {
-          plan_id, version, step: step.id, state: 'failed', sessionID: sid, error: String(error?.message ?? error).slice(0, 200),
+          plan_id, version, step: step.id, state, phase, sessionID: sid, attempt_id,
+          error: String(error?.message ?? error).slice(0, 200),
         }, { plan_id, step: step.id });
-        results.push({ id: step.id, state: 'failed', sessionID: sid, evidence_ref: record.ref, reused: false });
-        states.set(step.id, 'failed');
+        results.push({ id: step.id, execution: state, outcome: null, sessionID: sid, phase, attempt_id, evidence_ref: record.ref, reused: false, state: `${state}@${phase}` });
+        states.set(step.id, { execution: state, outcome: null });
       }
     };
     const runners = new Map();
@@ -701,10 +766,54 @@ export class Trace {
       if (!wave.length) throw new Error('Dependency deadlock');
       await Promise.all(wave.map(async step => { await runStep(step); runners.set(step.id, states.get(step.id)); pending.delete(step.id); }));
     }
-    const failed = results.some(r => ['failed', 'unsupported'].includes(r.state));
+    const unsettled = results.some(r => !(r.execution === 'settled' && r.outcome === 'worker_reported_success'));
     return { ok: true, plan_id, version, plan_ref: planEvent.ref, steps: results,
-      note: failed ? 'not every step succeeded; failed and unsupported steps are terminal on resume (retry_failed:true for an explicit new attempt)' : 'every step has recorded terminal evidence',
+      note: unsettled ? 'not every step has a worker-reported success; such steps are terminal on resume (retry_failed:true re-runs them explicitly)' : 'every step settled with worker-reported success',
+      semantics: 'execution settled means the child turn finished; task success requires the worker structured trace_step_result',
       parent_completion: 'plan acceptance never completes the parent task by itself' };
+  }
+  // Worker-submitted structured outcome for the plan step bound to this
+  // session. Identity and step come from the host binding, never from input,
+  // so a session can only report its own step. One attempt carries at most
+  // one outcome: identical replays dedupe to the first event, and a
+  // conflicting second claim is rejected rather than silently overwriting -
+  // last-arriver must never change task truth.
+  async stepResult(input = {}, host) {
+    if (!host?.sessionID) throw new Error('Host session identity unavailable');
+    if (!['success', 'failure'].includes(input.status)) throw new Error("status must be 'success' or 'failure'");
+    if (input.summary !== undefined && (typeof input.summary !== 'string' || bytes(input.summary) > 2048)) throw new Error('Invalid summary');
+    if (bytes(input) > 16384) throw new Error('Result too large');
+    const source_refs = input.source_refs ? await this.refs(input.source_refs) : [];
+    const summary = typeof input.summary === 'string' ? input.summary : '';
+    const bindings = this.store.findEntriesNewest({ type: 'trace.step', worker: host.sessionID }, 8);
+    let binding = null;
+    for (const row of bindings) {
+      try { const data = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
+        if (data.state === 'started' && data.sessionID === host.sessionID) { binding = { ...data, ref: row.ref }; break; }
+      } catch (error) { this.warning('trace_step_result', error); }
+    }
+    if (!binding) throw new Error('This session is not bound to any plan step');
+    const rows = this.store.findEntriesNewest({ type: 'trace.step.result', plan: binding.plan_id }, 16);
+    let existing = null;
+    for (const row of rows) {
+      try { const data = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
+        if (data.step === binding.step && data.attempt_id === binding.attempt_id) { existing = { ...data, ref: row.ref }; break; }
+      } catch (error) { this.warning('trace_step_result', error); }
+    }
+    if (existing) {
+      if (existing.status === input.status && (existing.summary ?? '') === summary) {
+        return { ok: true, plan_id: binding.plan_id, step: binding.step, status: input.status, result_ref: existing.ref,
+          deduplicated: true, note: 'identical replay of the recorded worker outcome; no new event' };
+      }
+      throw new Error(`Conflicting worker result: this attempt already recorded '${existing.status}' (ref ${existing.ref}); the first recorded claim stands and the conflict is visible, not overwritten`);
+    }
+    const event = await this.store.record('trace.step.result', identity(host), {
+      plan_id: binding.plan_id, version: binding.version, step: binding.step,
+      attempt_id: binding.attempt_id, worker_session: host.sessionID, binding_ref: binding.ref,
+      status: input.status, summary, source_refs, by: host.sessionID,
+    }, { plan_id: binding.plan_id, step: binding.step });
+    return { ok: true, plan_id: binding.plan_id, step: binding.step, status: input.status, result_ref: event.ref,
+      note: 'structured worker outcome recorded; settled-without-result stays outcome unknown' };
   }
   async lifecycle(event) {
     const data = event.properties ?? event.data ?? {};

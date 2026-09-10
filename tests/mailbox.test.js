@@ -205,6 +205,62 @@ test('P3: long-running mailbox - the newest messages stay visible and sweepable'
   assert.ok(swept.swept.delivered.every(d => sent.indexOf(d.message_id) >= 300 - 64), 'only the newest window was swept');
 }, { timeout: 180000 });
 
+test('P5.2: attempt_id pairing - an older retracted attempt cannot mask a newer crash window', async t => {
+  const { storeRoot } = await root(t);
+  const sender = await traceWith(storeRoot, {});
+  sender.store.session('s2');
+  const sent = await sender.send({ to: ['s2'], text: 'wal pairing probe' }, hostOf('s1'));
+  // Attempt #1: no host client -> retracted as not_attempted.
+  const outbox = await sender.inbox({ sweep: true }, hostOf('s1'));
+  assert.equal(outbox.outbox[0].deliveries[0].state, 'missing_delivery_record');
+  // Attempt #2: the host call succeeds and the process crashes before the
+  // result record is written. Only the attempt lands.
+  const healer = await traceWith(storeRoot, { prompt: async () => ({ data: { id: 'i1' } }) });
+  await healer.store.record('trace.delivery', { sessionID: 's1' }, {
+    message_id: sent.message_id, thread_id: sent.thread_id, recipient: 's2', attempt_id: 'attempt-second-00000000',
+    phase: 'attempt', state: 'attempted', method: 'prompt:queue', inbox_id: null,
+  }, { message_id: sent.message_id, thread_id: sent.thread_id, recipient: 's2' });
+  const outcome = await healer.deliveryOutcome(sent.message_id, 's2');
+  assert.equal(outcome.state, 'unknown_crash_window', 'the newest attempt is authoritative, not the older retraction');
+  const swept = await healer.inbox({ sweep: true }, hostOf('s1'));
+  assert.deepEqual(swept.swept.delivered, [], 'crash window is never auto-redelivered');
+  assert.equal(swept.swept.requires_manual_choice.length, 1);
+});
+
+test('P5.2: viewer-scoped inbox - other sessions traffic cannot push own mail out of view', async t => {
+  const { storeRoot } = await root(t);
+  const a = await traceWith(storeRoot, {});
+  a.store.session('b'); a.store.session('noise1');
+  const first = await a.send({ to: ['b'], text: 'the one unread message that matters' }, hostOf('s1'));
+  // 120 unrelated messages between other sessions, all newer.
+  const noise = await traceWith(storeRoot, {});
+  noise.store.session('noise1');
+  noise.store.session('noise2');
+  for (let i = 0; i < 120; i++) await noise.send({ to: ['noise1'], text: `noise ${i}` }, hostOf('s2', `n${i}`));
+  const b = await traceWith(storeRoot, {});
+  const inbox = await b.inbox({}, hostOf('b'));
+  const ids = inbox.inbox.map(m => m.message_id);
+  assert.ok(ids.includes(first.message_id), 'the only mail for b is visible despite newer unrelated traffic');
+  assert.equal(ids.length, 1);
+});
+
+test('P5.2: late thread joiners keep membership beyond any bounded window; malformed thread ids fail closed', async t => {
+  const { storeRoot } = await root(t);
+  const a = await traceWith(storeRoot, { prompt: async () => ({ data: { id: 'i1' } }) });
+  a.store.session('b'); a.store.session('c');
+  const root0 = await a.send({ to: ['b'], text: 'thread start', type: 'proposal' }, hostOf('s1'));
+  // 300 thread messages between the root and the late join.
+  for (let i = 0; i < 300; i++) await a.send({ to: ['b'], text: `filler ${i}`, in_reply_to: root0.message_id }, hostOf('s1', `f${i}`));
+  // c becomes a thread participant only at message 301 (addressed there).
+  await a.send({ to: ['c'], text: 'bringing c into the thread', in_reply_to: root0.message_id }, hostOf('s1', 'late'));
+  const c = await traceWith(storeRoot, { prompt: async () => ({ data: { id: 'ic' } }) });
+  c.store.session('a');
+  const reply = await c.send({ to: ['a'], text: 'late joiner replies', in_reply_to: root0.message_id }, hostOf('c'));
+  assert.equal(reply.thread_id, root0.thread_id, 'late joiner keeps membership from the full thread history');
+  // Malformed thread ids fail closed instead of silently opening a new thread.
+  await assert.rejects(a.send({ to: ['b'], text: 'typo thread', thread_id: 'thr_typo' }, hostOf('s1', 't1')), /Invalid thread_id/);
+});
+
 test('P3: failed host admission is terminal and visible; delivery refusal leaves native tools intact', async t => {
   const { storeRoot } = await root(t);
   const rejector = await traceWith(storeRoot, { prompt: async () => { throw Object.assign(new Error('session busy'), { code: 'SESSION_BUSY' }); } });
