@@ -83,7 +83,7 @@ def verify(root):
     assert state['notes'] and restart['sourceRef'] in state['compact']['refs']
     expanded = json.loads(output(next(c for c in recover if c['tool'] == 'trace_expand')))
     assert 'PATCH_BEFORE_94317' in expanded['exact_utf8']
-    recovery_wires = [w for w in wires if w['case'] == 'restart_recover']
+    recovery_wires = [w for w in wires if w['case'] in ['restart_recover', 'restart_release']]
     assert any(state['compact']['ref'] in str(w['recalls']) for w in recovery_wires)
     passed('process_restart_and_compact_source_recovery', restart)
     recall_sizes = [e['recallBytes'] for e in events if e['type'] == 'context.checkpoint']
@@ -93,6 +93,16 @@ def verify(root):
     assert any(c['tool'] == 'shell' and output(c) == 'QWEN27B_TRACE_NATIVE_OK' for c in qwen)
     assert all(c['state']['status'] == 'completed' for c in qwen)
     passed('qwen_27b_native_trace_smoke')
+    qwen_final = calls('qwen-final')
+    expected = {'read', 'shell', 'write', 'edit', 'execute', 'subagent', 'trace_status', 'trace_note', 'trace_intent', 'trace_expand'}
+    assert expected <= {c['tool'] for c in qwen_final}
+    assert all(c['state']['status'] == 'completed' for c in qwen_final)
+    passed('qwen_27b_complete_release_toolchain')
+    rollback = json.loads((root / 'isolated-rollback-final.json').read_text())
+    assert rollback['exact'] and rollback['historyPreserved']
+    assert 'opencode-trace' not in (root / 'rollback-plugins.txt').read_text()
+    assert all(c['state']['status'] == 'completed' for c in calls('rollback-native'))
+    passed('actual_host_rollback_and_native_smoke')
     # Verify every referenced payload and standalone immutable event body.
     count = 0
     for folder in ['qualified-store', 'scripted-store']:

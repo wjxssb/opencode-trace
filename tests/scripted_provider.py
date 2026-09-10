@@ -37,7 +37,7 @@ def serve(port, control, receipts):
             next_op = next(((i, op) for i, op in enumerate(operations) if f'call_{case_id}_{i}' not in outputs), None)
             last_user = next((m.get('content', '') for m in reversed(messages) if m.get('role') == 'user'), '')
             last_user = last_user if isinstance(last_user, str) else json.dumps(last_user)
-            compacting = '## Objective' in last_user or 'summary template' in last_user or ('summary' in last_user.lower() and 'TRACE_CASE=' not in last_user)
+            compacting = last_user.lstrip().startswith(('You MUST summarize the conversation above', 'Update the existing checkpoint', 'The previous response did not fill in the required summary template'))
             if not names or compacting:
                 delta = {'role': 'assistant', 'content': case.get('compact', 'Native fixture summary. Completed native operations and retained source history.')}
                 finish = 'stop'
