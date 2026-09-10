@@ -16,3 +16,5 @@ Excluded: Rust kernel, Python MCP bridge, process launcher, authority socket and
 The previous installed integration was separately uninstalled at the user's explicit request before this task. Its source, historical database/CAS and installation backups remain under the existing user paths and `/home/frank/audit/codewhale-uninstalled-20260909`. This project does not access them.
 
 Local host adaptation: OpenCode V2 `0.0.0-beta-19296` resolves a configured local plugin directory via `server.js` or `index.js`, rather than using this package's `exports` field. `server.js` is a one-line entrypoint for that API. The donor targeted an older beta; qualification here applies to the actual installed beta, without replacing or patching it.
+
+This host publishes `session.compaction.ended` for native V2 compaction; the observer handles it as well as the legacy `session.compacted` name. Its dispatcher reuses the outer call ID for inner tool hooks, so pairing also includes the trusted tool name and input. Direct tool output objects are JSON-normalized before the host validates them.

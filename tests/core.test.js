@@ -24,8 +24,10 @@ test('canonical serialization, host message normalization and stable call IDs', 
   assert.equal(messageID({ info: { id: 'm' } }), 'm');
   assert.equal(messageRole({ type: 'user' }), 'user');
   assert.equal(textFromMessage({ content: [{ type: 'text', text: 'old' }] }), 'old');
-  assert.equal(callKey(host()), callKey({ ...host(), input: 'irrelevant' }));
+  assert.equal(callKey(host()), callKey({ ...host(), status: 'completed' }));
   assert.notEqual(callKey(host()), callKey(host('s2')));
+  assert.notEqual(callKey({ ...host(), tool: 'execute' }), callKey({ ...host(), tool: 'inner_tool' }));
+  assert.notEqual(callKey({ ...host(), tool: 'inner_tool', input: { x: 1 } }), callKey({ ...host(), tool: 'inner_tool', input: { x: 2 } }));
 });
 
 test('before/after pairing, exact outputs, immutable ID replay and restart', async t => {
@@ -142,6 +144,31 @@ test('direct tool output satisfies host JSON contract after real observations', 
   assert.deepEqual(result.output, JSON.parse(JSON.stringify(result.output)));
   assert.equal(result.output.ok, true);
   assert.equal(result.output.recent[0].tool, 'read');
+});
+
+test('V2 compaction ended archives trusted summary and rejects other workspace events', async t => {
+  const { trace, dir, store } = await fixture(t);
+  const source = await store.record('tool.after', host(), { old: 'evidence' });
+  trace.ctx.session = { context: async () => ({ data: [{ type: 'compaction', id: 'msg_compact', status: 'completed', summary: `Native summary <opencode-trace-map-v1>{"important_refs":["${source.ref}"]}</opencode-trace-map-v1>` }] }) };
+  await trace.lifecycle({ type: 'session.compaction.ended', id: 'host_evt1', location: { directory: dir }, data: { sessionID: 's1' } });
+  assert.deepEqual(store.session('s1').compact.refs, [source.ref]);
+  const size = store.seen.size;
+  await trace.lifecycle({ type: 'session.created', location: { directory: '/tmp/other-workspace' }, data: { sessionID: 's2' } });
+  assert.equal(store.seen.size, size);
+  assert.ok(!store.sessions.has('s2'));
+});
+
+test('dispatcher and inner tools sharing host call ID keep independent pairs', async t => {
+  const { trace, store } = await fixture(t);
+  const events = [{ ...host(), tool: 'execute', input: { code: 'two inner calls' } }, { ...host(), tool: 'third_party', input: { query: 'one' } }, { ...host(), tool: 'third_party', input: { query: 'two' } }];
+  const before = [];
+  for (const e of events) before.push(await trace.before(e));
+  assert.equal(new Set(before.map(e => e.callKey)).size, 3);
+  for (const e of events.toReversed()) {
+    const after = await trace.after({ ...e, status: 'completed', result: { content: [{ type: 'text', text: 'ok' }] } });
+    assert.equal(after.callKey, before.find(b => b.callKey === after.callKey).callKey);
+  }
+  assert.equal(Object.values(store.session('s1').pending).filter(p => !p.terminal).length, 0);
 });
 
 test('plugin store failure never throws native hooks, removes tools, or binds permission/shell hooks', async t => {

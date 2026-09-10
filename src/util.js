@@ -61,7 +61,9 @@ export function identity(event = {}) {
   return Object.fromEntries(['sessionID', 'messageID', 'agent', 'role', 'persona', 'parentID'].filter(k => event[k] !== undefined).map(k => [k, event[k]]));
 }
 export function callKey(event) {
-  return hash(stable([event.sessionID ?? null, event.messageID ?? null, event.id ?? null]));
+  // V2's execute dispatcher reuses its call ID for inner tool hooks. The exact
+  // host tool and input distinguish those observations without inventing IDs.
+  return hash(stable([event.sessionID ?? null, event.messageID ?? null, event.id ?? null, event.tool ?? null, event.input ?? null]));
 }
 
 export function locator(input = {}) {

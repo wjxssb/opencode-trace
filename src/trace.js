@@ -168,15 +168,16 @@ export class Trace {
     const sid = data.sessionID ?? data.info?.id;
     if (!sid) return;
     // Global event subscription is filtered by actual host session location.
+    const location = event.location?.directory ?? data.location?.directory ?? data.info?.location?.directory;
+    if (location && await canonical(location) !== this.store.workspace) return;
     if (!this.store.sessions.has(sid)) {
-      const location = data.location?.directory ?? data.info?.location?.directory;
-      if (!location || await canonical(location) !== this.store.workspace) return;
+      if (!location) return;
     }
-    if (event.type === 'session.compacted' || event.type === 'session.idle' || (event.type === 'session.status' && data.status?.type === 'idle')) {
+    if (['session.compacted', 'session.compaction.ended', 'session.execution.succeeded', 'session.execution.failed', 'session.execution.interrupted', 'session.idle'].includes(event.type) || (event.type === 'session.status' && data.status?.type === 'idle')) {
       const messages = unwrap(await this.ctx.session.context({ sessionID: sid }));
       await this.observeMessages(sid, messages);
     }
-    if (['session.created', 'session.updated', 'session.deleted', 'session.idle', 'session.status', 'session.compacted'].includes(event.type))
-      await this.store.record('session.lifecycle', { ...identity(data), sessionID: sid }, data, { lifecycle: event.type });
+    if (['session.created', 'session.updated', 'session.deleted', 'session.forked', 'session.agent.selected', 'session.model.selected', 'session.idle', 'session.status', 'session.compacted', 'session.compaction.ended', 'session.execution.started', 'session.execution.succeeded', 'session.execution.failed', 'session.execution.interrupted'].includes(event.type))
+      await this.store.record('session.lifecycle', { ...identity(data), sessionID: sid }, data, { lifecycle: event.type, hostEventID: event.id });
   }
 }
