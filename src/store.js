@@ -183,6 +183,18 @@ export class Store {
     }
     return { window: out, reachedStart: out.length < limit };
   }
+  // Newest-first matches. Inbox and outbox maintenance must see the most
+  // recent messages, not the oldest N of a growing history.
+  findEntriesNewest(filter, limit = 64) {
+    const entries = [...this.index.values()].sort((a, b) => b.at - a.at || b.ref.localeCompare(a.ref));
+    const out = [];
+    for (const entry of entries) {
+      if (!this.matchesFilters(entry, filter)) continue;
+      out.push(entry);
+      if (out.length >= limit) break;
+    }
+    return out.reverse();
+  }
   async reconcile(limit = 64) {
     if (this.closed) return { scanned: 0, imported: 0 };
     if (!Number.isInteger(limit) || limit < 1 || limit > 128) throw new Error('Invalid reconcile batch');
@@ -226,6 +238,24 @@ export class Store {
     const data = await fs.readFile(path.join(this.root, 'blobs', digest.slice(0, 2), digest));
     if (hash(data) !== digest) throw new Error('Blob hash mismatch');
     return data;
+  }
+  // Bounded byte-range read for budgeted candidate scans. Reads exactly
+  // [start, start+length) without loading the whole blob; the chunk is NOT
+  // hash-verified because it is discovery only - exact evidence always goes
+  // through expand(), which verifies the full blob.
+  async readBlobRange(ref, start, length) {
+    if (!/^blob_[a-f0-9]{64}$/.test(ref)) throw new Error('Invalid blob ref');
+    if (!Number.isInteger(start) || start < 0 || !Number.isInteger(length) || length < 1) throw new Error('Invalid blob range');
+    const digest = ref.slice(5);
+    const handle = await fs.open(path.join(this.root, 'blobs', digest.slice(0, 2), digest), 'r');
+    try {
+      const { size } = await handle.stat();
+      const want = Math.min(length, Math.max(0, size - start));
+      if (want <= 0) return { chunk: Buffer.alloc(0), size, read: 0 };
+      const chunk = Buffer.alloc(want);
+      const { bytesRead } = await handle.read(chunk, 0, want, start);
+      return { chunk: chunk.subarray(0, bytesRead), size, read: bytesRead };
+    } finally { await handle.close(); }
   }
   async readEvent(ref) {
     if (!/^evt_[a-f0-9]{64}$/.test(ref)) throw new Error('Invalid event ref');

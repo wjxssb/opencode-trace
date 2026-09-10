@@ -83,28 +83,76 @@ test('P4: resume never re-executes recorded terminal states', async t => {
 test('P4: failed step cancels dependents; validation rejects cycles and bad shapes', async t => {
   const log = { create: [], sessions: [], prompts: [], waits: [], interrupts: [], failPrompt: new Set(['ses_child_1']) };
   const { trace } = await fixture(t, nativeSessions(log));
-  const out = await trace.plan({ steps: [
+  const steps = [
     { id: 'root', text: 'will fail' },
     { id: 'child', text: 'depends on root', depends_on: ['root'] },
     { id: 'side', text: 'independent survives' },
-  ] }, host());
+  ];
+  const out = await trace.plan({ steps }, host());
   assert.equal(out.steps.find(s => s.id === 'root').state, 'failed');
   assert.equal(out.steps.find(s => s.id === 'child').state, 'cancelled');
   assert.equal(out.steps.find(s => s.id === 'side').state, 'succeeded');
   assert.equal(log.interrupts.length, 1, 'failed step interrupted natively');
-  assert.match(out.note, /dependents were cancelled/);
-  // Failure recovery: the failed step re-runs on a new invocation.
+  assert.match(out.note, /terminal on resume/);
+  // Failure is terminal on resume: a failed step may have had side effects,
+  // so an identical re-invocation must not re-execute it.
+  const createsBefore = log.create.length;
+  const defaultRetry = await trace.plan({ steps }, host());
+  assert.equal(defaultRetry.steps.find(s => s.id === 'root').state, 'already_failed', 'failed steps are terminal');
+  assert.equal(defaultRetry.steps.find(s => s.id === 'side').state, 'already_succeeded', 'succeeded steps never re-run');
+  assert.equal(log.create.length, createsBefore, 'nothing re-executed by default');
+  // Explicit retry_failed opts in to a fresh attempt with a new binding.
   log.failPrompt.clear();
-  const retry = await trace.plan({ steps: out.steps ? [
-    { id: 'root', text: 'will fail' },
-    { id: 'child', text: 'depends on root', depends_on: ['root'] },
-    { id: 'side', text: 'independent survives' },
-  ] : [] }, host());
-  assert.equal(retry.steps.find(s => s.id === 'root').state, 'succeeded', 'failed steps re-run');
-  assert.equal(retry.steps.find(s => s.id === 'side').state, 'already_succeeded', 'succeeded steps never re-run');
+  const retry = await trace.plan({ steps, retry_failed: true }, host());
+  assert.equal(retry.steps.find(s => s.id === 'root').state, 'succeeded', 'explicit retry re-runs failed steps');
+  assert.equal(retry.steps.find(s => s.id === 'side').state, 'already_succeeded', 'succeeded steps still never re-run');
+  assert.equal(log.create.length, createsBefore + 1, 'exactly the failed step re-executed');
   await assert.rejects(trace.plan({ steps: [{ id: 'a', text: 'x', depends_on: ['b'] }, { id: 'b', text: 'y', depends_on: ['a'] }] }, host()), /cycle/i);
   await assert.rejects(trace.plan({ steps: [{ id: 'a', text: 'x', depends_on: ['ghost'] }] }, host()), /invalid dependency/i);
   await assert.rejects(trace.plan({ steps: Array.from({ length: 9 }, (_, i) => ({ id: `s${i}`, text: 'x' })) }, host()), /1-8 steps/);
+});
+
+test('P4: plan identity is scoped to the owning session; identical step lists never cross sessions', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'opencode-trace-planiso-'));
+  t.after(async () => { await fs.rm(dir, { recursive: true, force: true }); });
+  const storeRoot = path.join(dir, 'store');
+  const log = { create: [], sessions: [], prompts: [], waits: [], interrupts: [] };
+  const mk = () => { const trace = new Trace({ location: { directory: dir }, session: nativeSessions(log) }, { storeRoot }); return trace.ready.then(() => trace); };
+  const t1 = await mk(); const t2 = await mk();
+  t1.store.session('s1'); t1.store.session('s2');
+  const steps = [{ id: 'scan', text: 'TRACE_CASE=scan identical work' }];
+  const first = await t1.plan({ steps }, host('s1'));
+  assert.equal(first.steps[0].state, 'succeeded');
+  const second = await t2.plan({ steps }, host('s2'));
+  assert.notEqual(second.plan_id, first.plan_id, 'owner+version identity separates sessions');
+  assert.equal(second.steps[0].state, 'succeeded', 'the second owner executes fresh');
+  assert.notEqual(second.steps[0].sessionID, first.steps[0].sessionID);
+  // Same owner still resumes instead of re-executing.
+  const resumed = await t1.plan({ steps }, host('s1'));
+  assert.equal(resumed.steps[0].state, 'already_succeeded');
+  assert.equal(log.create.length, 2, 'exactly two native executions total');
+  t1.store.close(); t2.store.close();
+});
+
+test('P4: step agent binding must reference a real host agent and binds via native switching', async t => {
+  const log = { create: [], sessions: [], prompts: [], waits: [], interrupts: [], switches: [] };
+  const session = { ...nativeSessions(log), switchAgent: async ({ sessionID, agent }) => { log.switches.push({ sessionID, agent }); } };
+  const { trace } = await fixture(t, session);
+  // No snapshot yet: role strings cannot be trusted without host evidence.
+  await assert.rejects(trace.plan({ steps: [{ id: 'a', text: 'x', agent: 'reviewer' }] }, host()), /No agents snapshot/);
+  await trace.store.record('agents.snapshot', {}, [{ id: 'build', name: 'Build' }, { id: 'reviewer', name: 'Reviewer' }]);
+  await assert.rejects(trace.plan({ steps: [{ id: 'a', text: 'x', agent: 'invented-role' }] }, host()), /unknown host agent/);
+  const out = await trace.plan({ steps: [{ id: 'review', text: 'TRACE_CASE=review check the diff', agent: 'reviewer' }] }, host());
+  assert.equal(out.steps[0].state, 'succeeded');
+  assert.deepEqual(log.switches, [{ sessionID: out.steps[0].sessionID, agent: 'reviewer' }]);
+  const stepStates = await Promise.all([...trace.store.index.values()].filter(e => e.type === 'trace.step')
+    .map(async r => JSON.parse((await trace.store.readBlob(r.payloadRef)).toString())));
+  assert.ok(stepStates.some(s => s.state === 'started' && s.agent === 'reviewer'), 'agent binding recorded on the step evidence');
+  // Without native agent switching the step is recorded honestly as unsupported.
+  const limited = await fixture(t, nativeSessions({ create: [], sessions: [], prompts: [], waits: [], interrupts: [] }));
+  await limited.trace.store.record('agents.snapshot', {}, [{ id: 'reviewer' }]);
+  const honest = await limited.trace.plan({ steps: [{ id: 'r', text: 'x', agent: 'reviewer' }] }, host());
+  assert.equal(honest.steps[0].state, 'unsupported');
 });
 
 test('P4: unsupported host primitives are recorded honestly, never faked', async t => {

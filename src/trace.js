@@ -11,17 +11,19 @@ export const RECALL_MARKER = 'OPENCODE_TRACE_RECALL_V1';
 const refOf = (v, cap = 512) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, cap) : undefined);
 const encodeCursor = cursor => Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url');
 // Exact-case matches report exact byte offsets; the case-insensitive fallback
-// reports approximate offsets derived from the decoded prefix.
-function occurrences(data, text, max) {
-  const out = []; const needle = Buffer.from(text, 'utf8');
-  let at = data.indexOf(needle);
-  while (at >= 0 && out.length < max) { out.push(at); at = data.indexOf(needle, at + 1); }
+// reports approximate offsets derived from the decoded prefix. Chunk-local
+// variant for bounded scanning: discovery only, never hash-verified evidence.
+function chunkOccurrences(chunk, needle, text, max) {
+  const out = [];
+  let at = chunk.indexOf(needle);
+  while (at >= 0 && out.length < max) { out.push(at); at = chunk.indexOf(needle, at + 1); }
   if (out.length) return out;
-  const lower = data.toString('utf8').toLowerCase(); const small = text.toLowerCase();
+  const lower = chunk.toString('utf8').toLowerCase(); const small = text.toLowerCase();
   at = lower.indexOf(small);
   while (at >= 0 && out.length < max) { out.push(Buffer.byteLength(lower.slice(0, at), 'utf8')); at = lower.indexOf(small, at + 1); }
   return out;
 }
+const DEEP_CHUNK = 262144;
 
 const observation = session => ({
   intent_declared_status: session.intent?.status ?? null,
@@ -256,29 +258,53 @@ export class Trace {
         next_cursor: last ? encodeCursor({ q: queryHash, deep, at: last.at, ref: last.ref }) : null, coverage };
     }
     const budget = Math.min(Number.isInteger(input.deep_budget_bytes) ? input.deep_budget_bytes : 2097152, 16777216);
-    const skip = Array.isArray(cursor?.skip) ? cursor.skip.filter(r => typeof r === 'string') : [];
+    const skipOf = ref => {
+      for (const s of Array.isArray(cursor?.skip) ? cursor.skip : []) {
+        if (s === ref) return Number.MAX_SAFE_INTEGER;
+        if (s && typeof s === 'object' && s.ref === ref && Number.isInteger(s.bytes) && s.bytes >= 0) return s.bytes;
+      }
+      return 0;
+    };
     const { window: entries, reachedStart } = this.store.deepWindow(cursor ? { at: cursor.at, ref: cursor.ref } : null, 256);
     const { text, ...rest } = f;
     if (!text) throw new Error('deep scan requires text');
+    const needle = Buffer.from(text, 'utf8');
     const hits = []; let scannedBytes = 0, scannedBlobs = 0, scannedEvents = 0, last = null, lastScanned = [], brokeEarly = false;
+    // Bounded chunk scanning: each read is at most DEEP_CHUNK + needle length,
+    // so a multi-gigabyte blob can never bypass the byte budget into RAM.
+    // Overlapping reads keep needle matches from straddling chunk boundaries.
+    const scanBlob = async (entry, blobRef) => {
+      let pos = skipOf(blobRef), scanned = 0;
+      while (scannedBytes < budget) {
+        const want = DEEP_CHUNK + needle.length - 1;
+        const { chunk, read } = await this.store.readBlobRange(blobRef, pos, want);
+        if (read <= 0) return { scanned, done: true };
+        scannedBytes += read; scanned += read;
+        for (const local of chunkOccurrences(chunk, needle, text, 2)) {
+          hits.push({ event_ref: entry.ref, blob_ref: blobRef, byte_offset: pos + local,
+            snippet: chunk.subarray(Math.max(0, local - 48), local + needle.length + 96).toString('utf8') });
+        }
+        pos += Math.min(read, DEEP_CHUNK);
+        if (read < want) return { scanned, done: true };
+      }
+      return { scanned, done: false };
+    };
     for (const entry of entries) {
       // The cursor entry itself is always re-admitted; its already-scanned
-      // blobs are skipped via cursor.skip, so partial events resume exactly
-      // and no blob is silently passed over.
+      // byte prefixes are skipped via cursor.skip, so partial blobs resume
+      // exactly and no byte range is silently passed over.
       last = entry; lastScanned = []; scannedEvents++;
       if (this.store.matchesFilters(entry, rest)) {
         let complete = true;
         for (const blobRef of [entry.payloadRef, ...entry.outputs.map(o => o.ref)].filter(Boolean)) {
-          if (skip.includes(blobRef)) { lastScanned.push(blobRef); continue; }
+          const fromByte = skipOf(blobRef);
+          if (fromByte >= Number.MAX_SAFE_INTEGER) { lastScanned.push({ ref: blobRef, bytes: fromByte }); continue; }
           if (scannedBytes >= budget) { complete = false; brokeEarly = true; break; }
-          let data;
-          try { data = await this.store.readBlob(blobRef); }
-          catch (error) { this.warning('find_deep', error); continue; }
-          scannedBytes += data.length; scannedBlobs++; lastScanned.push(blobRef);
-          for (const offset of occurrences(data, text, 2)) {
-            hits.push({ event_ref: entry.ref, blob_ref: blobRef, byte_offset: offset,
-              snippet: data.subarray(Math.max(0, offset - 48), offset + text.length + 96).toString('utf8') });
-          }
+          let outcome;
+          try { outcome = await scanBlob(entry, blobRef); }
+          catch (error) { this.warning('find_deep', error); outcome = { scanned: 0, done: true }; }
+          scannedBlobs++;
+          lastScanned.push({ ref: blobRef, bytes: fromByte + outcome.scanned });
           if (hits.length >= limit) { complete = false; brokeEarly = true; break; }
         }
         if (!complete) break;
@@ -289,7 +315,7 @@ export class Trace {
       next_cursor: exhausted ? null : encodeCursor({ q: queryHash, deep, at: last.at, ref: last.ref,
         skip: lastScanned.slice(0, 64), ...(lastScanned.length >= 64 ? { partial: true } : {}) }),
       coverage: { ...coverage, deep_scan: { scanned_events: scannedEvents, scanned_blobs: scannedBlobs, scanned_bytes: scannedBytes,
-        budget_bytes: budget, exhausted_history: exhausted,
+        budget_bytes: budget, chunk_bytes: DEEP_CHUNK, exhausted_history: exhausted,
         meaning: exhausted ? 'No further history: this query is definitive for ingested events.' : 'More history remains; continue with next_cursor.' } } };
   }
   formatEntry(e, text) {
@@ -360,11 +386,12 @@ export class Trace {
     const source_refs = input.source_refs ? await this.refs(input.source_refs) : [];
     const delivery = input.delivery === 'steer' ? 'steer' : 'queue';
     let in_reply_to = null, thread_id = typeof input.thread_id === 'string' && /^thr_[a-f0-9]{32}$/.test(input.thread_id) ? input.thread_id : null;
-    let proposal = null;
+    let proposal = null, proposalData = null, parentData = null;
     if (input.in_reply_to != null) {
       const parent = await this.resolveMail(String(input.in_reply_to));
       if (!parent) throw new Error('in_reply_to does not resolve to a known trace message');
       in_reply_to = String(input.in_reply_to);
+      parentData = parent.data;
       thread_id = thread_id ?? parent.data.thread_id;
     }
     if (input.proposal != null) {
@@ -372,10 +399,28 @@ export class Trace {
       if (!target) throw new Error('proposal does not resolve to a known trace message');
       if (!['proposal', 'counter'].includes(target.data.type)) throw new Error('accept/reject/counter must bind a proposal or counter message');
       proposal = String(input.proposal);
+      proposalData = target.data;
       thread_id = thread_id ?? target.data.thread_id;
     }
+    // Thread consistency: reply, proposal binding and explicit thread must
+    // all describe the same thread; cross-thread bindings are rejected.
+    if (parentData && parentData.thread_id !== thread_id) throw new Error('in_reply_to belongs to a different thread');
+    if (proposalData && proposalData.thread_id !== thread_id) throw new Error('proposal belongs to a different thread');
+    // Structured decisions may only be cast by the proposal's addressees.
+    // The proposer cannot be its own addressee (self-addressing is refused),
+    // so proposer self-acceptance is structurally impossible.
+    if (proposalData && !proposalData.recipients.includes(sender)) throw new Error('Only an addressee of the proposal may accept, reject or counter it');
     if ((type === 'accept' || type === 'reject' || type === 'counter') && !proposal) throw new Error(`${type} requires an explicit proposal reference`);
-    if (thread_id && !this.store.findEntries({ thread: thread_id, type: 'trace.message' }, null, 1).length) throw new Error('Unknown thread_id in this workspace');
+    if (thread_id) {
+      const threadRows = this.store.findEntries({ thread: thread_id, type: 'trace.message' }, null, 256);
+      if (!threadRows.length) throw new Error('Unknown thread_id in this workspace');
+      // Joining an existing thread requires existing membership: the sender
+      // must already be a participant (root sender or addressee) of it.
+      if (in_reply_to || input.thread_id != null) {
+        const member = threadRows.some(r => r.sessionID === sender || (r.recipients ?? []).includes(sender));
+        if (!member) throw new Error('Sender is not a participant of this thread');
+      }
+    }
     const message_id = `msgx_${hash(stable([sender, recipients, text, randomUUID()])).slice(0, 32)}`;
     thread_id = thread_id ?? `thr_${hash(stable([sender, [...recipients].sort(), randomUUID()])).slice(0, 32)}`;
     const content = await this.store.blob(text, 'utf8');
@@ -386,39 +431,80 @@ export class Trace {
     }, { message_id, thread_id, recipients, reply_to: in_reply_to, proposal });
     const receipts = [];
     for (const recipient of recipients) {
-      const result = await this.deliverTo(recipient, this.mailEnvelope({ message_id, thread_id, from: sender, in_reply_to, proposal, type }, text), delivery);
-      // Nothing was attempted: leave no delivery record so a later sweep can
-      // deliver safely once a host client is available.
-      let delivery_ref = null;
-      if (result.attempted) {
-        const record = await this.store.record('trace.delivery', identity(host), {
-          message_id, thread_id, recipient, state: result.state, method: result.detail, inbox_id: result.inboxID ?? null,
-        }, { message_id, thread_id, recipient });
-        delivery_ref = record.ref;
-      }
-      receipts.push({ recipient, state: result.state, delivery_ref, ...(result.inboxID ? { host_inbox_id: result.inboxID } : {}) });
+      const receipt = await this.deliverWithWal(recipient, this.mailEnvelope({ message_id, thread_id, from: sender, in_reply_to, proposal, type }, text), delivery, { message_id, thread_id }, host);
+      receipts.push(receipt);
     }
     return { ok: true, message_id, thread_id, message_ref: event.ref, receipts,
       evidence_levels: 'persisted always; host_admitted per delivery receipt; context_observed/recipient_ack/reply_recorded are derived in trace_inbox' };
+  }
+  // Two-phase delivery WAL: the attempt is durable before the host call, the
+  // result after it. A crash in between leaves attempt-without-result, which
+  // is UNKNOWN and is never auto-retried (only reconciled from evidence).
+  async deliverWithWal(recipient, envelope, delivery, ids, host) {
+    const attempt = await this.store.record('trace.delivery', identity(host), {
+      message_id: ids.message_id, thread_id: ids.thread_id, recipient, phase: 'attempt', state: 'attempted', method: `prompt:${delivery}`,
+    }, { message_id: ids.message_id, thread_id: ids.thread_id, recipient });
+    const result = await this.deliverTo(recipient, envelope, delivery);
+    if (result.attempted === false) {
+      // Nothing reached the host: the attempt record is retracted as
+      // never-attempted so a later sweep may deliver safely.
+      await this.store.record('trace.delivery', identity(host), {
+        message_id: ids.message_id, thread_id: ids.thread_id, recipient, phase: 'result', state: 'not_attempted', method: result.detail, inbox_id: null,
+      }, { message_id: ids.message_id, thread_id: ids.thread_id, recipient });
+      return { recipient, state: 'unknown', delivery_ref: null };
+    }
+    const record = await this.store.record('trace.delivery', identity(host), {
+      message_id: ids.message_id, thread_id: ids.thread_id, recipient, phase: 'result', state: result.state, method: result.detail, inbox_id: result.inboxID ?? null,
+    }, { message_id: ids.message_id, thread_id: ids.thread_id, recipient });
+    return { recipient, state: result.state, delivery_ref: record.ref, ...(result.inboxID ? { host_inbox_id: result.inboxID } : {}) };
+  }
+  // Resolve the durable delivery outcome for (message, recipient) from the
+  // attempt/result WAL. attempt-without-result is a crash window: UNKNOWN
+  // unless the recipient's own persisted transcript proves admission. A
+  // 'not_attempted' result voids its attempt: the send never reached the host
+  // and a later sweep may deliver safely.
+  async deliveryOutcome(message_id, recipient, viewer = null) {
+    const rows = this.store.findEntries({ message: message_id, type: 'trace.delivery', recipient }, null, 64);
+    if (!rows.length) return { state: 'missing_delivery_record' };
+    let attempt = null, result = null, voided = false;
+    for (const row of rows) {
+      try { const data = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
+        if (data.phase === 'attempt') attempt = { ...data, ref: row.ref, at: row.at };
+        else if (data.phase === 'result' && data.state === 'not_attempted') voided = true;
+        else if (data.phase === 'result') result = { ...data, ref: row.ref, at: row.at };
+        else if (data.phase === undefined) result = { ...data, ref: row.ref, at: row.at, legacy: true };
+      } catch (error) { this.warning('trace_delivery', error); }
+    }
+    if (result) return { state: result.state, delivery_ref: result.ref, host_inbox_id: result.inbox_id ?? null,
+      ...(result.method === 'reconciled:transcript' ? { reconciled: true } : {}) };
+    // A retracted attempt never reached the host: safe to (re)deliver later.
+    if (!attempt || voided) return { state: 'missing_delivery_record' };
+    // Crash window: the host call may already have succeeded. Reconcile from
+    // the strongest local evidence - the recipient session's own persisted
+    // admitted prompt containing this message id.
+    const admitted = this.store.findEntries({ type: 'message.persisted', session: recipient, text: message_id }, null, 2);
+    if (admitted.length && viewer) {
+      const record = await this.store.record('trace.delivery', { sessionID: viewer }, {
+        message_id, thread_id: attempt.thread_id, recipient, phase: 'result', state: 'host_admitted',
+        method: 'reconciled:transcript', inbox_id: null,
+      }, { message_id, thread_id: attempt.thread_id, recipient });
+      return { state: 'host_admitted', delivery_ref: record.ref, host_inbox_id: null, reconciled: true };
+    }
+    return { state: 'unknown_crash_window', attempt_ref: attempt.ref };
   }
   async inbox(input = {}, host) {
     if (!host?.sessionID) throw new Error('Host session identity unavailable');
     const viewer = host.sessionID;
     await this.store.reconcile();
     const thread = typeof input.thread_id === 'string' && /^thr_[a-f0-9]{32}$/.test(input.thread_id) ? input.thread_id : null;
-    const rows = this.store.findEntries(thread ? { type: 'trace.message', thread } : { type: 'trace.message' }, null, 256);
+    // Newest window: a growing mailbox must always surface recent mail.
+    const rows = this.store.findEntriesNewest(thread ? { type: 'trace.message', thread } : { type: 'trace.message' }, 96);
     const inbox = [], outbox = [];
-    for (const row of rows.slice(-96)) {
+    for (const row of rows) {
       const mail = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
       const sent = row.sessionID === viewer;
       const involved = sent || (mail.recipients ?? []).includes(viewer);
       if (!involved) continue;
-      const deliveries = this.store.findEntries({ message: mail.message_id, type: 'trace.delivery' }, null, 32);
-      const deliveryStates = {};
-      for (const d of deliveries) {
-        try { deliveryStates[d.recipient] = JSON.parse((await this.store.readBlob(d.payloadRef)).toString()); }
-        catch (error) { this.warning('trace_inbox', error); }
-      }
       const acks = this.store.findEntries({ message: mail.message_id, type: 'trace.ack' }, null, 16).map(a => a.sessionID);
       const replies = this.store.findEntries({ reply_to: mail.message_id, type: 'trace.message' }, null, 16).map(r => r.ref);
       const observedRefs = this.store.findEntries({ type: 'message.persisted', session: viewer, text: mail.message_id }, null, 2).map(r => r.ref);
@@ -427,55 +513,43 @@ export class Trace {
         in_reply_to: mail.in_reply_to ?? null, proposal: mail.proposal ?? null,
         recipients: mail.recipients, acked_by: acks, reply_recorded: replies.length > 0, reply_refs: replies.slice(0, 4) };
       if (sent) {
-        outbox.push({ ...item, deliveries: (mail.recipients ?? []).map(r => ({ recipient: r,
-          state: deliveryStates[r]?.state ?? 'missing_delivery_record',
-          delivery_ref: deliveries.find(d => d.recipient === r)?.ref ?? null,
-          host_inbox_id: deliveryStates[r]?.inbox_id ?? null })) });
+        const deliveries = [];
+        for (const recipient of mail.recipients ?? []) deliveries.push({ recipient, ...(await this.deliveryOutcome(mail.message_id, recipient, viewer)) });
+        outbox.push({ ...item, deliveries });
       } else {
-        const myDelivery = deliveryStates[viewer];
-        // Evidence levels: each needs its own recorded or derived event.
-        // host_admitted/report the delivery receipt ref; context_observed
-        // reports the message.persisted event the target session's own hook
-        // recorded; ack and reply require explicit recipient actions.
+        const mine = await this.deliveryOutcome(mail.message_id, viewer, viewer);
         inbox.push({ ...item, levels: {
           persisted: row.ref,
-          host_admitted: myDelivery ? (myDelivery.state === 'host_admitted' ? deliveries.find(d => d.recipient === viewer).ref : `state:${myDelivery.state}`) : null,
+          host_admitted: mine.state === 'host_admitted' ? (mine.delivery_ref ?? true) : null,
           context_observed: observedRefs[0] ?? null,
           recipient_ack: acks.includes(viewer),
           reply_recorded: replies.length > 0,
-        }, note: 'recipient_ack/reply levels require explicit trace_ack / trace_send with in_reply_to' });
+        }, delivery_state: mine.state, note: 'host_admitted/context_observed/recipient_ack each require their own recorded or derived event; a receipt is never agreement' });
       }
     }
     let swept = null;
     if (input.sweep === true) swept = await this.sweepOutbox(viewer);
-    return { ok: true, viewer, inbox: inbox.slice(-32), outbox: outbox.slice(-32), ...(swept ? { swept } : {}) };
+    return { ok: true, viewer, inbox, outbox, ...(swept ? { swept } : {}) };
   }
   async sweepOutbox(viewer) {
     const delivered = [], manual = [];
-    const mine = this.store.findEntries({ type: 'trace.message', session: viewer }, null, 64);
+    // Newest sent messages first: old undelivered mail must not starve new
+    // mail out of the bounded sweep window.
+    const mine = this.store.findEntriesNewest({ type: 'trace.message', session: viewer }, 64);
     for (const row of mine) {
       const mail = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
-      const deliveries = this.store.findEntries({ message: mail.message_id, type: 'trace.delivery' }, null, 32);
       for (const recipient of mail.recipients ?? []) {
-        const existing = deliveries.find(d => d.recipient === recipient);
-        if (existing) {
-          const state = JSON.parse((await this.store.readBlob(existing.payloadRef)).toString()).state;
-          if (state === 'unknown') manual.push({ message_id: mail.message_id, recipient, reason: 'host_admission_uncertain; manual retry required, no auto redelivery' });
+        const outcome = await this.deliveryOutcome(mail.message_id, recipient, viewer);
+        if (outcome.state === 'unknown_crash_window' || outcome.state === 'unknown') {
+          manual.push({ message_id: mail.message_id, recipient, reason: 'host admission uncertain after an attempt; reconcile or retry manually, never auto-redelivered' });
           continue;
         }
-        // Missing delivery record: the send crashed between persist and
-        // delivery. Text recovery is deterministic from the content blob.
+        if (outcome.state !== 'missing_delivery_record') continue;
+        // No attempt ever started: safe to deliver with the full WAL.
         const text = (await this.store.readBlob(mail.content_ref)).toString('utf8');
-        const result = await this.deliverTo(recipient, this.mailEnvelope({ ...mail }, text), 'queue');
-        if (result.attempted === false) {
-          manual.push({ message_id: mail.message_id, recipient, reason: 'no host client in this process; nothing was attempted' });
-          continue;
-        }
-        const record = await this.store.record('trace.delivery', { sessionID: viewer }, {
-          message_id: mail.message_id, thread_id: mail.thread_id, recipient, state: result.state,
-          method: `sweep:${result.detail}`, inbox_id: result.inboxID ?? null,
-        }, { message_id: mail.message_id, thread_id: mail.thread_id, recipient });
-        delivered.push({ message_id: mail.message_id, recipient, state: result.state, delivery_ref: record.ref });
+        const receipt = await this.deliverWithWal(recipient, this.mailEnvelope({ ...mail }, text), 'queue', { message_id: mail.message_id, thread_id: mail.thread_id }, { sessionID: viewer });
+        if (receipt.state === 'unknown' && !receipt.delivery_ref) manual.push({ message_id: mail.message_id, recipient, reason: 'no host client in this process; nothing was attempted' });
+        else delivered.push({ message_id: mail.message_id, recipient, state: receipt.state, delivery_ref: receipt.delivery_ref });
       }
     }
     return { delivered, requires_manual_choice: manual };
@@ -494,19 +568,39 @@ export class Trace {
   // ---- Thin native orchestration adapter ----
   // The model owns planning; this tool only binds steps to native sessions and
   // records evidence. Independent steps fan out in dependency waves; recorded
-  // terminal states are never re-executed when the same plan version returns.
+  // terminal states are never re-executed when the same plan version returns
+  // (failed/unsupported steps included unless retry_failed is explicit).
+  // Plan identity is scoped to the owning session: plan_id binds owner+version
+  // so two sessions submitting identical step lists remain separate plans.
+  async knownAgents() {
+    const rows = this.store.findEntriesNewest({ type: 'agents.snapshot' }, 1);
+    if (!rows.length) return null;
+    try {
+      const agents = JSON.parse((await this.store.readBlob(rows[0].payloadRef)).toString());
+      return Array.isArray(agents) ? agents.map(a => a?.id).filter(id => typeof id === 'string') : null;
+    } catch (error) { this.warning('trace_plan', error); return null; }
+  }
   async plan(input = {}, host) {
     if (!host?.sessionID) throw new Error('Host session identity unavailable');
     const steps = Array.isArray(input.steps) ? input.steps : [];
     if (!steps.length || steps.length > 8) throw new Error('Expected 1-8 steps');
     const ids = steps.map(s => s?.id);
     if (new Set(ids).size !== ids.length || ids.some(id => typeof id !== 'string' || !/^[a-z0-9_-]{1,32}$/i.test(id))) throw new Error('Step ids must be unique short tokens');
+    let knownAgents = undefined;
     for (const step of steps) {
       if (typeof step.text !== 'string' || !step.text.trim() || bytes(step.text) > 4096) throw new Error(`Step ${step.id} has invalid text`);
       for (const dep of step.depends_on ?? []) if (!ids.includes(dep) || dep === step.id) throw new Error(`Step ${step.id} has an invalid dependency`);
+      if (step.agent !== undefined) {
+        if (typeof step.agent !== 'string' || !step.agent.trim()) throw new Error(`Step ${step.id} has an invalid agent`);
+        if (knownAgents === undefined) knownAgents = await this.knownAgents();
+        // Role binding must reference a real host agent profile recorded in
+        // the agents snapshot; invented role strings are rejected.
+        if (knownAgents === null) throw new Error('No agents snapshot available to validate step.agent');
+        if (!knownAgents.includes(step.agent)) throw new Error(`Step ${step.id} references unknown host agent '${step.agent}'`);
+      }
     }
     const version = hash(stable(steps));
-    const plan_id = `plan_${version.slice(0, 24)}`;
+    const plan_id = `plan_${hash(stable([host.sessionID, version])).slice(0, 24)}`;
     const byId = new Map(steps.map(s => [s.id, s]));
     const visiting = new Set(), done = new Set();
     const visit = id => {
@@ -518,14 +612,21 @@ export class Trace {
       return true;
     };
     for (const s of steps) if (!visit(s.id)) throw new Error('Dependency cycle detected');
+    // All recorded terminal states are reused on resume. failed/unsupported
+    // are terminal too: a failed step may have had side effects, so automatic
+    // re-execution would risk duplicating them. Explicit retry_failed opts in
+    // to a fresh attempt while the old attempt evidence remains.
+    const retryFailed = input.retry_failed === true;
     const previous = new Map();
     for (const row of this.store.findEntries({ type: 'trace.step', plan: plan_id }, null, 256)) {
       try { const data = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
-        if (data.version === version && ['succeeded', 'cancelled'].includes(data.state)) previous.set(data.step, { ...data, ref: row.ref });
+        const terminal = ['succeeded', 'cancelled'].includes(data.state) || (!retryFailed && ['failed', 'unsupported'].includes(data.state));
+        if (data.version === version && terminal) previous.set(data.step, { ...data, ref: row.ref });
       } catch (error) { this.warning('trace_plan', error); }
     }
     const planEvent = await this.store.record('trace.plan', identity(host), {
-      plan_id, version, resumed: previous.size > 0, steps: ids.map(id => ({ id, depends_on: byId.get(id).depends_on ?? [] })),
+      plan_id, version, owner: host.sessionID, resumed: previous.size > 0,
+      steps: ids.map(id => ({ id, depends_on: byId.get(id).depends_on ?? [], ...(byId.get(id).agent ? { agent: byId.get(id).agent } : {}) })),
     }, { plan_id });
     const results = [];
     const states = new Map();
@@ -554,10 +655,21 @@ export class Trace {
         states.set(step.id, 'unsupported');
         return;
       }
+      if (step.agent !== undefined && typeof sessionApi.switchAgent !== 'function') {
+        const record = await this.store.record('trace.step', identity(host), {
+          plan_id, version, step: step.id, state: 'unsupported', reason: 'host client cannot bind a step agent (no switchAgent)',
+          ...(step.agent ? { agent: step.agent } : {}),
+        }, { plan_id, step: step.id });
+        results.push({ id: step.id, state: 'unsupported', evidence_ref: record.ref, reused: false });
+        states.set(step.id, 'unsupported');
+        return;
+      }
       const created = unwrap(await sessionApi.create({ title: `trace-plan ${plan_id.slice(5, 14)}/${step.id}` }));
       const sid = created?.id ?? null;
+      if (step.agent !== undefined) await unwrap(await sessionApi.switchAgent({ sessionID: sid, agent: step.agent }));
       await this.store.record('trace.step', identity(host), {
         plan_id, version, step: step.id, state: 'started', sessionID: sid, native: 'session.create+prompt+wait',
+        ...(step.agent !== undefined ? { agent: step.agent } : {}),
       }, { plan_id, step: step.id });
       try {
         await unwrap(await sessionApi.prompt({ sessionID: sid, text: step.text }));
@@ -566,6 +678,7 @@ export class Trace {
         const last = context.filter(m => messageRole(m) === 'assistant' && (m.time?.completed || m.finish)).at(-1) ?? null;
         const record = await this.store.record('trace.step', identity(host), {
           plan_id, version, step: step.id, state: 'succeeded', sessionID: sid,
+          ...(step.agent !== undefined ? { agent: step.agent } : {}),
           evidence: { last_message_id: messageID(last) ?? null, output_preview: last ? textFromMessage(last).slice(0, 512) : null,
             note: 'exact transcript is persisted as message.persisted events of the bound session' },
         }, { plan_id, step: step.id });
@@ -590,7 +703,7 @@ export class Trace {
     }
     const failed = results.some(r => ['failed', 'unsupported'].includes(r.state));
     return { ok: true, plan_id, version, plan_ref: planEvent.ref, steps: results,
-      note: failed ? 'not every step succeeded; dependents were cancelled, never silently skipped' : 'every step has recorded terminal evidence',
+      note: failed ? 'not every step succeeded; failed and unsupported steps are terminal on resume (retry_failed:true for an explicit new attempt)' : 'every step has recorded terminal evidence',
       parent_completion: 'plan acceptance never completes the parent task by itself' };
   }
   async lifecycle(event) {

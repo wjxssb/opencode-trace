@@ -37,10 +37,10 @@ For isolated testing, `--root PATH` selects bundle/receipt storage; `--store-roo
 | `trace_find` | Find history by clues instead of refs: type, session, agent, tool, status, call_key, path, thread/mail/plan/related refs, time range, or text. `deep:true` scans exact blob bytes under a budget with a resumable cursor. |
 | `trace_intent` | Declare one current intent per session: summary, paths, optional resources, active/waiting/done/cancelled and related refs. Same-millisecond concurrent intents stay visible as `intent_conflicts`. |
 | `trace_status` | Show current memory, recent native result refs, peer snapshots and degradation count, with explicit peer pagination. |
-| `trace_send` | Persist and deliver a directed negotiation message (persist before delivery, host-derived sender, thread inheritance, proposal-bound accept/reject/counter). |
-| `trace_inbox` | Show negotiation mail with per-level evidence: persisted / host_admitted / context_observed / recipient_ack / reply_recorded; `sweep:true` retries only entirely undelivered sends. |
+| `trace_send` | Persist and deliver a directed negotiation message (persist before delivery, host-derived sender, attempt/result delivery WAL, thread membership, addressee-only decisions on proposals). |
+| `trace_inbox` | Show negotiation mail with per-level evidence: persisted / host_admitted / context_observed / recipient_ack / reply_recorded; `sweep:true` retries only sends whose attempt never started; crash-window attempts are reconciled from evidence or left for manual choice, never auto-retried. |
 | `trace_ack` | Record delivery receipt for a specific message; never agreement. |
-| `trace_plan` | Execute an LLM-owned plan through native sessions only (create+prompt+wait+collect); dependency waves fan out; recorded terminal states never re-run. |
+| `trace_plan` | Execute an LLM-owned plan through native sessions only (create+prompt+wait+collect); dependency waves fan out; all recorded terminal states (including failed) never re-run without `retry_failed`; plan identity is owner-session scoped; optional `step.agent` binds a real host agent via native switching. |
 
 The model decides what is worth remembering. Code validates structure, sizes and workspace-local refs; it does not classify the meaning of prompts, outputs or commands. Identity comes from the host tool context, not tool input. Notes from peers can be cited within the same canonical workspace; arbitrary external refs cannot be expanded.
 
@@ -86,7 +86,7 @@ Automatic peer projection carries identity, lifecycle observations, intent ref/s
 
 Hooks used: session `prompt` and `context`; tool `execute.before` and `execute.after`; agent transform for a read-only snapshot; tool transform to add the trace tools; lifecycle event subscription and session `get`/`context` for recovery; the plugin client's native `session.prompt` (mailbox delivery), `create`/`prompt`/`wait`/`context` (plan steps) when the host exposes them. The plugin never changes native tools, messages, permissions, agents or execution routing, and binds no shell hook.
 
-The derived index behind `trace_find` is memory-only and rebuilt from authoritative events at startup; hint extraction peeks at most 8 KiB of each payload. Deep text scans read exact blob bytes under an explicit budget with a cursor that resumes partially scanned events exactly (no skipped or duplicated blobs) and reports whether the scan is definitive. Evidence levels never auto-upgrade: a persisted mailbox message is not delivery, a delivery receipt is not comprehension, an ack is not agreement, and plan acceptance never completes a parent task.
+The derived index behind `trace_find` is memory-only and rebuilt from authoritative events at startup; hint extraction peeks at most 8 KiB of each payload. Deep text scans read blobs in 256 KiB chunks with needle overlap, so the byte budget is enforced at chunk granularity and a single huge output can never bypass it into memory; the cursor resumes at exact byte prefixes, and reported hits are discovery coordinates - exact evidence always goes through `trace_expand`, which hash-verifies the full blob. Evidence levels never auto-upgrade: a persisted mailbox message is not delivery, a delivery receipt is not comprehension, an ack is not agreement, and plan acceptance never completes a parent task. Mailbox delivery uses an attempt/result write-ahead record: an attempt whose result is missing is a crash window that is reconciled from the recipient's own persisted transcript or reported for manual choice, never silently re-delivered. Thread participation is derived from recorded evidence (root sender or addressee); accept/reject/counter may only be cast by the proposal's addressees, and replies, proposal bindings and explicit thread ids must all describe one thread.
 
 Observer errors are caught and logged without payloads. Native hooks wait at most one second for local observer work, then continue. Trace tools can return `ok:false`; that does not affect native execution. A failed store may lose trace observations for that interval. A setup/registration error disables the corresponding observer feature and warns rather than making OpenCode unusable.
 
@@ -96,7 +96,7 @@ At most eight native-hook observer jobs may remain outstanding. A timed-out job 
 
 ```
 node --test tests/*.test.js
-node tests/e2e_host.mjs /absolute/fresh-dir     # real isolated-host E2E (18 checks)
+node tests/e2e_host.mjs /absolute/fresh-dir     # real isolated-host E2E (20 checks)
 node tests/p5_install_drill.mjs /absolute/fresh-dir  # isolated install/rollback drill (15 checks)
 ```
 

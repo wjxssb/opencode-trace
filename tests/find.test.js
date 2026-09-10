@@ -136,6 +136,25 @@ test('P2: cursor pagination is stable and duplicate-free until exhaustion', asyn
   await assert.rejects(trace.find({ type: 'trace.note', cursor: Buffer.from('{"q":"zzz","deep":false,"at":1,"ref":"x"}').toString('base64url') }), /Cursor does not match/);
 });
 
+test('P5.1: deep scan is chunk-bounded - a huge blob cannot bypass the byte budget', async t => {
+  const { trace } = await fixture(t);
+  // A 3 MiB output with the needle near the end; the budget is 2 MiB.
+  const padding = 'Q'.repeat(3 * 1024 * 1024);
+  await trace.after({ ...host('s1', 'huge'), tool: 'read', input: { filePath: 'huge.log' }, status: 'completed', result: { content: [{ type: 'text', text: `${padding}CHUNKED-NEEDLE-END` }] } });
+  const page1 = await trace.find({ text: 'CHUNKED-NEEDLE-END', deep: true, deep_budget_bytes: 2 * 1024 * 1024 });
+  assert.equal(page1.hits.length, 0, 'the needle sits beyond the first budget window');
+  assert.ok(page1.coverage.deep_scan.scanned_bytes <= 2 * 1024 * 1024 + 262200, 'overrun is bounded by one chunk, never the whole blob');
+  assert.equal(page1.coverage.deep_scan.exhausted_history, false);
+  assert.ok(page1.next_cursor, 'a byte-precise resume cursor is returned');
+  const page2 = await trace.find({ text: 'CHUNKED-NEEDLE-END', deep: true, deep_budget_bytes: 2 * 1024 * 1024, cursor: page1.next_cursor });
+  assert.ok(page2.hits.length >= 1, 'the needle is found after resuming at the byte cursor');
+  assert.ok(page2.hits[0].byte_offset > 2 * 1024 * 1024, 'the offset proves the deep position was reached');
+  // Exact recovery still hash-verifies through trace_expand.
+  const exact = await trace.store.expand(page2.hits[0].blob_ref, page2.hits[0].byte_offset, 64);
+  assert.ok(exact.exact_utf8.startsWith('CHUNKED-NEEDLE-END'), 'exact bytes at the reported offset');
+  assert.ok(page2.coverage.deep_scan.scanned_bytes <= 2 * 1024 * 1024 + 262200, 'second page stays chunk-bounded too');
+});
+
 test('P2: index distinguishes no-result from catch-up; store failure degrades find without blocking tools', async t => {
   const { trace } = await fixture(t);
   const none = await trace.find({ text: 'never-recorded-clue' });

@@ -42,7 +42,11 @@ await fs.writeFile(path.join(home, '.config', 'opencode', 'opencode.json'), JSON
   $schema: 'https://opencode.ai/config.json',
   autoupdate: false, share: 'disabled', default_agent: 'build',
   model: 'fixture/fixture-model',
-  permissions: [{ action: 'edit', resource: '*', effect: 'deny' }],
+  agents: { reviewer: { description: 'Read-only reviewer role', mode: 'all',
+    permissions: [
+      { action: 'edit', resource: '*', effect: 'deny' },
+      { action: 'write', resource: '*', effect: 'deny' },
+    ] } },
   provider: { fixture: { npm: '@ai-sdk/openai-compatible', name: 'Fixture',
     options: { baseURL: `http://127.0.0.1:${modelPort}/v1`, apiKey: 'fixture-key' },
     models: { 'fixture-model': { name: 'Fixture Model' } } } },
@@ -168,22 +172,43 @@ try {
   const sessionsAfterResume = (await api('GET', '/api/session')).data?.length ?? 0;
   check('C: resume re-executes nothing', sessionsAfterResume === sessionsAfterFirst, `${sessionsAfterResume - sessionsAfterFirst} new sessions`);
 
-  // Phase D: real permission boundary denies edit; trace never records success.
-  await fs.writeFile(controlPath, JSON.stringify({ ...cases, try_edit: { operations: [
-    { name: 'edit', arguments: { filePath: 'blocked.txt', content: 'nope' } },
-  ] } }));
-  await promptAndSettle(B.id, 'TRACE_CASE=try_edit edit the file, then finish regardless of outcome.');
+  // Phase D: real per-role permission boundaries through agent-bound steps.
+  // The writer step (default build agent) may edit; the reviewer-bound step is
+  // denied by its real host agent permissions, and trace never records a
+  // successful edit for it.
+  await fs.writeFile(controlPath, JSON.stringify({ ...cases,
+    edit_ok: { operations: [{ name: 'write', arguments: { path: 'made.txt', content: 'ok' } }] },
+    edit_deny: { operations: [{ name: 'write', arguments: { path: 'blocked.txt', content: 'nope' } }] },
+    orchestrate_roles: { operations: [
+      { name: 'trace_plan', arguments: { steps: [
+        { id: 'writer', text: 'TRACE_CASE=edit_ok create the file, then finish.', agent: 'build' },
+        { id: 'reader', text: 'TRACE_CASE=edit_deny try the file write, then finish regardless of outcome.', agent: 'reviewer' },
+      ] } },
+    ] } }));
+  await promptAndSettle(A.id, 'TRACE_CASE=orchestrate_roles run the role-bound plan, then finish.');
   store = await openStore();
-  const editAfters = [];
+  const plans = [], roleSteps = [];
   for (const e of store.index.values()) {
-    if (e.type !== 'tool.after' || e.tool !== 'edit') continue;
     const data = JSON.parse((await store.readBlob(e.payloadRef)).toString());
-    editAfters.push({ status: data.status, error: data.error ?? null });
+    if (e.type === 'trace.plan') plans.push(data);
+    if (e.type === 'trace.step' && data.agent) roleSteps.push(data);
   }
-  check('D: real permission boundary held (no successful edit)', editAfters.every(a => a.status !== 'completed'), JSON.stringify(editAfters));
-  const transcript = await api('GET', `/api/session/${B.id}/message`);
-  const transcriptText = JSON.stringify(transcript);
-  check('D: denial visible in the real transcript', /unknown tool: edit|denied|permission|not allowed|requires approval/i.test(transcriptText));
+  const writerStep = roleSteps.find(s => s.step === 'writer' && s.state === 'succeeded');
+  const readerStep = roleSteps.find(s => s.step === 'reader' && s.state === 'succeeded');
+  check('D: agent-bound steps bound real host agents', !!writerStep && !!readerStep && readerStep.agent === 'reviewer' && writerStep.agent === 'build',
+    `writer:${writerStep?.agent ?? 'missing'} reader:${readerStep?.agent ?? 'missing'}`);
+  const editOutcomes = [];
+  for (const e of store.index.values()) {
+    if (e.type !== 'tool.after' || e.tool !== 'write') continue;
+    const data = JSON.parse((await store.readBlob(e.payloadRef)).toString());
+    editOutcomes.push({ session: e.sessionID, status: data.status });
+  }
+  const writerEdits = editOutcomes.filter(o => o.session === writerStep?.sessionID);
+  const readerEdits = editOutcomes.filter(o => o.session === readerStep?.sessionID);
+  check('D: build-bound step executed a real file write', writerEdits.some(o => o.status === 'completed'));
+  check('D: reviewer-bound write denied at the native boundary', readerEdits.length === 0, JSON.stringify(readerEdits));
+  const readerTranscript = JSON.stringify(await api('GET', `/api/session/${readerStep.sessionID}/message`));
+  check('D: denial visible in the reviewer session transcript', /unknown tool: write|denied|permission|not allowed/i.test(readerTranscript));
 } catch (error) {
   check('E2E harness completed', false, String(error?.stack ?? error).slice(0, 400));
 } finally {
