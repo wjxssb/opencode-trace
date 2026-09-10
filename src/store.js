@@ -6,6 +6,18 @@ import { atomic, canonical, hash, stable, refPattern } from './util.js';
 
 const keep = (items, item, limit) => [...items.filter(x => x.ref !== item.ref), item].sort((a, b) => a.at - b.at || a.ref.localeCompare(b.ref)).slice(-limit);
 
+// Payload prefixes are read only to extract bounded search hints for the
+// derived index. The hint read never replaces the authoritative expand path,
+// which always returns hash-verified bytes from the blob store.
+const HINT_READ_BYTES = 8192, HINT_MAX_STRINGS = 8, HINT_STRING_CAP = 200;
+
+function collectStrings(value, out) {
+  if (out.length >= HINT_MAX_STRINGS) return;
+  if (typeof value === 'string') { if (value.trim()) out.push(value.length > HINT_STRING_CAP ? value.slice(0, HINT_STRING_CAP) : value); }
+  else if (Array.isArray(value)) { for (const v of value) { collectStrings(v, out); if (out.length >= HINT_MAX_STRINGS) return; } }
+  else if (value && typeof value === 'object') { for (const v of Object.values(value)) { collectStrings(v, out); if (out.length >= HINT_MAX_STRINGS) return; } }
+}
+
 export class Store {
   constructor(workspace, root = path.join(os.homedir(), '.local/share/opencode-trace'), warning = () => {}) {
     this.workspace = workspace; this.base = root; this.warning = warning;
@@ -17,6 +29,11 @@ export class Store {
     // must never reopen a finished call. callKeys are 64-hex digests, not
     // outputs, so the in-memory set stays small for realistic sessions.
     this.terminalCalls = new Set();
+    // Derived, rebuildable search index over every ingested event. Purely
+    // in-memory: rebuilt from authoritative events during startup recovery,
+    // so deleting it loses nothing. Entries are bounded (~1KB each) via
+    // capped string hints; exact bytes always live in the blob store.
+    this.index = new Map();
   }
   async init() {
     this.workspace = await canonical(this.workspace);
@@ -63,6 +80,95 @@ export class Store {
       hostCreated = Number.isFinite(row.time?.created) ? row.time.created : null;
     }
     this.reduce(event, hostCreated);
+    await this.indexEvent(event);
+  }
+  // Bounded payload peek for search hints. Reads at most HINT_READ_BYTES of
+  // the payload file, never the whole blob, and never serves content.
+  async readPayloadHints(event) {
+    try {
+      const digest = event.payload?.ref?.slice(5);
+      if (!/^[a-f0-9]{64}$/.test(digest ?? '')) return [];
+      const handle = await fs.open(path.join(this.root, 'blobs', digest.slice(0, 2), digest), 'r');
+      try {
+        const chunk = Buffer.alloc(Math.min(HINT_READ_BYTES, event.payload.bytes ?? HINT_READ_BYTES));
+        const { bytesRead } = await handle.read(chunk, 0, chunk.length, 0);
+        const raw = chunk.subarray(0, bytesRead).toString('utf8');
+        try { const parsed = JSON.parse(raw); const out = []; collectStrings(parsed, out); return out; }
+        catch { const out = raw.match(/"([^"\\]{4,120})"/g) ?? []; return out.slice(0, HINT_MAX_STRINGS).map(s => s.slice(1, -1)); }
+      } finally { await handle.close(); }
+    } catch (error) { this.warning('index_hints', error); return []; }
+  }
+  async indexEvent(event) {
+    const rels = [...new Set([
+      ...(event.note?.source_refs ?? []), ...(event.note?.supersedes ?? []), ...(event.note?.depends_on ?? []),
+      ...(event.intent?.related_refs ?? []), ...(event.compact?.refs ?? []),
+    ].flat().filter(r => typeof r === 'string' && refPattern.test(r)))];
+    const payloadHints = await this.readPayloadHints(event);
+    if (event.type === 'coordination.advisory' && (event.payload?.bytes ?? 0) <= 65536) {
+      // Advisory source relations live in the payload data of these small events.
+      try {
+        const data = JSON.parse((await this.readBlob(event.payload.ref)).toString());
+        for (const r of data?.source_refs ?? []) if (refPattern.test(r)) rels.push(r);
+      } catch (error) { this.warning('index_advisory', error); }
+    }
+    const entry = {
+      ref: event.ref, at: event.at ?? 0, type: event.type,
+      sessionID: event.host?.sessionID ?? null, messageID: event.host?.messageID ?? null, agent: event.host?.agent ?? null,
+      tool: event.tool ?? null, status: event.status ?? null, callKey: event.callKey ?? null,
+      paths: Array.isArray(event.paths) ? event.paths : null,
+      source: event.source && Object.keys(event.source).length ? event.source : null,
+      payloadRef: event.payload?.ref ?? null, bytes: event.payload?.bytes ?? 0,
+      outputs: (event.outputs ?? []).map(o => ({ ref: o.ref, bytes: o.bytes ?? null })).filter(o => typeof o.ref === 'string'),
+      rels: [...new Set(rels)], hints: payloadHints,
+    };
+    this.index.set(event.ref, entry);
+  }
+  matchesFilters(entry, f) {
+    if (f.type && !(Array.isArray(f.type) ? f.type.includes(entry.type) : entry.type === f.type)) return false;
+    if (f.session && entry.sessionID !== f.session) return false;
+    if (f.agent && entry.agent !== f.agent) return false;
+    if (f.tool && entry.tool !== f.tool) return false;
+    if (f.status && entry.status !== f.status) return false;
+    if (f.callKey && entry.callKey !== f.callKey) return false;
+    if (f.ref && entry.ref !== f.ref) return false;
+    if (f.related && entry.ref !== f.related && !entry.rels.includes(f.related)) return false;
+    if (f.after != null && !(entry.at >= f.after)) return false;
+    if (f.before != null && !(entry.at <= f.before)) return false;
+    if (f.path) {
+      const needle = f.path.toLowerCase();
+      const hay = [...(entry.paths ?? []), entry.source ? Object.values(entry.source).filter(v => typeof v === 'string') : []].flat().map(v => v.toLowerCase());
+      if (!hay.some(v => v.includes(needle))) return false;
+    }
+    if (f.text) {
+      const needle = f.text.toLowerCase();
+      if (!entry.hints.some(h => h.toLowerCase().includes(needle))) return false;
+    }
+    return true;
+  }
+  // Sorted (at, ref) ascending matches. Returns up to limit+1 entries so the
+  // caller can detect truncation; pass a cursor {at, ref} to resume after it.
+  findEntries(filter, cursor = null, limit = 21) {
+    const entries = [...this.index.values()].sort((a, b) => a.at - b.at || a.ref.localeCompare(b.ref));
+    const out = [];
+    for (const entry of entries) {
+      if (cursor && (entry.at < cursor.at || (entry.at === cursor.at && entry.ref.localeCompare(cursor.ref) <= 0))) continue;
+      if (!this.matchesFilters(entry, filter)) continue;
+      out.push(entry);
+      if (out.length >= limit) break;
+    }
+    return out;
+  }
+  // Reverse-chronological window for budgeted exact-byte deep scans. The
+  // cursor pair itself stays included so partially scanned events can resume.
+  deepWindow(before, limit) {
+    const entries = [...this.index.values()].sort((a, b) => b.at - a.at || b.ref.localeCompare(a.ref));
+    const out = [];
+    for (const entry of entries) {
+      if (before && (entry.at > before.at || (entry.at === before.at && entry.ref.localeCompare(before.ref) > 0))) continue;
+      out.push(entry);
+      if (out.length >= limit) break;
+    }
+    return { window: out, reachedStart: out.length < limit };
   }
   async reconcile(limit = 64) {
     if (this.closed) return { scanned: 0, imported: 0 };
@@ -214,11 +320,24 @@ export class Store {
     } else data = await this.readBlob(ref);
     // UTF-8 byte pagination uses base64 too, so arbitrary boundaries are lossless.
     const chunk = metadataOnly ? Buffer.alloc(0) : data.subarray(offset, offset + limit);
+    // Unified relation discovery across event kinds: note source/supersedes/
+    // depends_on, intent related_refs, compact refs, outputs, and advisory
+    // payload source_refs. This list is a convenience view; absence here never
+    // proves the payload lacks relations (trace_find searches the full index).
+    const inlineRels = [
+      event?.payload.ref, ...(event?.outputs ?? []).map(x => x.ref),
+      ...(event?.note?.source_refs ?? []), ...(event?.note?.supersedes ?? []), ...(event?.note?.depends_on ?? []),
+      ...(event?.intent?.related_refs ?? []), ...(event?.compact?.refs ?? []),
+    ];
+    if (event?.type === 'coordination.advisory' && (event.payload?.bytes ?? Infinity) <= 65536) {
+      try { for (const r of JSON.parse(data.toString())?.source_refs ?? []) if (refPattern.test(r)) inlineRels.push(r); }
+      catch (error) { this.warning('expand_advisory_rels', error); }
+    }
     return { ref, payload_ref: event?.payload.ref ?? ref, sha256: hash(data), hash_verified: true,
       metadata_only: metadataOnly, offset, limit, returned_bytes: chunk.length, total_bytes: data.length,
       next_offset: offset + chunk.length < data.length ? offset + chunk.length : null,
       metadata: event ?? { sha256: hash(data), bytes: data.length }, source: event?.source ?? null,
-      related_refs: [event?.payload.ref, ...(event?.outputs ?? []).map(x => x.ref), ...(event?.note?.source_refs ?? []), ...(event?.compact?.refs ?? [])].filter(Boolean),
+      related_refs: [...new Set(inlineRels.filter(Boolean))],
       text_blobs: event?.outputs ?? [],
       ...(metadataOnly ? {} : { exact_utf8: chunk.toString('utf8'), exact_base64: chunk.toString('base64'), encoding: 'utf8; base64 preserves page-boundary bytes' }) };
   }

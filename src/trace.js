@@ -1,11 +1,26 @@
 import path from 'node:path';
 import { Store } from './store.js';
-import { atomic, bytes, stable, hash, identity, callKey, locator, mutationPaths, canonical, overlaps, messageID, messageRole, messageContentFingerprint, unwrap } from './util.js';
+import { atomic, bytes, stable, hash, identity, callKey, locator, mutationPaths, canonical, overlaps, messageID, messageRole, messageContentFingerprint, refPattern, unwrap } from './util.js';
 import { compactGuidance, compactions, saveCompact } from './compact.js';
 
 const NOTE_KINDS = ['fact', 'finding', 'decision', 'unresolved', 'handoff', 'correction'];
 const ACTIVE = new Set(['active', 'waiting']);
 export const RECALL_MARKER = 'OPENCODE_TRACE_RECALL_V1';
+
+const refOf = (v, cap = 512) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, cap) : undefined);
+const encodeCursor = cursor => Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url');
+// Exact-case matches report exact byte offsets; the case-insensitive fallback
+// reports approximate offsets derived from the decoded prefix.
+function occurrences(data, text, max) {
+  const out = []; const needle = Buffer.from(text, 'utf8');
+  let at = data.indexOf(needle);
+  while (at >= 0 && out.length < max) { out.push(at); at = data.indexOf(needle, at + 1); }
+  if (out.length) return out;
+  const lower = data.toString('utf8').toLowerCase(); const small = text.toLowerCase();
+  at = lower.indexOf(small);
+  while (at >= 0 && out.length < max) { out.push(Buffer.byteLength(lower.slice(0, at), 'utf8')); at = lower.indexOf(small, at + 1); }
+  return out;
+}
 
 const observation = session => ({
   intent_declared_status: session.intent?.status ?? null,
@@ -201,6 +216,102 @@ export class Trace {
   async markContextApplied(e, { recall, checkpoint }) {
     await this.store.record('context.applied', identity(e),
       { stage: 'hook_applied', checkpoint, recallBytes: bytes(recall) }, { stage: 'hook_applied', checkpoint });
+  }
+  async find(input = {}) {
+    const f = {};
+    f.type = input.type === undefined ? undefined : (Array.isArray(input.type)
+      ? input.type.map(t => refOf(t, 64)).filter(Boolean).slice(0, 8)
+      : refOf(input.type, 64));
+    f.session = refOf(input.session, 128); f.agent = refOf(input.agent, 128);
+    f.tool = refOf(input.tool, 128); f.status = refOf(input.status, 32);
+    f.callKey = refOf(input.call_key, 80); f.ref = refOf(input.ref, 80); f.related = refOf(input.related, 80);
+    for (const r of [f.ref, f.related]) if (r !== undefined && !refPattern.test(r)) throw new Error('Invalid ref filter');
+    f.path = refOf(input.path, 512); f.text = refOf(input.text, 256);
+    f.after = input.after == null ? undefined : Number(input.after);
+    f.before = input.before == null ? undefined : Number(input.before);
+    if (f.after != null && (!Number.isFinite(f.after) || f.after < 0)) throw new Error('Invalid after');
+    if (f.before != null && (!Number.isFinite(f.before) || f.before < 0)) throw new Error('Invalid before');
+    const deep = input.deep === true;
+    const limit = Math.min(Math.max(Number.isInteger(input.limit) ? input.limit : 20, 1), 100);
+    const queryHash = hash(stable(f));
+    let cursor = null;
+    if (input.cursor != null) {
+      try { cursor = JSON.parse(Buffer.from(String(input.cursor), 'base64url').toString('utf8')); }
+      catch { throw new Error('Invalid cursor'); }
+      if (!cursor || cursor.q !== queryHash || cursor.deep !== deep || !Number.isFinite(cursor.at) || typeof cursor.ref !== 'string') throw new Error('Cursor does not match this query');
+    }
+    // Bounded catch-up so a query never silently misses events written by
+    // other processes since the last context hook.
+    const reconcile = await this.store.reconcile();
+    const coverage = this.indexCoverage(reconcile);
+    if (!deep) {
+      const rows = this.store.findEntries(f, cursor ? { at: cursor.at, ref: cursor.ref } : null, limit + 1);
+      const truncated = rows.length > limit;
+      const last = truncated ? rows[limit - 1] : null;
+      return { mode: 'index', query: { ...f }, results: rows.slice(0, limit).map(e => this.formatEntry(e, f.text)),
+        next_cursor: last ? encodeCursor({ q: queryHash, deep, at: last.at, ref: last.ref }) : null, coverage };
+    }
+    const budget = Math.min(Number.isInteger(input.deep_budget_bytes) ? input.deep_budget_bytes : 2097152, 16777216);
+    const skip = Array.isArray(cursor?.skip) ? cursor.skip.filter(r => typeof r === 'string') : [];
+    const { window: entries, reachedStart } = this.store.deepWindow(cursor ? { at: cursor.at, ref: cursor.ref } : null, 256);
+    const { text, ...rest } = f;
+    if (!text) throw new Error('deep scan requires text');
+    const hits = []; let scannedBytes = 0, scannedBlobs = 0, scannedEvents = 0, last = null, lastScanned = [], brokeEarly = false;
+    for (const entry of entries) {
+      // The cursor entry itself is always re-admitted; its already-scanned
+      // blobs are skipped via cursor.skip, so partial events resume exactly
+      // and no blob is silently passed over.
+      last = entry; lastScanned = []; scannedEvents++;
+      if (this.store.matchesFilters(entry, rest)) {
+        let complete = true;
+        for (const blobRef of [entry.payloadRef, ...entry.outputs.map(o => o.ref)].filter(Boolean)) {
+          if (skip.includes(blobRef)) { lastScanned.push(blobRef); continue; }
+          if (scannedBytes >= budget) { complete = false; brokeEarly = true; break; }
+          let data;
+          try { data = await this.store.readBlob(blobRef); }
+          catch (error) { this.warning('find_deep', error); continue; }
+          scannedBytes += data.length; scannedBlobs++; lastScanned.push(blobRef);
+          for (const offset of occurrences(data, text, 2)) {
+            hits.push({ event_ref: entry.ref, blob_ref: blobRef, byte_offset: offset,
+              snippet: data.subarray(Math.max(0, offset - 48), offset + text.length + 96).toString('utf8') });
+          }
+          if (hits.length >= limit) { complete = false; brokeEarly = true; break; }
+        }
+        if (!complete) break;
+      }
+    }
+    const exhausted = reachedStart && !brokeEarly && scannedBytes < budget;
+    return { mode: 'deep', query: { ...f }, hits: hits.slice(0, limit),
+      next_cursor: exhausted ? null : encodeCursor({ q: queryHash, deep, at: last.at, ref: last.ref,
+        skip: lastScanned.slice(0, 64), ...(lastScanned.length >= 64 ? { partial: true } : {}) }),
+      coverage: { ...coverage, deep_scan: { scanned_events: scannedEvents, scanned_blobs: scannedBlobs, scanned_bytes: scannedBytes,
+        budget_bytes: budget, exhausted_history: exhausted,
+        meaning: exhausted ? 'No further history: this query is definitive for ingested events.' : 'More history remains; continue with next_cursor.' } } };
+  }
+  formatEntry(e, text) {
+    let hit;
+    if (text) {
+      const needle = text.toLowerCase();
+      const field = e.hints.find(h => h.toLowerCase().includes(needle));
+      if (field) {
+        const at = field.toLowerCase().indexOf(needle);
+        const start = Math.max(0, at - 40);
+        hit = { field: 'hint', snippet: `${start > 0 ? '…' : ''}${field.slice(start, Math.min(field.length, at + text.length + 80))}${at + text.length + 80 < field.length ? '…' : ''}` };
+      }
+    }
+    return { ref: e.ref, type: e.type, at: e.at, sessionID: e.sessionID, agent: e.agent, tool: e.tool, status: e.status,
+      callKey: e.callKey ?? null, paths: e.paths ?? null, source: e.source ?? null,
+      payload_ref: e.payloadRef, bytes: e.bytes, outputs: e.outputs.slice(0, 4), rels: e.rels.slice(0, 8), ...(hit ? { hit } : {}) };
+  }
+  indexCoverage(reconcile) {
+    let oldest = null, newest = null;
+    for (const e of this.store.index.values()) {
+      if (oldest === null || e.at < oldest) oldest = e.at;
+      if (newest === null || e.at > newest) newest = e.at;
+    }
+    return { indexed_events: this.store.index.size, oldest_at: oldest, newest_at: newest,
+      catch_up: reconcile, pending_watcher_jobs: this.store.watchJobs.size, missed_watcher_notifications: this.store.missedWatchEvents,
+      note: 'Index is derived, memory-only and rebuilt from authoritative events at startup. It covers exactly the events this process has ingested; use queries to catch up.' };
   }
   async lifecycle(event) {
     const data = event.properties ?? event.data ?? {};
