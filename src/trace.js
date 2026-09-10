@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { Store } from './store.js';
 import { atomic, bytes, stable, hash, identity, callKey, locator, mutationPaths, canonical, overlaps, messageID, messageRole, messageContentFingerprint, refPattern, unwrap } from './util.js';
 import { compactGuidance, compactions, saveCompact } from './compact.js';
@@ -225,6 +226,8 @@ export class Trace {
     f.session = refOf(input.session, 128); f.agent = refOf(input.agent, 128);
     f.tool = refOf(input.tool, 128); f.status = refOf(input.status, 32);
     f.callKey = refOf(input.call_key, 80); f.ref = refOf(input.ref, 80); f.related = refOf(input.related, 80);
+    f.thread = refOf(input.thread, 80); f.message = refOf(input.message, 80);
+    f.recipient = refOf(input.recipient, 128); f.reply_to = refOf(input.reply_to, 80); f.proposal = refOf(input.proposal, 80);
     for (const r of [f.ref, f.related]) if (r !== undefined && !refPattern.test(r)) throw new Error('Invalid ref filter');
     f.path = refOf(input.path, 512); f.text = refOf(input.text, 256);
     f.after = input.after == null ? undefined : Number(input.after);
@@ -312,6 +315,179 @@ export class Trace {
     return { indexed_events: this.store.index.size, oldest_at: oldest, newest_at: newest,
       catch_up: reconcile, pending_watcher_jobs: this.store.watchJobs.size, missed_watcher_notifications: this.store.missedWatchEvents,
       note: 'Index is derived, memory-only and rebuilt from authoritative events at startup. It covers exactly the events this process has ingested; use queries to catch up.' };
+  }
+
+  // ---- Persistent directed negotiation ----
+  // Sender identity always comes from the host tool call, never from
+  // model-supplied fields. Persistence happens before any delivery attempt;
+  // every receipt level below requires its own evidence event.
+  static MAIL_TYPES = ['question', 'proposal', 'objection', 'counter', 'evidence', 'accept', 'reject', 'withdraw', 'handoff', 'note'];
+  mailEnvelope(message, text) {
+    return `[opencode-trace mailbox] message_id=${message.message_id} thread_id=${message.thread_id} from=${message.from}${message.in_reply_to ? ` in_reply_to=${message.in_reply_to}` : ''}${message.proposal ? ` proposal=${message.proposal}` : ''} type=${message.type}\n${text}`;
+  }
+  async deliverTo(recipient, envelope, delivery) {
+    const promptApi = this.ctx.session?.prompt;
+    if (typeof promptApi !== 'function') return { state: 'unknown', attempted: false, detail: 'host client exposes no session.prompt' };
+    try {
+      const admitted = unwrap(await promptApi.call(this.ctx.session, { sessionID: recipient, text: envelope, delivery }));
+      return { state: 'host_admitted', attempted: true, inboxID: admitted?.id ?? admitted?.inboxID ?? null, detail: `prompt:${delivery}` };
+    } catch (error) {
+      // Host rejection is terminal; transport-style failures stay unknown
+      // because the host may still have admitted the input.
+      const transient = ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN'].includes(error?.code) || error?.name === 'AbortError' || error?.name === 'TimeoutError';
+      this.warning('trace_send', error);
+      return { state: transient ? 'unknown' : 'failed', attempted: true, detail: String(error?.code ?? error?.message ?? 'error').slice(0, 160) };
+    }
+  }
+  async resolveMail(messageID) {
+    const rows = this.store.findEntries({ message: messageID });
+    const row = rows.find(r => r.type === 'trace.message');
+    if (!row) return null;
+    return { entry: row, data: JSON.parse((await this.store.readBlob(row.payloadRef)).toString()) };
+  }
+  async send(input = {}, host) {
+    if (!host?.sessionID) throw new Error('Host session identity unavailable');
+    const sender = host.sessionID;
+    if (typeof input.text !== 'string' || !input.text.trim() || bytes(input.text) > 16384 || bytes(input) > 32768) throw new Error('Invalid message text or size');
+    const text = input.text;
+    const recipients = [...new Set(Array.isArray(input.to) ? input.to.filter(r => typeof r === 'string' && r) : [])];
+    if (!recipients.length || recipients.length > 8) throw new Error('Expected between 1 and 8 recipients');
+    if (recipients.includes(sender)) throw new Error('Refusing to address the sender itself');
+    const unknown = recipients.filter(r => !this.store.sessions.has(r));
+    if (unknown.length) throw new Error(`Unknown or unobserved recipient sessions in this workspace: ${unknown.join(', ')}`);
+    const type = Trace.MAIL_TYPES.includes(input.type) ? input.type : 'note';
+    const source_refs = input.source_refs ? await this.refs(input.source_refs) : [];
+    const delivery = input.delivery === 'steer' ? 'steer' : 'queue';
+    let in_reply_to = null, thread_id = typeof input.thread_id === 'string' && /^thr_[a-f0-9]{32}$/.test(input.thread_id) ? input.thread_id : null;
+    let proposal = null;
+    if (input.in_reply_to != null) {
+      const parent = await this.resolveMail(String(input.in_reply_to));
+      if (!parent) throw new Error('in_reply_to does not resolve to a known trace message');
+      in_reply_to = String(input.in_reply_to);
+      thread_id = thread_id ?? parent.data.thread_id;
+    }
+    if (input.proposal != null) {
+      const target = await this.resolveMail(String(input.proposal));
+      if (!target) throw new Error('proposal does not resolve to a known trace message');
+      if (!['proposal', 'counter'].includes(target.data.type)) throw new Error('accept/reject/counter must bind a proposal or counter message');
+      proposal = String(input.proposal);
+      thread_id = thread_id ?? target.data.thread_id;
+    }
+    if ((type === 'accept' || type === 'reject' || type === 'counter') && !proposal) throw new Error(`${type} requires an explicit proposal reference`);
+    if (thread_id && !this.store.findEntries({ thread: thread_id, type: 'trace.message' }, null, 1).length) throw new Error('Unknown thread_id in this workspace');
+    const message_id = `msgx_${hash(stable([sender, recipients, text, randomUUID()])).slice(0, 32)}`;
+    thread_id = thread_id ?? `thr_${hash(stable([sender, [...recipients].sort(), randomUUID()])).slice(0, 32)}`;
+    const content = await this.store.blob(text, 'utf8');
+    // Durable accept point: the message exists before any delivery is attempted.
+    const event = await this.store.record('trace.message', identity(host), {
+      message_id, thread_id, from: sender, recipients, type, in_reply_to, proposal,
+      content_ref: content.ref, content_sha256: content.sha256, bytes: content.bytes, source_refs,
+    }, { message_id, thread_id, recipients, reply_to: in_reply_to, proposal });
+    const receipts = [];
+    for (const recipient of recipients) {
+      const result = await this.deliverTo(recipient, this.mailEnvelope({ message_id, thread_id, from: sender, in_reply_to, proposal, type }, text), delivery);
+      // Nothing was attempted: leave no delivery record so a later sweep can
+      // deliver safely once a host client is available.
+      let delivery_ref = null;
+      if (result.attempted) {
+        const record = await this.store.record('trace.delivery', identity(host), {
+          message_id, thread_id, recipient, state: result.state, method: result.detail, inbox_id: result.inboxID ?? null,
+        }, { message_id, thread_id, recipient });
+        delivery_ref = record.ref;
+      }
+      receipts.push({ recipient, state: result.state, delivery_ref, ...(result.inboxID ? { host_inbox_id: result.inboxID } : {}) });
+    }
+    return { ok: true, message_id, thread_id, message_ref: event.ref, receipts,
+      evidence_levels: 'persisted always; host_admitted per delivery receipt; context_observed/recipient_ack/reply_recorded are derived in trace_inbox' };
+  }
+  async inbox(input = {}, host) {
+    if (!host?.sessionID) throw new Error('Host session identity unavailable');
+    const viewer = host.sessionID;
+    await this.store.reconcile();
+    const thread = typeof input.thread_id === 'string' && /^thr_[a-f0-9]{32}$/.test(input.thread_id) ? input.thread_id : null;
+    const rows = this.store.findEntries(thread ? { type: 'trace.message', thread } : { type: 'trace.message' }, null, 256);
+    const inbox = [], outbox = [];
+    for (const row of rows.slice(-96)) {
+      const mail = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
+      const sent = row.sessionID === viewer;
+      const involved = sent || (mail.recipients ?? []).includes(viewer);
+      if (!involved) continue;
+      const deliveries = this.store.findEntries({ message: mail.message_id, type: 'trace.delivery' }, null, 32);
+      const deliveryStates = {};
+      for (const d of deliveries) {
+        try { deliveryStates[d.recipient] = JSON.parse((await this.store.readBlob(d.payloadRef)).toString()); }
+        catch (error) { this.warning('trace_inbox', error); }
+      }
+      const acks = this.store.findEntries({ message: mail.message_id, type: 'trace.ack' }, null, 16).map(a => a.sessionID);
+      const replies = this.store.findEntries({ reply_to: mail.message_id, type: 'trace.message' }, null, 16).map(r => r.ref);
+      const observedRefs = this.store.findEntries({ type: 'message.persisted', session: viewer, text: mail.message_id }, null, 2).map(r => r.ref);
+      const item = { message_id: mail.message_id, thread_id: mail.thread_id, type: mail.type, from: mail.from,
+        sent_at: row.at, message_ref: row.ref, content_ref: mail.content_ref, content_sha256: mail.content_sha256, bytes: mail.bytes,
+        in_reply_to: mail.in_reply_to ?? null, proposal: mail.proposal ?? null,
+        recipients: mail.recipients, acked_by: acks, reply_recorded: replies.length > 0, reply_refs: replies.slice(0, 4) };
+      if (sent) {
+        outbox.push({ ...item, deliveries: (mail.recipients ?? []).map(r => ({ recipient: r,
+          state: deliveryStates[r]?.state ?? 'missing_delivery_record',
+          delivery_ref: deliveries.find(d => d.recipient === r)?.ref ?? null,
+          host_inbox_id: deliveryStates[r]?.inbox_id ?? null })) });
+      } else {
+        const myDelivery = deliveryStates[viewer];
+        // Evidence levels: each needs its own recorded or derived event.
+        // host_admitted/report the delivery receipt ref; context_observed
+        // reports the message.persisted event the target session's own hook
+        // recorded; ack and reply require explicit recipient actions.
+        inbox.push({ ...item, levels: {
+          persisted: row.ref,
+          host_admitted: myDelivery ? (myDelivery.state === 'host_admitted' ? deliveries.find(d => d.recipient === viewer).ref : `state:${myDelivery.state}`) : null,
+          context_observed: observedRefs[0] ?? null,
+          recipient_ack: acks.includes(viewer),
+          reply_recorded: replies.length > 0,
+        }, note: 'recipient_ack/reply levels require explicit trace_ack / trace_send with in_reply_to' });
+      }
+    }
+    let swept = null;
+    if (input.sweep === true) swept = await this.sweepOutbox(viewer);
+    return { ok: true, viewer, inbox: inbox.slice(-32), outbox: outbox.slice(-32), ...(swept ? { swept } : {}) };
+  }
+  async sweepOutbox(viewer) {
+    const delivered = [], manual = [];
+    const mine = this.store.findEntries({ type: 'trace.message', session: viewer }, null, 64);
+    for (const row of mine) {
+      const mail = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
+      const deliveries = this.store.findEntries({ message: mail.message_id, type: 'trace.delivery' }, null, 32);
+      for (const recipient of mail.recipients ?? []) {
+        const existing = deliveries.find(d => d.recipient === recipient);
+        if (existing) {
+          const state = JSON.parse((await this.store.readBlob(existing.payloadRef)).toString()).state;
+          if (state === 'unknown') manual.push({ message_id: mail.message_id, recipient, reason: 'host_admission_uncertain; manual retry required, no auto redelivery' });
+          continue;
+        }
+        // Missing delivery record: the send crashed between persist and
+        // delivery. Text recovery is deterministic from the content blob.
+        const text = (await this.store.readBlob(mail.content_ref)).toString('utf8');
+        const result = await this.deliverTo(recipient, this.mailEnvelope({ ...mail }, text), 'queue');
+        if (result.attempted === false) {
+          manual.push({ message_id: mail.message_id, recipient, reason: 'no host client in this process; nothing was attempted' });
+          continue;
+        }
+        const record = await this.store.record('trace.delivery', { sessionID: viewer }, {
+          message_id: mail.message_id, thread_id: mail.thread_id, recipient, state: result.state,
+          method: `sweep:${result.detail}`, inbox_id: result.inboxID ?? null,
+        }, { message_id: mail.message_id, thread_id: mail.thread_id, recipient });
+        delivered.push({ message_id: mail.message_id, recipient, state: result.state, delivery_ref: record.ref });
+      }
+    }
+    return { delivered, requires_manual_choice: manual };
+  }
+  async ack(input = {}, host) {
+    if (!host?.sessionID) throw new Error('Host session identity unavailable');
+    const mail = await this.resolveMail(String(input.message_id ?? ''));
+    if (!mail) throw new Error('Unknown trace message');
+    if (!(mail.data.recipients ?? []).includes(host.sessionID)) throw new Error('Only an addressed recipient may acknowledge');
+    const event = await this.store.record('trace.ack', identity(host), {
+      message_id: mail.data.message_id, thread_id: mail.data.thread_id, by: host.sessionID,
+    }, { message_id: mail.data.message_id, thread_id: mail.data.thread_id });
+    return { ok: true, message_id: mail.data.message_id, ack_ref: event.ref, note: 'receipt only; never means agreement or completion' };
   }
   async lifecycle(event) {
     const data = event.properties ?? event.data ?? {};

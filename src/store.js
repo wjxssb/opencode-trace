@@ -115,6 +115,12 @@ export class Store {
       ref: event.ref, at: event.at ?? 0, type: event.type,
       sessionID: event.host?.sessionID ?? null, messageID: event.host?.messageID ?? null, agent: event.host?.agent ?? null,
       tool: event.tool ?? null, status: event.status ?? null, callKey: event.callKey ?? null,
+      thread: typeof event.thread_id === 'string' ? event.thread_id : null,
+      mailID: typeof event.message_id === 'string' ? event.message_id : null,
+      recipients: Array.isArray(event.recipients) ? event.recipients.filter(r => typeof r === 'string') : null,
+      recipient: typeof event.recipient === 'string' ? event.recipient : null,
+      replyTo: typeof event.reply_to === 'string' ? event.reply_to : null,
+      proposal: typeof event.proposal === 'string' ? event.proposal : null,
       paths: Array.isArray(event.paths) ? event.paths : null,
       source: event.source && Object.keys(event.source).length ? event.source : null,
       payloadRef: event.payload?.ref ?? null, bytes: event.payload?.bytes ?? 0,
@@ -130,6 +136,11 @@ export class Store {
     if (f.tool && entry.tool !== f.tool) return false;
     if (f.status && entry.status !== f.status) return false;
     if (f.callKey && entry.callKey !== f.callKey) return false;
+    if (f.thread && entry.thread !== f.thread) return false;
+    if (f.message && entry.mailID !== f.message) return false;
+    if (f.recipient && !(entry.recipient === f.recipient || (entry.recipients ?? []).includes(f.recipient))) return false;
+    if (f.reply_to && entry.replyTo !== f.reply_to) return false;
+    if (f.proposal && entry.proposal !== f.proposal) return false;
     if (f.ref && entry.ref !== f.ref) return false;
     if (f.related && entry.ref !== f.related && !entry.rels.includes(f.related)) return false;
     if (f.after != null && !(entry.at >= f.after)) return false;
