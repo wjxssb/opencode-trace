@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Store } from './store.js';
-import { atomic, bytes, stable, hash, identity, callKey, locator, mutationPaths, canonical, overlaps, messageID, messageRole, messageContentFingerprint, refPattern, unwrap } from './util.js';
+import { atomic, bytes, stable, hash, identity, callKey, locator, mutationPaths, canonical, overlaps, messageID, messageRole, messageContentFingerprint, textFromMessage, refPattern, unwrap } from './util.js';
 import { compactGuidance, compactions, saveCompact } from './compact.js';
 
 const NOTE_KINDS = ['fact', 'finding', 'decision', 'unresolved', 'handoff', 'correction'];
@@ -227,6 +227,7 @@ export class Trace {
     f.tool = refOf(input.tool, 128); f.status = refOf(input.status, 32);
     f.callKey = refOf(input.call_key, 80); f.ref = refOf(input.ref, 80); f.related = refOf(input.related, 80);
     f.thread = refOf(input.thread, 80); f.message = refOf(input.message, 80);
+    f.plan = refOf(input.plan, 80);
     f.recipient = refOf(input.recipient, 128); f.reply_to = refOf(input.reply_to, 80); f.proposal = refOf(input.proposal, 80);
     for (const r of [f.ref, f.related]) if (r !== undefined && !refPattern.test(r)) throw new Error('Invalid ref filter');
     f.path = refOf(input.path, 512); f.text = refOf(input.text, 256);
@@ -488,6 +489,109 @@ export class Trace {
       message_id: mail.data.message_id, thread_id: mail.data.thread_id, by: host.sessionID,
     }, { message_id: mail.data.message_id, thread_id: mail.data.thread_id });
     return { ok: true, message_id: mail.data.message_id, ack_ref: event.ref, note: 'receipt only; never means agreement or completion' };
+  }
+
+  // ---- Thin native orchestration adapter ----
+  // The model owns planning; this tool only binds steps to native sessions and
+  // records evidence. Independent steps fan out in dependency waves; recorded
+  // terminal states are never re-executed when the same plan version returns.
+  async plan(input = {}, host) {
+    if (!host?.sessionID) throw new Error('Host session identity unavailable');
+    const steps = Array.isArray(input.steps) ? input.steps : [];
+    if (!steps.length || steps.length > 8) throw new Error('Expected 1-8 steps');
+    const ids = steps.map(s => s?.id);
+    if (new Set(ids).size !== ids.length || ids.some(id => typeof id !== 'string' || !/^[a-z0-9_-]{1,32}$/i.test(id))) throw new Error('Step ids must be unique short tokens');
+    for (const step of steps) {
+      if (typeof step.text !== 'string' || !step.text.trim() || bytes(step.text) > 4096) throw new Error(`Step ${step.id} has invalid text`);
+      for (const dep of step.depends_on ?? []) if (!ids.includes(dep) || dep === step.id) throw new Error(`Step ${step.id} has an invalid dependency`);
+    }
+    const version = hash(stable(steps));
+    const plan_id = `plan_${version.slice(0, 24)}`;
+    const byId = new Map(steps.map(s => [s.id, s]));
+    const visiting = new Set(), done = new Set();
+    const visit = id => {
+      if (done.has(id)) return true;
+      if (visiting.has(id)) return false;
+      visiting.add(id);
+      for (const dep of byId.get(id).depends_on ?? []) if (!visit(dep)) return false;
+      visiting.delete(id); done.add(id);
+      return true;
+    };
+    for (const s of steps) if (!visit(s.id)) throw new Error('Dependency cycle detected');
+    const previous = new Map();
+    for (const row of this.store.findEntries({ type: 'trace.step', plan: plan_id }, null, 256)) {
+      try { const data = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
+        if (data.version === version && ['succeeded', 'cancelled'].includes(data.state)) previous.set(data.step, { ...data, ref: row.ref });
+      } catch (error) { this.warning('trace_plan', error); }
+    }
+    const planEvent = await this.store.record('trace.plan', identity(host), {
+      plan_id, version, resumed: previous.size > 0, steps: ids.map(id => ({ id, depends_on: byId.get(id).depends_on ?? [] })),
+    }, { plan_id });
+    const results = [];
+    const states = new Map();
+    const runStep = async step => {
+      const done = previous.get(step.id);
+      if (done) {
+        results.push({ id: step.id, state: `already_${done.state}`, sessionID: done.sessionID ?? null, evidence_ref: done.ref, reused: true });
+        states.set(step.id, done.state);
+        return;
+      }
+      const depStates = await Promise.all((step.depends_on ?? []).map(id => runners.get(id)));
+      if (depStates.some(s => s !== 'succeeded')) {
+        const record = await this.store.record('trace.step', identity(host), {
+          plan_id, version, step: step.id, state: 'cancelled', reason: 'dependency did not succeed',
+        }, { plan_id, step: step.id });
+        results.push({ id: step.id, state: 'cancelled', evidence_ref: record.ref, reused: false });
+        states.set(step.id, 'cancelled');
+        return;
+      }
+      const sessionApi = this.ctx.session;
+      if (!sessionApi?.create || !sessionApi?.prompt || !sessionApi?.wait || !sessionApi?.context) {
+        const record = await this.store.record('trace.step', identity(host), {
+          plan_id, version, step: step.id, state: 'unsupported', reason: 'host client lacks native session primitives',
+        }, { plan_id, step: step.id });
+        results.push({ id: step.id, state: 'unsupported', evidence_ref: record.ref, reused: false });
+        states.set(step.id, 'unsupported');
+        return;
+      }
+      const created = unwrap(await sessionApi.create({ title: `trace-plan ${plan_id.slice(5, 14)}/${step.id}` }));
+      const sid = created?.id ?? null;
+      await this.store.record('trace.step', identity(host), {
+        plan_id, version, step: step.id, state: 'started', sessionID: sid, native: 'session.create+prompt+wait',
+      }, { plan_id, step: step.id });
+      try {
+        await unwrap(await sessionApi.prompt({ sessionID: sid, text: step.text }));
+        await sessionApi.wait({ sessionID: sid });
+        const context = unwrap(await sessionApi.context({ sessionID: sid })) ?? [];
+        const last = context.filter(m => messageRole(m) === 'assistant' && (m.time?.completed || m.finish)).at(-1) ?? null;
+        const record = await this.store.record('trace.step', identity(host), {
+          plan_id, version, step: step.id, state: 'succeeded', sessionID: sid,
+          evidence: { last_message_id: messageID(last) ?? null, output_preview: last ? textFromMessage(last).slice(0, 512) : null,
+            note: 'exact transcript is persisted as message.persisted events of the bound session' },
+        }, { plan_id, step: step.id });
+        results.push({ id: step.id, state: 'succeeded', sessionID: sid, evidence_ref: record.ref, reused: false });
+        states.set(step.id, 'succeeded');
+      } catch (error) {
+        this.warning('trace_plan', error);
+        try { await sessionApi.interrupt?.({ sessionID: sid }); } catch {}
+        const record = await this.store.record('trace.step', identity(host), {
+          plan_id, version, step: step.id, state: 'failed', sessionID: sid, error: String(error?.message ?? error).slice(0, 200),
+        }, { plan_id, step: step.id });
+        results.push({ id: step.id, state: 'failed', sessionID: sid, evidence_ref: record.ref, reused: false });
+        states.set(step.id, 'failed');
+      }
+    };
+    const runners = new Map();
+    const pending = new Set(ids);
+    while (pending.size) {
+      const wave = steps.filter(s => pending.has(s.id) && (s.depends_on ?? []).every(d => !pending.has(d)));
+      if (!wave.length) throw new Error('Dependency deadlock');
+      await Promise.all(wave.map(async step => { await runStep(step); runners.set(step.id, states.get(step.id)); pending.delete(step.id); }));
+    }
+    const failed = results.some(r => ['failed', 'unsupported'].includes(r.state));
+    return { ok: true, plan_id, version, plan_ref: planEvent.ref, steps: results,
+      note: failed ? 'not every step succeeded; dependents were cancelled, never silently skipped' : 'every step has recorded terminal evidence',
+      parent_completion: 'plan acceptance never completes the parent task by itself' };
   }
   async lifecycle(event) {
     const data = event.properties ?? event.data ?? {};

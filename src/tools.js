@@ -49,6 +49,14 @@ export function definitions(trace) {
       schema({ thread_id: str, sweep: { type: 'boolean' } }), (i, h) => trace.inbox(i, h)),
     tool('trace_ack', 'Record that you received a specific trace message. This is a delivery receipt only; it never means agreement or completion.',
       schema({ message_id: str }, ['message_id']), (i, h) => trace.ack(i, h)),
+    tool('trace_plan', 'Execute a small dependency-ordered plan through native sessions only: you own the plan, this binds each step to a fresh session (create + prompt + wait + collect). Independent steps fan out in waves; recorded terminal states are never re-executed when the same plan version returns; failed steps cancel their dependents. Maximum 8 steps; step text up to 4096 bytes. Plan acceptance never completes your parent task by itself.',
+      schema({
+        steps: { type: 'array', minItems: 1, maxItems: 8, items: schema({
+          id: { ...str, pattern: '^[a-z0-9_-]{1,32}$' },
+          text: { ...str, maxLength: 4096 },
+          depends_on: { type: 'array', items: str, maxItems: 8 },
+        }, ['id', 'text']) },
+      }, ['steps']), (i, h) => trace.plan(i, h)),
     tool('trace_intent', 'Declare your current intent and explicit paths/resources. Overlap produces advisory information only. Update to done/cancelled when finished.',
       schema({ summary: str, paths: { type: 'array', items: str, maxItems: 64 }, resources: { type: 'array', items: str, maxItems: 32 }, status: { enum: ['active', 'waiting', 'done', 'cancelled'] }, related_refs: refs }, ['summary', 'paths', 'status']), (i, h) => trace.intent(i, h)),
     tool('trace_status', 'Show bounded memory, peer intent declarations separately from historical host lifecycle observations, exact source refs and degradation count. Peer pagination limits display only. include_storage:true performs an optional filesystem byte/object count; no retention or quota is enforced.',

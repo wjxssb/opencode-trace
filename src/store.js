@@ -117,6 +117,7 @@ export class Store {
       tool: event.tool ?? null, status: event.status ?? null, callKey: event.callKey ?? null,
       thread: typeof event.thread_id === 'string' ? event.thread_id : null,
       mailID: typeof event.message_id === 'string' ? event.message_id : null,
+      plan: typeof event.plan_id === 'string' ? event.plan_id : null,
       recipients: Array.isArray(event.recipients) ? event.recipients.filter(r => typeof r === 'string') : null,
       recipient: typeof event.recipient === 'string' ? event.recipient : null,
       replyTo: typeof event.reply_to === 'string' ? event.reply_to : null,
@@ -138,6 +139,7 @@ export class Store {
     if (f.callKey && entry.callKey !== f.callKey) return false;
     if (f.thread && entry.thread !== f.thread) return false;
     if (f.message && entry.mailID !== f.message) return false;
+    if (f.plan && entry.plan !== f.plan) return false;
     if (f.recipient && !(entry.recipient === f.recipient || (entry.recipients ?? []).includes(f.recipient))) return false;
     if (f.reply_to && entry.replyTo !== f.reply_to) return false;
     if (f.proposal && entry.proposal !== f.proposal) return false;
