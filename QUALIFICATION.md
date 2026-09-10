@@ -1,5 +1,9 @@
 # Local qualification
 
+This page preserves the original 0.1.0 installation qualification. See the
+[0.1.1 targeted audit](EVIDENCE.md) for measured costs, fixes, GLM recovery,
+Qwen's pre-fix timeout and post-fix `ENVIRONMENT_BLOCKED_XID43` result.
+
 Qualified on 2026-09-09 with Ubuntu 24.04.3 LTS, OpenCode V2 `0.0.0-beta-19296`, Node `v22.16.0`.
 
 Release: `0.1.0`. Runtime bundle SHA-256:

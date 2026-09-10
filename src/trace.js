@@ -7,9 +7,21 @@ const NOTE_KINDS = ['fact', 'finding', 'decision', 'unresolved', 'handoff', 'cor
 const ACTIVE = new Set(['active', 'waiting']);
 export const RECALL_MARKER = 'OPENCODE_TRACE_RECALL_V1';
 
+const observation = session => ({
+  intent_declared_status: session.intent?.status ?? null,
+  intent_recorded_at: session.intent?.at ?? null,
+  session_lifecycle: session.observation?.lifecycle ?? null,
+  last_observed_at: session.observation?.at ?? null,
+  lifecycle_ref: session.observation?.ref ?? null,
+  host_deleted_evidence: session.deleted ?? null,
+  liveness_unknown: !session.deleted,
+  stale_observation: 'Historical observation, not a heartbeat. Execution completion does not terminate the session.'
+});
+
 export class Trace {
   constructor(ctx, options = {}) {
     this.ctx = ctx; this.options = options; this.errors = 0; this.hydrated = new Set(); this.hydrating = new Map(); this.messageSeen = new Set(); this.compactSeen = new Set();
+    this.observerJobs = new Set(); this.maxObserverJobs = 8; this.droppedObservations = 0;
     this.warning = (where, error) => {
       this.errors++;
       // Log error class/code only; hook payloads may contain private material.
@@ -20,10 +32,19 @@ export class Trace {
     this.ready.catch(error => this.warning('startup', error));
   }
   async safe(where, fn) {
+    if (this.observerJobs.size >= this.maxObserverJobs) {
+      this.droppedObservations++;
+      this.warning(where, { code: 'OBSERVER_BUSY' });
+      return undefined;
+    }
     let timer;
+    const job = (async () => { await this.ready; return fn(); })();
+    this.observerJobs.add(job);
+    const release = () => this.observerJobs.delete(job);
+    job.then(release, release);
     // Bounded waiting for this observer, never a prerequisite for execution.
     try {
-      return await Promise.race([(async () => { await this.ready; return fn(); })(), new Promise((_, reject) => {
+      return await Promise.race([job, new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error('observer_timeout')), 1000); timer.unref?.();
       })]);
     } catch (error) { this.warning(where, error); return undefined; }
@@ -110,7 +131,7 @@ export class Trace {
         if (!shared.length && !sharedResources.length) continue;
         const event = await this.store.record('coordination.advisory', { sessionID: sid }, { source_refs: [sourceRef, peerSource.ref].sort(), effect: 'advisory_only' },
           { peers: [sid, peerID].sort(), paths: shared, resources: sharedResources });
-        result.push({ ref: event.ref, peer: peerID, paths: shared, resources: sharedResources });
+        result.push({ ref: event.ref, peer: peerID, paths: shared, resources: sharedResources, observation: observation(peer) });
       }
     }
     return result;
@@ -120,15 +141,17 @@ export class Trace {
     const superseded = new Set(s.notes.flatMap(n => n.supersedes ?? []));
     const peers = [...this.store.sessions.values()].filter(p => p.sessionID !== sid).sort((a, b) => b.lastActivity - a.lastActivity || a.sessionID.localeCompare(b.sessionID));
     return { schema: 1, workspace: this.store.workspace, sessionID: sid, agent: s.agent ?? null, parentID: s.parentID ?? null,
-      current_intent: s.intent, unresolved: s.notes.filter(n => n.kind === 'unresolved' && !superseded.has(n.ref)).slice(-8),
+      current_intent: s.intent, observation: observation(s), unresolved: s.notes.filter(n => n.kind === 'unresolved' && !superseded.has(n.ref)).slice(-8),
       notes: s.notes.filter(n => n.kind !== 'unresolved' && !superseded.has(n.ref)).slice(-8), compact: s.compact,
       recent: s.recent.filter(e => e.type === 'tool.after' && !e.tool?.startsWith('trace_')).slice(-8),
-      advisories: s.conflicts.slice(-4),
+      advisories: s.conflicts.slice(-4).map(a => ({ ...a, peer_observations: a.peers.filter(id => id !== sid).map(id => ({ sessionID: id, ...observation(this.store.session(id)) })) })),
       peers: peers.slice(peerOffset, peerOffset + peerLimit).map(p => ({ sessionID: p.sessionID, agent: p.agent ?? null, role: p.role ?? null, parentID: p.parentID ?? null,
-        status: p.lifecycle ?? 'observed', lastActivity: p.lastActivity, intent: p.intent ? { ref: p.intent.ref, summary: p.intent.summary.slice(0, 256), status: p.intent.status, paths: p.intent.paths.slice(0, 8) } : null,
+        status: p.lifecycle ?? 'observed', lastActivity: p.lastActivity, intent: p.intent ? { ref: p.intent.ref, status: p.intent.status,
+          paths: p.intent.paths.slice(0, 8), resources: p.intent.resources.slice(0, 8), recorded_at: p.intent.at } : null,
+        observation: observation(p),
         note_refs: p.notes.slice(-2).map(n => n.ref) })),
       peer_total: peers.length, peer_next_offset: peerOffset + peerLimit < peers.length ? peerOffset + peerLimit : null,
-      observation: 'Snapshot may be stale; intents are declarations, and paths for arbitrary shell are unknown. Advisories never block execution.' };
+      coordination: 'Snapshot may be stale; intents are declarations, and paths for arbitrary shell are unknown. Advisories never block execution.' };
   }
   recall(sid) {
     const view = this.projection(sid);
@@ -155,11 +178,17 @@ export class Trace {
     return text;
   }
   async context(e) {
+    await this.store.reconcile();
     await this.hydrate(e.sessionID);
     await this.observeMessages(e.sessionID, e.messages);
     const s = this.store.session(e.sessionID); if (e.agent !== undefined) s.agent = e.agent;
     const recall = this.recall(e.sessionID);
-    const event = await this.store.record('context.checkpoint', identity(e), { messageIDs: (e.messages ?? []).map(messageID).filter(Boolean), recall }, { recallBytes: bytes(recall) });
+    const ids = (e.messages ?? []).map(messageID).filter(Boolean);
+    // The exact messages are durable message.persisted events above. Avoid
+    // copying the cumulative ID prefix on every turn (quadratic storage).
+    const event = await this.store.record('context.checkpoint', identity(e), {
+      messageCount: ids.length, messageIDsSha256: hash(stable(ids)), messageIDsTail: ids.slice(-8), recall
+    }, { recallBytes: bytes(recall) });
     await atomic(path.join(this.store.root, 'recall', `${hash(e.sessionID)}.json`), stable({ ref: event.ref, text: recall }));
     return recall;
   }

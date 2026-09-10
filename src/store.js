@@ -10,6 +10,7 @@ export class Store {
   constructor(workspace, root = path.join(os.homedir(), '.local/share/opencode-trace'), warning = () => {}) {
     this.workspace = workspace; this.base = root; this.warning = warning;
     this.sessions = new Map(); this.seen = new Set(); this.watchJobs = new Set();
+    this.watchRefs = new Set(); this.maxWatchJobs = 16; this.missedWatchEvents = 0;
   }
   async init() {
     this.workspace = await canonical(this.workspace);
@@ -19,8 +20,12 @@ export class Store {
     // Watch before recovery to cover concurrent writers during the one startup scan.
     this.watcher = watch(path.join(this.root, 'events'), (_event, filename) => {
       if (!/^evt_[a-f0-9]{64}\.json$/.test(filename ?? '')) return;
-      const job = this.readEvent(filename.slice(0, -5)).then(e => this.reduce(e)).catch(e => this.warning('watch', e));
-      this.watchJobs.add(job); job.finally(() => this.watchJobs.delete(job));
+      const ref = filename.slice(0, -5);
+      if (this.seen.has(ref) || this.watchRefs.has(ref)) return;
+      if (this.watchJobs.size >= this.maxWatchJobs) { this.missedWatchEvents++; return; }
+      this.watchRefs.add(ref);
+      const job = this.readEvent(ref).then(e => this.ingest(e)).catch(e => this.warning('watch', e));
+      this.watchJobs.add(job); job.finally(() => { this.watchJobs.delete(job); this.watchRefs.delete(ref); });
     });
     this.watcher.unref();
     const names = (await fs.readdir(path.join(this.root, 'events'))).filter(x => /^evt_[a-f0-9]{64}\.json$/.test(x));
@@ -30,12 +35,56 @@ export class Store {
       catch (error) { this.warning('recovery', error); }
     }
     recovered.sort((a, b) => a.at - b.at || a.ref.localeCompare(b.ref));
-    for (const event of recovered) this.reduce(event);
+    for (const event of recovered) {
+      try { await this.ingest(event); }
+      catch (error) { this.warning('recovery', error); }
+    }
     await atomic(path.join(this.root, 'state', 'schema.json'), stable({ schema: 1, workspace: this.workspace, workspaceID: this.workspaceID }));
     return this;
   }
-  close() { this.watcher?.close(); }
+  close() {
+    this.closed = true; this.watcher?.close();
+    const directory = this.reconcileDirectory; this.reconcileDirectory = null;
+    return directory?.close().catch(() => {});
+  }
   async flush() { await Promise.allSettled([...this.watchJobs]); }
+  async ingest(event) {
+    let hostCreated = event.compact?.host_created_at;
+    // Older immutable events lack the chronology field. Recover it from the
+    // verified native compaction payload, without rewriting the event.
+    if (event.type === 'compaction' && hostCreated === undefined) {
+      const row = JSON.parse((await this.readBlob(event.payload.ref)).toString());
+      hostCreated = Number.isFinite(row.time?.created) ? row.time.created : null;
+    }
+    this.reduce(event, hostCreated);
+  }
+  async reconcile(limit = 64) {
+    if (this.closed) return { scanned: 0, imported: 0 };
+    if (!Number.isInteger(limit) || limit < 1 || limit > 128) throw new Error('Invalid reconcile batch');
+    if (this.reconcileJob) return this.reconcileJob;
+    const job = (async () => {
+      if (!this.reconcileDirectory) this.reconcileDirectory = await fs.opendir(path.join(this.root, 'events'));
+      let scanned = 0, imported = 0;
+      while (!this.closed && scanned < limit) {
+        const entry = await this.reconcileDirectory.read();
+        if (!entry) { await this.reconcileDirectory.close(); this.reconcileDirectory = null; break; }
+        scanned++;
+        if (!/^evt_[a-f0-9]{64}\.json$/.test(entry.name)) continue;
+        const ref = entry.name.slice(0, -5);
+        if (this.seen.has(ref)) continue;
+        try { await this.ingest(await this.readEvent(ref)); imported++; }
+        catch (error) { this.warning('reconcile', error); }
+      }
+      return { scanned, imported };
+    })();
+    this.reconcileJob = job;
+    try { return await job; } finally {
+      this.reconcileJob = null;
+      if (this.closed && this.reconcileDirectory) {
+        await this.reconcileDirectory.close().catch(() => {}); this.reconcileDirectory = null;
+      }
+    }
+  }
   session(id) {
     if (!this.sessions.has(id)) this.sessions.set(id, { sessionID: id, recent: [], notes: [], conflicts: [], pending: {}, compact: null, intent: null, lastActivity: 0 });
     return this.sessions.get(id);
@@ -82,16 +131,16 @@ export class Store {
         event = existing;
       }
     }
-    this.reduce(event);
+    await this.ingest(event);
     if (host.sessionID) await atomic(path.join(this.root, 'sessions', `${hash(host.sessionID)}.json`), stable(this.session(host.sessionID)));
     return event;
   }
-  reduce(event) {
+  reduce(event, hostCreated = event.compact?.host_created_at) {
     if (this.seen.has(event.ref)) return;
     this.seen.add(event.ref);
     const sid = event.host.sessionID;
     if (!sid) return;
-    const s = this.session(sid), item = { ref: event.ref, type: event.type, at: event.at, tool: event.tool, status: event.status, source: event.source };
+    const s = this.session(sid), item = { ref: event.ref, type: event.type, at: event.at, tool: event.tool, status: event.status, source: event.source, outputs: event.outputs };
     s.recent = keep(s.recent, item, 32);
     if (event.at >= s.lastActivity) {
       Object.assign(s, event.host); s.lastActivity = event.at;
@@ -107,8 +156,24 @@ export class Store {
     // Completed entries are only replay guards; retain a bounded window, not outputs.
     const completed = Object.entries(s.pending).filter(([, v]) => v.terminal).sort((a, b) => b[1].at - a[1].at);
     for (const [key] of completed.slice(128)) delete s.pending[key];
-    if (event.type === 'compaction' && event.at >= (s.compact?.at ?? 0)) s.compact = { ...item, ...event.compact };
-    if (event.type === 'session.lifecycle') s.lifecycle = event.lifecycle;
+    if (event.type === 'compaction') {
+      const candidate = { ...item, ...event.compact, host_created_at: hostCreated ?? null,
+        host_message_id: event.host.messageID ?? '', chronology_unknown: !Number.isFinite(hostCreated) };
+      const a = candidate.host_created_at ?? -Infinity, b = s.compact?.host_created_at ?? -Infinity;
+      // Host creation time orders compactions, never local observation time.
+      // Equal/missing times use an explicit deterministic tie-break, not a
+      // claim that opaque IDs prove chronology.
+      if (!s.compact || a > b || (a === b && candidate.host_message_id.localeCompare(s.compact.host_message_id) > 0)) s.compact = candidate;
+    }
+    if (event.type === 'session.lifecycle') {
+      if (event.at >= (s.observation?.at ?? 0)) {
+        s.lifecycle = event.lifecycle;
+        s.observation = { lifecycle: event.lifecycle, at: event.at, ref: event.ref, hostEventID: event.hostEventID ?? null };
+      }
+      // Execution completion is not session termination. Keep explicit deletion
+      // evidence separate from both the last observation and declared intent.
+      if (event.lifecycle === 'session.deleted') s.deleted = { ref: event.ref, at: event.at, hostEventID: event.hostEventID ?? null };
+    }
     if (event.type === 'coordination.advisory') {
       for (const peer of event.peers) {
         const target = this.session(peer);
@@ -116,17 +181,44 @@ export class Store {
       }
     }
   }
-  async expand(ref, offset = 0, limit = 12000) {
+  async expand(ref, offset = 0, limit = 2048, metadataOnly = false) {
     if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 24000) throw new Error('Invalid expansion range');
+    if (typeof metadataOnly !== 'boolean') throw new Error('Invalid metadata_only');
     let event, data;
     if (ref.startsWith('evt_')) {
       event = await this.readEvent(ref); data = await this.readBlob(event.payload.ref);
     } else data = await this.readBlob(ref);
     // UTF-8 byte pagination uses base64 too, so arbitrary boundaries are lossless.
-    const chunk = data.subarray(offset, offset + limit);
-    return { ref, metadata: event ?? { sha256: hash(data), bytes: data.length }, source: event?.source ?? null,
+    const chunk = metadataOnly ? Buffer.alloc(0) : data.subarray(offset, offset + limit);
+    return { ref, payload_ref: event?.payload.ref ?? ref, sha256: hash(data), hash_verified: true,
+      metadata_only: metadataOnly, offset, limit, returned_bytes: chunk.length, total_bytes: data.length,
+      next_offset: offset + chunk.length < data.length ? offset + chunk.length : null,
+      metadata: event ?? { sha256: hash(data), bytes: data.length }, source: event?.source ?? null,
       related_refs: [event?.payload.ref, ...(event?.outputs ?? []).map(x => x.ref), ...(event?.note?.source_refs ?? []), ...(event?.compact?.refs ?? [])].filter(Boolean),
-      offset, total_bytes: data.length, next_offset: offset + chunk.length < data.length ? offset + chunk.length : null,
-      exact_utf8: chunk.toString('utf8'), exact_base64: chunk.toString('base64'), encoding: 'utf8; base64 preserves page-boundary bytes' };
+      text_blobs: event?.outputs ?? [],
+      ...(metadataOnly ? {} : { exact_utf8: chunk.toString('utf8'), exact_base64: chunk.toString('base64'), encoding: 'utf8; base64 preserves page-boundary bytes' }) };
+  }
+  async storageUsage() {
+    const groups = {};
+    async function walk(directory, group) {
+      for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+        const filename = path.join(directory, entry.name);
+        if (entry.isDirectory()) await walk(filename, group);
+        else if (entry.isFile()) {
+          const s = await fs.stat(filename);
+          group.objects++; group.bytes += s.size; group.allocated_file_bytes += s.blocks * 512;
+        }
+      }
+    }
+    for (const name of ['events', 'blobs', 'sessions', 'recall', 'intents', 'state']) {
+      groups[name] = { objects: 0, bytes: 0, allocated_file_bytes: 0 };
+      await walk(path.join(this.root, name), groups[name]);
+    }
+    const disk = await fs.statfs(this.root).catch(() => null);
+    return { observed_at: Date.now(), consistency: 'best_effort_snapshot; concurrent writes may change totals',
+      total_bytes: Object.values(groups).reduce((n, g) => n + g.bytes, 0),
+      object_count: Object.values(groups).reduce((n, g) => n + g.objects, 0), groups,
+      filesystem_available_bytes: disk ? disk.bavail * disk.bsize : null,
+      retention: 'No automatic deletion or disk quota. File allocation excludes directory metadata.' };
   }
 }

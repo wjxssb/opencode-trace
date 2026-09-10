@@ -33,7 +33,9 @@ export async function saveCompact(store, sid, row) {
   try { map = await parseMap(row.summary, store); }
   catch (error) { gap = error instanceof SyntaxError ? 'invalid_json' : error.code === 'ENOENT' ? 'missing_ref' : error.message; }
   const refs = [...new Set(Object.values(map ?? {}).flat())];
-  const event = await store.record('compaction', { sessionID: sid, messageID: row.id }, row, { compact: { map, refs, recovery_gap: gap } });
+  const hostCreated = Number.isFinite(row.time?.created) ? row.time.created : null;
+  const event = await store.record('compaction', { sessionID: sid, messageID: row.id }, row,
+    { compact: { map, refs, recovery_gap: gap, host_created_at: hostCreated } });
   if (gap) await store.record('recovery_gap', { sessionID: sid, messageID: row.id }, { reason: gap, source_ref: event.ref });
   return event;
 }
