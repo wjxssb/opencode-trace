@@ -1,0 +1,10 @@
+node_modules/
+coverage/
+.DS_Store
+__pycache__/
+.env
+.env.*
+/opencode.json
+/opencode.jsonc
+/receipts/
+/audit/
