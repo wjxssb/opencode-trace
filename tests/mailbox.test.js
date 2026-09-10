@@ -244,6 +244,69 @@ test('P5.2: viewer-scoped inbox - other sessions traffic cannot push own mail ou
   assert.equal(ids.length, 1);
 });
 
+test('P5.3: sweep drains an old backlog across repeated sweeps - the budget counts actionable mail, not raw history', async t => {
+  const { storeRoot } = await root(t);
+  const sender = await traceWith(storeRoot, {});
+  sender.store.session('s2');
+  const sent = [];
+  for (let i = 0; i < 150; i++) sent.push((await sender.send({ to: ['s2'], text: `backlog ${i}` }, hostOf('s1', `b${i}`))).message_id);
+  let calls = 0;
+  const healer = await traceWith(storeRoot, { prompt: async input => { calls++; return { data: { id: `h${calls}` } }; } });
+  let swept = await healer.inbox({ sweep: true }, hostOf('s1'));
+  assert.equal(swept.swept.delivered.length, 64, 'one sweep is bounded to 64 actionable deliveries');
+  assert.equal(swept.swept.actionable_budget, 64);
+  // Delivered mail stops consuming the budget, so the next sweep reaches the
+  // older half instead of staring at the same newest 64 forever.
+  swept = await healer.inbox({ sweep: true }, hostOf('s1'));
+  assert.equal(swept.swept.delivered.length, 64);
+  swept = await healer.inbox({ sweep: true }, hostOf('s1'));
+  assert.equal(swept.swept.delivered.length, 22, 'the remaining backlog is swept');
+  assert.equal(calls, 150, 'every undelivered message was delivered exactly once across sweeps');
+  const final = await healer.inbox({ sweep: true }, hostOf('s1'));
+  assert.deepEqual(final.swept.delivered, []);
+  assert.equal(final.swept.actionable_budget, 0, 'a drained backlog consumes no budget');
+  const states = new Set((await healer.inbox({}, hostOf('s1'))).outbox.flatMap(m => m.deliveries.map(d => d.state)));
+  assert.deepEqual([...states], ['host_admitted']);
+  // The oldest message was reached and delivered: no starvation.
+  assert.equal((await healer.deliveryOutcome(sent[0], 's2')).state, 'host_admitted', 'the oldest backlog item was delivered');
+});
+
+test('P5.3: delivery projection reads full history - old churn cannot hide the newest attempt', async t => {
+  const { storeRoot } = await root(t);
+  const sender = await traceWith(storeRoot, {});
+  sender.store.session('s2');
+  const sent = await sender.send({ to: ['s2'], text: 'long wal probe' }, hostOf('s1'));
+  const recordAttempt = (attempt_id, state) => sender.store.record('trace.delivery', { sessionID: 's1' }, {
+    message_id: sent.message_id, thread_id: sent.thread_id, recipient: 's2', attempt_id, phase: state === 'attempted' ? 'attempt' : 'result',
+    ...(state === 'attempted' ? { state: 'attempted', method: 'prompt:queue', inbox_id: null } : { state, method: 'synthetic', inbox_id: null }),
+  }, { message_id: sent.message_id, thread_id: sent.thread_id, recipient: 's2' });
+  // 70 retracted attempts: the oldest-128-event window of the previous
+  // implementation already ends inside this churn.
+  for (let i = 0; i < 70; i++) { await recordAttempt(`attempt-old-${String(i).padStart(4, '0')}`, 'attempted'); await recordAttempt(`attempt-old-${String(i).padStart(4, '0')}`, 'not_attempted'); }
+  // Attempt 71 is admitted and its result lands - beyond the old cutoff.
+  const newest = 'attempt-new-0000000001';
+  await recordAttempt(newest, 'attempted');
+  await recordAttempt(newest, 'host_admitted');
+  const admitted = await sender.deliveryOutcome(sent.message_id, 's2');
+  assert.equal(admitted.state, 'host_admitted', 'the newest result decides, not the oldest window');
+  // And the same history with a result-less newest attempt stays a crash window.
+  const sent2 = await sender.send({ to: ['s2'], text: 'long wal probe two' }, hostOf('s1', 'c2'));
+  for (let i = 0; i < 70; i++) { await sender.store.record('trace.delivery', { sessionID: 's1' }, {
+    message_id: sent2.message_id, thread_id: sent2.thread_id, recipient: 's2', attempt_id: `attempt-x-${String(i).padStart(4, '0')}`,
+    phase: 'attempt', state: 'attempted', method: 'prompt:queue', inbox_id: null,
+  }, { message_id: sent2.message_id, thread_id: sent2.thread_id, recipient: 's2' });
+    await sender.store.record('trace.delivery', { sessionID: 's1' }, {
+    message_id: sent2.message_id, thread_id: sent2.thread_id, recipient: 's2', attempt_id: `attempt-x-${String(i).padStart(4, '0')}`,
+    phase: 'result', state: 'host_admitted', method: 'synthetic', inbox_id: 'x',
+  }, { message_id: sent2.message_id, thread_id: sent2.thread_id, recipient: 's2' }); }
+  await sender.store.record('trace.delivery', { sessionID: 's1' }, {
+    message_id: sent2.message_id, thread_id: sent2.thread_id, recipient: 's2', attempt_id: 'attempt-crash-0000001',
+    phase: 'attempt', state: 'attempted', method: 'prompt:queue', inbox_id: null,
+  }, { message_id: sent2.message_id, thread_id: sent2.thread_id, recipient: 's2' });
+  const crash = await sender.deliveryOutcome(sent2.message_id, 's2');
+  assert.equal(crash.state, 'unknown_crash_window', 'a result-less newest attempt is never masked by 70 completed ones');
+});
+
 test('P5.2: late thread joiners keep membership beyond any bounded window; malformed thread ids fail closed', async t => {
   const { storeRoot } = await root(t);
   const a = await traceWith(storeRoot, { prompt: async () => ({ data: { id: 'i1' } }) });

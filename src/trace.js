@@ -230,9 +230,13 @@ export class Trace {
     f.tool = refOf(input.tool, 128); f.status = refOf(input.status, 32);
     f.callKey = refOf(input.call_key, 80); f.ref = refOf(input.ref, 80); f.related = refOf(input.related, 80);
     f.thread = refOf(input.thread, 80); f.message = refOf(input.message, 80);
-    f.plan = refOf(input.plan, 80);
+    f.plan = refOf(input.plan, 80); f.step = refOf(input.step, 80);
+    f.worker = refOf(input.worker, 128); f.attempt = refOf(input.attempt_id, 80);
     f.recipient = refOf(input.recipient, 128); f.reply_to = refOf(input.reply_to, 80); f.proposal = refOf(input.proposal, 80);
     for (const r of [f.ref, f.related]) if (r !== undefined && !refPattern.test(r)) throw new Error('Invalid ref filter');
+    // A related-ref query on a recorded mail also reaches its replies and
+    // proposal bindings through the message-id relation.
+    if (f.related) f.relatedMail = this.store.index.get(f.related)?.mailID ?? null;
     f.path = refOf(input.path, 512); f.text = refOf(input.text, 256);
     f.after = input.after == null ? undefined : Number(input.after);
     f.before = input.before == null ? undefined : Number(input.before);
@@ -482,7 +486,9 @@ export class Trace {
   // deliverable; result missing -> crash window (UNKNOWN unless the
   // recipient's own persisted transcript proves admission).
   async deliveryOutcome(message_id, recipient, viewer = null) {
-    const rows = this.store.findEntries({ message: message_id, type: 'trace.delivery', recipient }, null, 128);
+    // Recovery truth reads every delivery event for this (message, recipient):
+    // a fixed oldest-N window could hide the newest attempt behind old churn.
+    const rows = this.store.findEntriesAll({ message: message_id, type: 'trace.delivery', recipient });
     if (!rows.length) return { state: 'missing_delivery_record' };
     const byAttempt = new Map();
     let legacyAttempt = null, legacyResult = null;
@@ -562,18 +568,28 @@ export class Trace {
   }
   async sweepOutbox(viewer) {
     const delivered = [], manual = [];
-    // Newest sent messages first: old undelivered mail must not starve new
-    // mail out of the bounded sweep window.
-    const mine = this.store.findEntriesNewest({ type: 'trace.message', session: viewer }, 64);
+    // Walk every sent message newest-first. The bounded sweep budget counts
+    // ACTIONABLE messages (never-attempted or unresolved deliveries), not raw
+    // history, so an old backlog drains across repeated sweeps instead of
+    // starving behind the newest window forever. Bounded display windows stay
+    // display-only; recovery truth never depends on them.
+    const actionableCap = 64;
+    let actionable = 0, scanned = 0;
+    const mine = this.store.findEntriesAll({ type: 'trace.message', session: viewer }).slice().reverse();
     for (const row of mine) {
+      if (actionable >= actionableCap) break;
+      scanned++;
       const mail = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
       for (const recipient of mail.recipients ?? []) {
+        if (actionable >= actionableCap) break;
         const outcome = await this.deliveryOutcome(mail.message_id, recipient, viewer);
         if (outcome.state === 'unknown_crash_window' || outcome.state === 'unknown') {
+          actionable++;
           manual.push({ message_id: mail.message_id, recipient, reason: 'host admission uncertain after an attempt; reconcile or retry manually, never auto-redelivered' });
           continue;
         }
         if (outcome.state !== 'missing_delivery_record') continue;
+        actionable++;
         // No attempt ever started: safe to deliver with the full WAL.
         const text = (await this.store.readBlob(mail.content_ref)).toString('utf8');
         const receipt = await this.deliverWithWal(recipient, this.mailEnvelope({ ...mail }, text), 'queue', { message_id: mail.message_id, thread_id: mail.thread_id }, { sessionID: viewer });
@@ -581,7 +597,8 @@ export class Trace {
         else delivered.push({ message_id: mail.message_id, recipient, state: receipt.state, delivery_ref: receipt.delivery_ref });
       }
     }
-    return { delivered, requires_manual_choice: manual };
+    return { delivered, requires_manual_choice: manual, scanned_history: scanned, actionable_budget: actionable,
+      note: 'each sweep processes at most 64 actionable deliveries, newest first; settled mail never consumes the budget, so repeated sweeps drain any backlog' };
   }
   async ack(input = {}, host) {
     if (!host?.sessionID) throw new Error('Host session identity unavailable');
@@ -648,7 +665,10 @@ export class Trace {
     // retry_failed opts in to a fresh attempt; old attempt evidence remains.
     const retryFailed = input.retry_failed === true;
     const previous = new Map();
-    for (const row of this.store.findEntries({ type: 'trace.step', plan: plan_id }, null, 256)) {
+    // Full-history projection: the newest recorded terminal event per step
+    // decides resume truth. A fixed oldest-N window could resurrect a stale
+    // failure and hide a later success (or the reverse).
+    for (const row of this.store.findEntriesAll({ type: 'trace.step', plan: plan_id })) {
       try { const data = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
         let exec = data.state;
         if (exec === 'succeeded') exec = 'settled'; // legacy rows predate outcome evidence
@@ -729,7 +749,7 @@ export class Trace {
         // from the child session binding, so the worker cannot report for
         // another step.
         phase = 'result';
-        const submittedRows = this.store.findEntries({ type: 'trace.step.result', session: sid }, null, 8);
+        const submittedRows = this.store.findEntriesAll({ type: 'trace.step.result', session: sid });
         let submitted = null;
         for (const row of submittedRows) {
           const data = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
@@ -793,19 +813,52 @@ export class Trace {
       } catch (error) { this.warning('trace_step_result', error); }
     }
     if (!binding) throw new Error('This session is not bound to any plan step');
-    const rows = this.store.findEntriesNewest({ type: 'trace.step.result', plan: binding.plan_id }, 16);
-    let existing = null;
-    for (const row of rows) {
+    // Canonical claim identity: status, summary and the sorted unique evidence
+    // refs. Only a byte-identical structured claim dedupes; any differing
+    // evidence makes it a visible conflict, never a silent overwrite.
+    const canonicalRefs = JSON.stringify([...new Set(source_refs)].sort());
+    const terminalStates = ['settled', 'transport_failed', 'failed', 'cancelled', 'unsupported'];
+    // Terminal state of the exact attempt first: once the step event exists,
+    // every further claim is late evidence and never rewrites the outcome.
+    let terminal = null;
+    for (const row of this.store.findEntriesAll({ type: 'trace.step', plan: binding.plan_id })) {
       try { const data = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
-        if (data.step === binding.step && data.attempt_id === binding.attempt_id) { existing = { ...data, ref: row.ref }; break; }
+        if (data.step === binding.step && data.attempt_id === binding.attempt_id && terminalStates.includes(data.state)) { terminal = { state: data.state, ref: row.ref }; break; }
       } catch (error) { this.warning('trace_step_result', error); }
     }
+    let existing = null;
+    const identical = [];
+    for (const row of this.store.findEntriesAll({ type: 'trace.step.result', plan: binding.plan_id })) {
+      try { const data = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
+        if (data.step !== binding.step || data.attempt_id !== binding.attempt_id) continue;
+        existing = existing ?? { ...data, ref: row.ref };
+        if (data.status === input.status && (data.summary ?? '') === summary
+          && JSON.stringify([...new Set(data.source_refs ?? [])].sort()) === canonicalRefs) identical.push({ ...data, ref: row.ref });
+      } catch (error) { this.warning('trace_step_result', error); }
+    }
+    if (identical.length) {
+      const match = identical[0];
+      return { ok: true, plan_id: binding.plan_id, step: binding.step, status: input.status, result_ref: match.ref,
+        deduplicated: true, ...(match.late ? { late: true } : {}), note: 'identical replay of the recorded worker outcome; no new event' };
+    }
     if (existing) {
-      if (existing.status === input.status && (existing.summary ?? '') === summary) {
-        return { ok: true, plan_id: binding.plan_id, step: binding.step, status: input.status, result_ref: existing.ref,
-          deduplicated: true, note: 'identical replay of the recorded worker outcome; no new event' };
+      if (!terminal) {
+        throw new Error(`Conflicting worker result: this attempt already recorded '${existing.status}' with its own evidence (ref ${existing.ref}); identical replays dedupe, differing claims stay visible and are rejected`);
       }
-      throw new Error(`Conflicting worker result: this attempt already recorded '${existing.status}' (ref ${existing.ref}); the first recorded claim stands and the conflict is visible, not overwritten`);
+    }
+    if (terminal) {
+      // The bound attempt already has a terminal step event. The claim is kept
+      // as evidence (flagged late) but never rewrites the recorded outcome:
+      // deciding whether a late claim should change anything is review work
+      // for the sessions reading the evidence, not for this program.
+      const event = await this.store.record('trace.step.result', identity(host), {
+        plan_id: binding.plan_id, version: binding.version, step: binding.step,
+        attempt_id: binding.attempt_id, worker_session: host.sessionID, binding_ref: binding.ref,
+        status: input.status, summary, source_refs, late: true, by: host.sessionID,
+      }, { plan_id: binding.plan_id, step: binding.step });
+      return { ok: true, plan_id: binding.plan_id, step: binding.step, status: input.status, result_ref: event.ref, late: true,
+        terminal_state: terminal.state, terminal_ref: terminal.ref,
+        note: 'the bound attempt is already terminal; this claim is stored as late evidence only and does not change the recorded step outcome' };
     }
     const event = await this.store.record('trace.step.result', identity(host), {
       plan_id: binding.plan_id, version: binding.version, step: binding.step,

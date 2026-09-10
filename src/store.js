@@ -104,6 +104,25 @@ export class Store {
       ...(event.intent?.related_refs ?? []), ...(event.compact?.refs ?? []),
     ].flat().filter(r => typeof r === 'string' && refPattern.test(r)))];
     const payloadHints = await this.readPayloadHints(event);
+    // Explicit structured relations and attempt addressing for mailbox and
+    // plan events. These keep their structured data in the payload; small
+    // payloads are read once here so the derived index can serve relation
+    // queries. Only explicit refs are indexed - never parsed meaning.
+    let attempt = null, stepWorker = null;
+    const structured = { 'trace.message': ['source_refs'], 'trace.step': ['result_ref', 'worker_source_refs', 'attempt_id'], 'trace.step.result': ['source_refs', 'binding_ref', 'attempt_id'] }[event.type];
+    if (structured && (event.payload?.bytes ?? 0) <= 65536) {
+      try {
+        const data = JSON.parse((await this.readBlob(event.payload.ref)).toString());
+        for (const key of structured) {
+          const v = data?.[key];
+          if (typeof v === 'string' && refPattern.test(v)) rels.push(v);
+          if (Array.isArray(v)) for (const r of v) if (typeof r === 'string' && refPattern.test(r)) rels.push(r);
+        }
+        attempt = typeof data?.attempt_id === 'string' ? data.attempt_id : null;
+        if (event.type === 'trace.step.result') stepWorker = typeof data?.worker_session === 'string' ? data.worker_session : null;
+        if (event.type === 'trace.step') stepWorker = typeof data?.sessionID === 'string' ? data.sessionID : null;
+      } catch (error) { this.warning(`index_${event.type}`, error); }
+    }
     if (event.type === 'coordination.advisory' && (event.payload?.bytes ?? 0) <= 65536) {
       // Advisory source relations live in the payload data of these small events.
       try {
@@ -118,7 +137,9 @@ export class Store {
       thread: typeof event.thread_id === 'string' ? event.thread_id : null,
       mailID: typeof event.message_id === 'string' ? event.message_id : null,
       plan: typeof event.plan_id === 'string' ? event.plan_id : null,
-      worker: typeof event.worker === 'string' ? event.worker : null,
+      step: typeof event.step === 'string' ? event.step : null,
+      worker: typeof event.worker === 'string' ? event.worker : stepWorker,
+      attempt,
       recipients: Array.isArray(event.recipients) ? event.recipients.filter(r => typeof r === 'string') : null,
       recipient: typeof event.recipient === 'string' ? event.recipient : null,
       replyTo: typeof event.reply_to === 'string' ? event.reply_to : null,
@@ -141,13 +162,18 @@ export class Store {
     if (f.thread && entry.thread !== f.thread) return false;
     if (f.message && entry.mailID !== f.message) return false;
     if (f.plan && entry.plan !== f.plan) return false;
+    if (f.step && entry.step !== f.step) return false;
     if (f.worker && entry.worker !== f.worker) return false;
+    if (f.attempt && entry.attempt !== f.attempt) return false;
     if (f.mailParticipant && !(entry.sessionID === f.mailParticipant || (entry.recipients ?? []).includes(f.mailParticipant))) return false;
     if (f.recipient && !(entry.recipient === f.recipient || (entry.recipients ?? []).includes(f.recipient))) return false;
     if (f.reply_to && entry.replyTo !== f.reply_to) return false;
     if (f.proposal && entry.proposal !== f.proposal) return false;
     if (f.ref && entry.ref !== f.ref) return false;
-    if (f.related && entry.ref !== f.related && !entry.rels.includes(f.related)) return false;
+    // `related` matches explicit ref relations; when the target is a recorded
+    // mail, message-id relations (replies, proposal bindings) resolve too.
+    if (f.related && entry.ref !== f.related && !entry.rels.includes(f.related)
+      && !(f.relatedMail && (entry.replyTo === f.relatedMail || entry.proposal === f.relatedMail))) return false;
     if (f.after != null && !(entry.at >= f.after)) return false;
     if (f.before != null && !(entry.at <= f.before)) return false;
     if (f.path) {
@@ -197,6 +223,23 @@ export class Store {
       if (out.length >= limit) break;
     }
     return out.reverse();
+  }
+  // Every match, oldest-first. Recovery truth (delivery outcomes, plan step
+  // state, attempt bindings) must never be decided by a fixed oldest-N window,
+  // so state projections scan the full derived index; the immutable events
+  // stay the only authority.
+  findEntriesAll(filter) {
+    return [...this.index.values()]
+      .sort((a, b) => a.at - b.at || a.ref.localeCompare(b.ref))
+      .filter(entry => this.matchesFilters(entry, filter));
+  }
+  // Event ref of a recorded mail by message id. O(index) and memo-free; used
+  // to turn message-id relations (reply_to/proposal) into ref relations at
+  // query time, because ingest order never decides lookup availability.
+  mailEventRef(messageID) {
+    if (typeof messageID !== 'string') return null;
+    for (const entry of this.index.values()) if (entry.type === 'trace.message' && entry.mailID === messageID) return entry.ref;
+    return null;
   }
   async reconcile(limit = 64) {
     if (this.closed) return { scanned: 0, imported: 0 };
@@ -367,17 +410,35 @@ export class Store {
     // UTF-8 byte pagination uses base64 too, so arbitrary boundaries are lossless.
     const chunk = metadataOnly ? Buffer.alloc(0) : data.subarray(offset, offset + limit);
     // Unified relation discovery across event kinds: note source/supersedes/
-    // depends_on, intent related_refs, compact refs, outputs, and advisory
-    // payload source_refs. This list is a convenience view; absence here never
-    // proves the payload lacks relations (trace_find searches the full index).
+    // depends_on, intent related_refs, compact refs, outputs, advisory payload
+    // source_refs, mailbox/plan structured relations (message source_refs,
+    // step result_ref/worker_source_refs, worker result source_refs/binding_ref)
+    // and message-id links (reply/proposal) resolved to their event refs.
+    // This list is a convenience view; absence here never proves the payload
+    // lacks relations (trace_find searches the full index).
     const inlineRels = [
       event?.payload.ref, ...(event?.outputs ?? []).map(x => x.ref),
       ...(event?.note?.source_refs ?? []), ...(event?.note?.supersedes ?? []), ...(event?.note?.depends_on ?? []),
       ...(event?.intent?.related_refs ?? []), ...(event?.compact?.refs ?? []),
     ];
+    const structured = { 'trace.message': ['source_refs'], 'trace.step': ['result_ref', 'worker_source_refs'], 'trace.step.result': ['source_refs', 'binding_ref'] }[event?.type];
+    if (structured && (event.payload?.bytes ?? Infinity) <= 65536) {
+      try {
+        const parsed = JSON.parse(data.toString());
+        for (const key of structured) {
+          const v = parsed?.[key];
+          if (typeof v === 'string' && refPattern.test(v)) inlineRels.push(v);
+          if (Array.isArray(v)) for (const r of v) if (typeof r === 'string' && refPattern.test(r)) inlineRels.push(r);
+        }
+      } catch (error) { this.warning('expand_structured_rels', error); }
+    }
     if (event?.type === 'coordination.advisory' && (event.payload?.bytes ?? Infinity) <= 65536) {
       try { for (const r of JSON.parse(data.toString())?.source_refs ?? []) if (refPattern.test(r)) inlineRels.push(r); }
       catch (error) { this.warning('expand_advisory_rels', error); }
+    }
+    for (const id of [event?.reply_to, event?.proposal]) {
+      const parentRef = this.mailEventRef(id);
+      if (parentRef) inlineRels.push(parentRef);
     }
     return { ref, payload_ref: event?.payload.ref ?? ref, sha256: hash(data), hash_verified: true,
       metadata_only: metadataOnly, offset, limit, returned_bytes: chunk.length, total_bytes: data.length,

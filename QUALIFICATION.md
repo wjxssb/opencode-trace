@@ -1,12 +1,26 @@
 # Local qualification
 
-This page preserves the original 0.1.0 installation qualification. See the
+## Current state (P5.3, 2026-09-10)
+
+The trace surface at current `main` has ten model-facing tools
+(`trace_note`, `trace_expand`, `trace_find`, `trace_intent`, `trace_status`,
+`trace_send`, `trace_inbox`, `trace_ack`, `trace_step_result`, `trace_plan`),
+62 component tests per Node version (20.19.5 and 22.16.0), a 23-check real
+isolated-host E2E (`tests/e2e_host.mjs`) and a 15-check install/rollback drill
+(`tests/p5_install_drill.mjs`). The E2E and drill are local real-host gates;
+GitHub Actions runs only the component suite because the runner has no
+OpenCode binary. Real-model (GLM/Qwen) multi-session negotiation qualification
+is not yet run; that is the next gate (P6), followed by shadow install on the
+user's main instance. `worker_reported_success` is an identity-bound worker
+claim, not independently verified success.
+
+The rest of this page preserves the original 0.1.0 installation qualification. See the
 [0.1.1 targeted audit](EVIDENCE.md) for measured costs, fixes, GLM recovery,
 Qwen's pre-fix timeout and post-fix `ENVIRONMENT_BLOCKED_XID43` result.
 
 Qualified on 2026-09-09 with Ubuntu 24.04.3 LTS, OpenCode V2 `0.0.0-beta-19296`, Node `v22.16.0`.
 
-Release: `0.1.0`. Runtime bundle SHA-256:
+Release: `0.1.0` (historical). Runtime bundle SHA-256:
 `e2911f7f4770f3bc9d770bcb0316e7bb35b3bf725403568d365c58a10b4c2381`.
 
 The runtime has zero external dependencies. Six source modules plus `server.js` total 519 lines, counting comments and blank lines. Installer modules total 156 lines.

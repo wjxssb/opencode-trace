@@ -4,6 +4,7 @@ import * as fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { Trace } from '../src/trace.js';
+import { hash, stable } from '../src/util.js';
 
 async function fixture(t, session) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'opencode-trace-plan-'));
@@ -231,4 +232,82 @@ test('P5.2: worker results are per-attempt - replays dedupe, conflicts are rejec
   assert.equal(result.binding_ref, started.ref);
   // An unbound session cannot submit a result at all.
   await assert.rejects(trace.stepResult({ status: 'success' }, { sessionID: 'ses_ghost' }), /not bound to any plan step/);
+});
+
+test('P5.3: replay comparison covers the full structured claim including source_refs', async t => {
+  const log = { create: [], sessions: [], prompts: [], waits: [], interrupts: [] };
+  const { trace } = await fixture(t, nativeSessions(log));
+  const evidenceA = (await trace.after({ ...host(), tool: 'read', input: { filePath: 'a.log' }, status: 'completed', result: { content: [{ type: 'text', text: 'evidence A' }] } })).ref;
+  const evidenceB = (await trace.after({ ...host(), tool: 'read', input: { filePath: 'b.log' }, status: 'completed', result: { content: [{ type: 'text', text: 'evidence B' }] } })).ref;
+  let conflict = null, second = null;
+  log.submit = async sessionID => {
+    await trace.stepResult({ status: 'success', summary: 'done', source_refs: [evidenceA] }, { sessionID });
+    // Same status+summary but different evidence: NOT an identical replay.
+    second = await trace.stepResult({ status: 'success', summary: 'done', source_refs: [evidenceB] }, { sessionID }).catch(e => e);
+    conflict = await trace.stepResult({ status: 'failure', summary: 'done', source_refs: [evidenceA] }, { sessionID }).catch(e => e);
+  };
+  const out = await trace.plan({ steps: [{ id: 'solo', text: 'evidence-aware replay' }] }, host());
+  assert.equal(out.steps[0].outcome, 'worker_reported_success');
+  assert.ok(second instanceof Error, 'same claim text with different source_refs is a conflict, not a replay');
+  assert.match(second.message, /Conflicting worker result/);
+  assert.ok(conflict instanceof Error);
+  const rows = trace.store.findEntries({ type: 'trace.step.result' }, null, 8);
+  assert.equal(rows.length, 1, 'no divergent claim was persisted');
+  const data = JSON.parse((await trace.store.readBlob(rows[0].payloadRef)).toString());
+  assert.deepEqual(data.source_refs, [evidenceA], 'the first recorded evidence stands');
+});
+
+test('P5.3: a late worker claim after a terminal attempt is stored as evidence, never rewriting the outcome', async t => {
+  const log = { create: [], sessions: [], prompts: [], waits: [], interrupts: [] };
+  const { trace } = await fixture(t, nativeSessions(log));
+  let sid = null;
+  log.submit = async session => { sid = session; await trace.stepResult({ status: 'success', summary: 'on time' }, { sessionID: session }); };
+  const steps = [{ id: 'solo', text: 'worker submits during the turn' }];
+  await trace.plan({ steps }, host());
+  // The step is settled with worker-reported success; a much later claim on
+  // the SAME attempt must not overwrite anything.
+  const late = await trace.stepResult({ status: 'failure', summary: 'changed my mind later' }, { sessionID: sid });
+  assert.equal(late.late, true, 'the late claim is stored, flagged late');
+  assert.ok(late.result_ref.startsWith('evt_'));
+  assert.equal(late.terminal_state, 'settled');
+  // Identical late replay dedupes to the late event.
+  const replay = await trace.stepResult({ status: 'failure', summary: 'changed my mind later' }, { sessionID: sid });
+  assert.equal(replay.deduplicated, true);
+  assert.equal(replay.result_ref, late.result_ref);
+  // The recorded step outcome is untouched and resume still reuses it.
+  const resumed = await trace.plan({ steps }, host());
+  assert.equal(resumed.steps[0].state, 'already_settled(worker_reported_success)');
+  assert.equal(log.create.length, 1, 'no re-execution happened');
+  const stepRows = trace.store.findEntries({ type: 'trace.step' }, null, 16);
+  const settledPayloads = [];
+  for (const row of stepRows) {
+    const data = JSON.parse((await trace.store.readBlob(row.payloadRef)).toString());
+    if (data.state === 'settled') settledPayloads.push(data);
+  }
+  assert.equal(settledPayloads.length, 1);
+  assert.equal(settledPayloads[0].outcome, 'worker_reported_success', 'the recorded outcome never changed');
+});
+
+test('P5.3: plan resume reads full step history - a late success beyond the old 256-event window wins', async t => {
+  const log = { create: [], sessions: [], prompts: [], waits: [], interrupts: [] };
+  const { trace } = await fixture(t, nativeSessions(log));
+  const steps = [{ id: 'solo', text: 'already done long ago' }];
+  const version = hash(stable(steps));
+  const planId = `plan_${hash(stable([host().sessionID, version])).slice(0, 24)}`;
+  // Synthetic long history for one step: 140 failed attempts (280 events),
+  // then a final success. The oldest-256 window of the previous resume logic
+  // ended inside the failures and never saw the success.
+  for (let i = 0; i < 140; i++) {
+    const attempt = `attempt-old-${String(i).padStart(4, '0')}`;
+    await trace.store.record('trace.step', host(), { plan_id: planId, version, step: 'solo', state: 'started', sessionID: `ses_old_${i}`, attempt_id: attempt }, { plan_id: planId, step: 'solo', worker: `ses_old_${i}` });
+    await trace.store.record('trace.step', host(), { plan_id: planId, version, step: 'solo', state: 'settled', outcome: 'worker_reported_failure', sessionID: `ses_old_${i}`, attempt_id: attempt }, { plan_id: planId, step: 'solo' });
+  }
+  await trace.store.record('trace.step', host(), { plan_id: planId, version, step: 'solo', state: 'started', sessionID: 'ses_final', attempt_id: 'attempt-final-0000001' }, { plan_id: planId, step: 'solo', worker: 'ses_final' });
+  await trace.store.record('trace.step', host(), { plan_id: planId, version, step: 'solo', state: 'settled', outcome: 'worker_reported_success', sessionID: 'ses_final', attempt_id: 'attempt-final-0000001' }, { plan_id: planId, step: 'solo' });
+  const out = await trace.plan({ steps }, host());
+  assert.equal(out.steps[0].reused, true, 'resume reuses recorded evidence');
+  assert.equal(out.steps[0].execution, 'settled');
+  assert.equal(out.steps[0].outcome, 'worker_reported_success', 'the newest terminal event decides, not the oldest window');
+  assert.equal(log.create.length, 0, 'no session was created: the success was not hidden by old failures');
+  assert.equal(out.steps[0].sessionID, 'ses_final');
 });
