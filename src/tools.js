@@ -1,7 +1,11 @@
 const str = { type: 'string' };
 const refs = { type: 'array', items: str, maxItems: 16 };
 const schema = (properties, required = []) => ({ type: 'object', properties, required, additionalProperties: false });
-const result = value => ({ output: value, content: JSON.stringify(value), metadata: { opencode_trace: true } });
+const result = value => {
+  const content = JSON.stringify(value);
+  // Host output-schema validation requires JSON values, including nested fields.
+  return { output: JSON.parse(content), content, metadata: { opencode_trace: true } };
+};
 
 export function definitions(trace) {
   const tool = (name, description, input, fn) => ({ name, description, input, output: { type: 'object', additionalProperties: true },
