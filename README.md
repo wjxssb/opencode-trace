@@ -33,9 +33,14 @@ For isolated testing, `--root PATH` selects bundle/receipt storage; `--store-roo
 | Tool | Purpose |
 |---|---|
 | `trace_note` | Save a fact, finding, decision, unresolved item, handoff or correction, with existing `source_refs`, `supersedes`, and `depends_on`. |
-| `trace_expand` | Read an exact immutable event/note or content blob by ref. Returns metadata, original structured source locator, related refs and byte pagination. |
-| `trace_intent` | Declare one current intent per session: summary, paths, optional resources, active/waiting/done/cancelled and related refs. |
+| `trace_expand` | Read an exact immutable event/note or content blob by ref. Returns metadata, original structured source locator, unified related refs and byte pagination. |
+| `trace_find` | Find history by clues instead of refs: type, session, agent, tool, status, call_key, path, thread/mail/plan/related refs, time range, or text. `deep:true` scans exact blob bytes under a budget with a resumable cursor. |
+| `trace_intent` | Declare one current intent per session: summary, paths, optional resources, active/waiting/done/cancelled and related refs. Same-millisecond concurrent intents stay visible as `intent_conflicts`. |
 | `trace_status` | Show current memory, recent native result refs, peer snapshots and degradation count, with explicit peer pagination. |
+| `trace_send` | Persist and deliver a directed negotiation message (persist before delivery, host-derived sender, thread inheritance, proposal-bound accept/reject/counter). |
+| `trace_inbox` | Show negotiation mail with per-level evidence: persisted / host_admitted / context_observed / recipient_ack / reply_recorded; `sweep:true` retries only entirely undelivered sends. |
+| `trace_ack` | Record delivery receipt for a specific message; never agreement. |
+| `trace_plan` | Execute an LLM-owned plan through native sessions only (create+prompt+wait+collect); dependency waves fan out; recorded terminal states never re-run. |
 
 The model decides what is worth remembering. Code validates structure, sizes and workspace-local refs; it does not classify the meaning of prompts, outputs or commands. Identity comes from the host tool context, not tool input. Notes from peers can be cited within the same canonical workspace; arbitrary external refs cannot be expanded.
 
@@ -79,7 +84,9 @@ Explicit overlapping intents and structured edit/write paths generate durable ad
 
 Automatic peer projection carries identity, lifecycle observations, intent ref/status, paths/resources and timestamps. Peer intent prose is available only by explicit expansion. This is a structural boundary without keyword filtering; it is not a guarantee of model immunity to malicious evidence. Sessions in the same canonical workspace share its trace trust boundary. Separate worktrees with different real paths have separate stores.
 
-Hooks used: session `prompt` and `context`; tool `execute.before` and `execute.after`; agent transform for a read-only snapshot; tool transform to add only four tools; lifecycle event subscription and session `get`/`context` for recovery. The plugin never changes native tools, messages, permissions, agents or execution routing, and binds no shell hook.
+Hooks used: session `prompt` and `context`; tool `execute.before` and `execute.after`; agent transform for a read-only snapshot; tool transform to add the trace tools; lifecycle event subscription and session `get`/`context` for recovery; the plugin client's native `session.prompt` (mailbox delivery), `create`/`prompt`/`wait`/`context` (plan steps) when the host exposes them. The plugin never changes native tools, messages, permissions, agents or execution routing, and binds no shell hook.
+
+The derived index behind `trace_find` is memory-only and rebuilt from authoritative events at startup; hint extraction peeks at most 8 KiB of each payload. Deep text scans read exact blob bytes under an explicit budget with a cursor that resumes partially scanned events exactly (no skipped or duplicated blobs) and reports whether the scan is definitive. Evidence levels never auto-upgrade: a persisted mailbox message is not delivery, a delivery receipt is not comprehension, an ack is not agreement, and plan acceptance never completes a parent task.
 
 Observer errors are caught and logged without payloads. Native hooks wait at most one second for local observer work, then continue. Trace tools can return `ok:false`; that does not affect native execution. A failed store may lose trace observations for that interval. A setup/registration error disables the corresponding observer feature and warns rather than making OpenCode unusable.
 
@@ -89,8 +96,10 @@ At most eight native-hook observer jobs may remain outstanding. A timed-out job 
 
 ```
 node --test tests/*.test.js
+node tests/e2e_host.mjs /absolute/fresh-dir     # real isolated-host E2E (18 checks)
+node tests/p5_install_drill.mjs /absolute/fresh-dir  # isolated install/rollback drill (15 checks)
 ```
 
-Tests cover identity normalization, paired immutable events, blobs and tampering, restart/replay, source recovery after file change, bounded recall, compaction maps/gaps, note validation, multi-session convergence, deterministic advisory overlap, unknown shell paths, fail-open hooks and config-preserving installation/rollback. GitHub Actions runs this suite on Node 20 and 22. Real-host qualification results and their limits are recorded in [QUALIFICATION.md](QUALIFICATION.md); private session receipts are not distributed.
+Tests cover identity normalization, paired immutable events, blobs and tampering, restart/replay, source recovery after file change, bounded recall, compaction maps/gaps, note validation, multi-session convergence, deterministic advisory overlap, unknown shell paths, fail-open hooks and config-preserving installation/rollback. Regression tests additionally cover message revision retention, same-millisecond convergence with visible intent conflicts, the durable terminal guard against late out-of-order tool events, prepared/applied context evidence stages, clue-only retrieval over thousands of events, budgeted deep scans with resumable cursors, mailbox crash windows and honest orchestration resume. GitHub Actions runs the component suite on Node 20 and 22. The E2E and P5 scripts are real-host drills: they start a private OpenCode server (isolated `HOME`, loopback ports, deterministic scripted provider) and never touch an existing user service, config or session. Real-host qualification results and their limits are recorded in [QUALIFICATION.md](QUALIFICATION.md) and host/reference capabilities in [CAPABILITIES.md](CAPABILITIES.md); private session receipts are not distributed.
 
 The [targeted audit](EVIDENCE.md) records measured storage amplification, model-qualified recovery, failures, fixes and remaining boundaries. Qwen's post-fix model run was blocked by GPU Xid 43; no Qwen improvement is claimed.
