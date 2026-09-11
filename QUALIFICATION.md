@@ -1,6 +1,25 @@
 # Local qualification
 
-## Current state (P5.3, 2026-09-10)
+## Current state (P6, 2026-09-10)
+
+**P6 real-model qualification: PASS (GLM-5.3-flash).** A dedicated harness
+(`tests/p6_qualification.mjs`, local-only, real provider via api.z.ai coding
+plan) drove seven real sessions on an isolated OpenCode host against a
+randomized fixture workspace. All ten P6 gates passed: clue-only recovery of
+a historical value from event blobs (SHA-verified), two-session natural
+negotiation through the mailbox, reviewer counter-evidence discovery against
+pre-seeded historical facts, evidence-driven revision with cited refs, a late
+verifier recovering state without chat history, native build/reviewer role
+binding with real permission boundaries, `trace_plan` workers submitting
+their own `trace_step_result` claims, fuzzy end-to-end reconstruction, no
+corruption, and full usability after a real server process restart. An
+independent verifier LLM re-verified the evidence chain itself (blob hashes,
+negative queries, re-derived refs) and judged the collaboration genuine;
+its noted weakest link (the reconstructor left no durable note) is recorded
+as MODEL_BEHAVIOR, not a program rule. `REAL_MODEL_GLM = PASS`;
+`REAL_MODEL_QWEN = NOT_RUN` (local vLLM healthy; GLM stands alone).
+Receipts: `receipts/p6-real-model-<timestamp>/` (local, sanitized - refs and
+hashes only, no credentials). Component suites remain 62/62 per Node version.
 
 The trace surface at current `main` has ten model-facing tools
 (`trace_note`, `trace_expand`, `trace_find`, `trace_intent`, `trace_status`,
