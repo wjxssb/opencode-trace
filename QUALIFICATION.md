@@ -2,6 +2,23 @@
 
 ## Current state (P6, 2026-09-10)
 
+**FINAL QUALIFICATION — installed and frozen.**
+
+```
+P6_REAL_MODEL   = PASS   (GLM-5.3-flash, real provider, isolated real host)
+REAL_MODEL_GLM  = PASS
+REAL_MODEL_QWEN = NOT_RUN (local vLLM healthy; not required for this gate)
+SHADOW_INSTALL  = PASS   (14/14: installer product, copied real config, history, restart, byte-exact rollback)
+MAIN_INSTALL    = PASS   (bundle 0.1.2-8e8839277968d89d, one scoped config entry)
+MAIN_SMOKE      = PASS   (13/13 on the user's real HOME + upgraded config, real local Qwen)
+ROLLBACK_READY  = PASS   (verified in shadow; manifest retained for the main install)
+```
+
+The running pre-existing user service was never killed; it loads the plugin
+at its next natural restart. Rollback path: `node install/cli.js rollback
+--manifest <installations/.../receipt.json>` (plus config backup retained
+locally). P7 cost benchmarking is deferred to real usage by decision.
+
 **P6 real-model qualification: PASS (GLM-5.3-flash).** A dedicated harness
 (`tests/p6_qualification.mjs`, local-only, real provider via api.z.ai coding
 plan) drove seven real sessions on an isolated OpenCode host against a
