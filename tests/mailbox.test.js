@@ -31,6 +31,9 @@ test('P3: proposal -> objection thread carries per-level evidence; sender identi
   assert.equal(proposal.thread_id.startsWith('thr_'), true);
   assert.deepEqual(prompts.map(p => p.sessionID), ['s2']);
   assert.equal(prompts[0].delivery, 'queue');
+  assert.deepEqual(prompts[0].metadata.opencode_trace_mailbox, {
+    origin: 'peer-agent', sender: 's1', message_id: proposal.message_id, thread_id: proposal.thread_id,
+  });
   assert.match(prompts[0].text, /message_id=msgx_[a-f0-9]{32} thread_id=thr_[a-f0-9]{32} from=s1 type=proposal/);
   assert.ok(prompts[0].text.includes('I propose plan A'));
 

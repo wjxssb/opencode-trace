@@ -45,6 +45,8 @@ For isolated testing, `--root PATH` selects bundle/receipt storage; `--store-roo
 
 The model decides what is worth remembering. Code validates structure, sizes and workspace-local refs; it does not classify the meaning of prompts, outputs or commands. Identity comes from the host tool context, not tool input. Notes from peers can be cited within the same canonical workspace; arbitrary external refs cannot be expanded.
 
+Since 0.1.3, every trace tool result is presented in human-readable form: `content` is Markdown — a titled summary with bullets plus a complete fenced machine block carrying every structured field, including exact refs, cursors, coverage and payloads — and the structured value rides in `metadata.raw`, size-bounded because oversized metadata once broke host delivery. Presentation is mechanical formatting only (no LLM, no semantic classification); exact bytes stay recoverable through `trace_expand`. The `opencode-inline-reviewer` plugin reads the bounded session projections (`sessions/`, `intents/`) read-only to hand the Reviewer the worker's trace memory as an UNVERIFIED Context Pack section.
+
 `trace_expand` reads stored bytes rather than reopening the original document. Its default payload page is 2048 bytes (maximum 24000). `metadata_only:true` returns verified metadata and refs without payload bytes. `text_blobs` lists exact individual tool text blobs; `payload_ref` identifies the full JSON result envelope. The model chooses the ref and page size. Follow `next_offset` until null; rereading a page adds no evidence. `exact_base64` preserves every byte even when a UTF-8 character crosses page boundaries; concatenating decoded pages recovers the SHA-256-verified original. `exact_utf8` is for convenient reading. The page limit bounds source bytes, not the complete JSON response, which also contains base64 and metadata. Metadata inspection still reads and verifies the stored blob locally.
 
 ## Storage
@@ -104,3 +106,35 @@ node tests/p5_install_drill.mjs /absolute/fresh-dir  # isolated install/rollback
 Tests cover identity normalization, paired immutable events, blobs and tampering, restart/replay, source recovery after file change, bounded recall, compaction maps/gaps, note validation, multi-session convergence, deterministic advisory overlap, unknown shell paths, fail-open hooks and config-preserving installation/rollback. Regression tests additionally cover message revision retention, same-millisecond convergence with visible intent conflicts, the durable terminal guard against late out-of-order tool events, prepared/applied context evidence stages, clue-only retrieval over thousands of events, budgeted deep scans with resumable cursors, mailbox crash windows and honest orchestration resume. P5.2 correctness closures have their own regressions: attempt-paired delivery WALs (a retracted older attempt never masks a newer crash window), viewer-scoped inbox windows, exact deep-cursor boundary recovery (a needle inside the consumed/physical gap region is found with its exact byte offset across pages), boundary-straddling needles found exactly once, per-attempt worker results (identical replays dedupe, conflicting claims are rejected, forged plan/step input is ignored), phase-journaled step failures with orphan-child cleanup, full-history thread membership for late joiners, fail-closed thread ids, and a child-process restart test proving delivery crash windows, worker result bindings and thread membership survive a real OS process boundary. P5.3 state/index closures: sweep budgets count actionable mail so old backlogs drain across sweeps (never starving behind the newest window), delivery and plan-resume projections read full history (no fixed oldest-N window can hide the newest attempt or terminal step), explicit source/reply/proposal/binding/result/attempt relations are indexed for the relation graph, `trace_find` exposes plan/step/worker/attempt_id addressing to the model, worker-claim replay identity covers the full structured claim (status, summary, canonical source_refs), and late claims on terminal attempts are stored as flagged evidence without rewriting the recorded outcome. GitHub Actions runs the component suite on Node 20 and 22 (62 tests per version at P5.3). GitHub Actions runs the component suite on Node 20 and 22. The E2E and P5 scripts are real-host drills: they start a private OpenCode server (isolated `HOME`, loopback ports, deterministic scripted provider) and never touch an existing user service, config or session. Real-host qualification results and their limits are recorded in [QUALIFICATION.md](QUALIFICATION.md) and host/reference capabilities in [CAPABILITIES.md](CAPABILITIES.md); private session receipts are not distributed.
 
 The [targeted audit](EVIDENCE.md) records measured storage amplification, model-qualified recovery, failures, fixes and remaining boundaries. Qwen's post-fix model run was blocked by GPU Xid 43; no Qwen improvement is claimed.
+
+
+Trace display uses a collapsed native TUI row in the r539 host patch. Expand the row for exact input and output; collapsing never edits stored history or model input. `trace_send` is explicit peer-to-peer delivery within the observed workspace, not session merging. Its receipts distinguish persistence from admission and agreement. Peer messages remain peer evidence, not new user authorization. The queue preview labels the sender and hides the long envelope; the queue dialog retains the original message. Metadata limits are measured in UTF-8 bytes; large structured results remain complete in content.
+
+Results exceeding 24,000 UTF-8 bytes or 1,500 lines are saved as immutable JSON blobs before host delivery. The short response carries `result_ref`, SHA-256, byte count and pagination fields; `trace_expand` with 2,048-byte pages recovers every field. This avoids the native host's 50 KiB / 2,000-line truncation and its temporary output-file retention limit.
+
+
+### R540 fidelity audit (2026-09-12)
+
+All ten trace tools use compact native TUI summaries with recoverable exact
+input/result data. Large rendered results are stored as immutable JSON before
+host truncation, with a hash/ref and explicit continuation instructions.
+`trace_expand` does not duplicate its large payload in the human summary.
+
+Mailbox queue delivers an explicit message to an existing task owner; it does
+not merge sessions or spawn a duplicate owner. New deliveries include structured
+`opencode_trace_mailbox` metadata with peer origin, sender, message and thread
+identities. This is provenance, not authorization or a security boundary.
+Historical messages are retained unchanged. Persisted, admitted, observed, ack
+and reply states remain distinct; uncertain admissions are never automatically
+replayed.
+
+Independent work can use native task/subagent tools or explicit `trace_plan`.
+Plan assignments now carry the plan ref, owner, step, attempt, and dependency
+result refs, plus a request for `trace_step_result`. Exact plan step text is
+stored in the plan record. Dependencies remain worker-reported outcomes, not
+independently verified success. Session creation failure cannot proceed with an
+absent child identity. No mailbox notification implicitly schedules new work.
+
+Validation: 77 tests passed including mailbox provenance, dependency evidence,
+DAG outcome/resume behavior and lossless result storage. The related reviewer
+fidelity and TUI audit is in `../opencode-inline-reviewer/docs/AUDIT-R540.md`.

@@ -20,8 +20,8 @@ const host = (sessionID = 's1', id = 'c1') => ({ sessionID, messageID: 'm1', id,
 // and stands in for the worker calling trace_step_result.
 const nativeSessions = log => ({
   create: async ({ title }) => { const id = `ses_child_${log.create.push(title)}`; log.sessions.push(id); return { data: { id } }; },
-  prompt: async ({ sessionID, text }) => {
-    log.prompts.push({ sessionID, text });
+  prompt: async ({ sessionID, text, metadata }) => {
+    log.prompts.push({ sessionID, text, metadata });
     if (log.failPrompt?.has(sessionID)) throw new Error('step prompt rejected');
     if (log.submit) await log.submit(sessionID);
     return { data: { id: `msg_in_${log.prompts.length}` } };
@@ -51,6 +51,13 @@ test('P5.2: settled-with-worker-success gates the DAG; failure and unknown block
   const joinStep = out.steps.find(s => s.id === 'join');
   assert.ok(indexOf(joinStep.sessionID) > indexOf(out.steps.find(s => s.id === 'alpha').sessionID));
   assert.equal(log.waits.length, 3);
+  const joinPrompt = log.prompts.find(p => p.sessionID === joinStep.sessionID);
+  assert.match(joinPrompt.text, /trace_step_result/);
+  assert.equal(joinPrompt.metadata.opencode_trace_assignment.owner_session, host().sessionID);
+  assert.equal(joinPrompt.metadata.opencode_trace_assignment.dependencies.length, 2);
+  assert.ok(joinPrompt.metadata.opencode_trace_assignment.dependencies.every(d => d.evidence_ref.startsWith('evt_')));
+  const planRecord = JSON.parse((await trace.store.readBlob(trace.store.index.get(out.plan_ref).payloadRef)).toString());
+  assert.equal(planRecord.steps.find(s => s.id === 'join').text, 'combine findings');
   assert.deepEqual(log.interrupts, []);
   // Terminal evidence: execution and outcome are separate, the worker result
   // is linked, and settled never claims success by itself.

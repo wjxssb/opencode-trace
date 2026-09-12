@@ -136,14 +136,21 @@ test('cross-process store updates merge via immutable events and restart', async
   assert.ok(store.sessions.has('s2')); assert.ok(second.sessions.has('s1'));
 });
 
-test('direct tool output satisfies host JSON contract after real observations', async t => {
+test('direct tool output satisfies host presentation contract after real observations', async t => {
   const { trace } = await fixture(t);
   await trace.after({ ...host(), tool: 'read', input: { filePath: 'doc' }, status: 'completed', result: { content: [{ type: 'text', text: 'old' }] } });
   await trace.note({ kind: 'finding', text: 'found', source_refs: [] }, host());
   const result = await definitions(trace).find(t => t.name === 'trace_status').execute({}, host());
-  assert.deepEqual(result.output, JSON.parse(JSON.stringify(result.output)));
-  assert.equal(result.output.ok, true);
-  assert.equal(result.output.recent[0].tool, 'read');
+  // P1 contract (Phase 0 spike): content is human Markdown + fenced machine
+  // block; the structured value rides in metadata.raw, size-bounded.
+  assert.equal(typeof result.content, 'string');
+  assert.equal(result.output, result.content);
+  assert.match(result.content, /```json/);
+  assert.equal(typeof result.metadata.raw, 'object');
+  assert.equal(result.metadata.raw.ok, true);
+  assert.equal(result.metadata.raw.ok, true);
+  assert.equal(result.metadata.raw.recent[0].tool, 'read');
+  assert.match(result.title, /Memory:/);
 });
 
 test('V2 compaction ended archives trusted summary and rejects other workspace events', async t => {
@@ -187,6 +194,8 @@ test('plugin store failure never throws native hooks, removes tools, or binds pe
   assert.deepEqual(Object.keys(hooks).sort(), ['context', 'execute.after', 'execute.before', 'prompt']);
   assert.equal(added.length, 10);
   const report = await added[0].execute({ kind: 'fact', text: 'x', source_refs: [] }, host());
-  assert.equal(report.output.ok, false);
+  assert.equal(report.metadata.raw.ok, false);
+  assert.match(report.title, /trace_note failed/);
+  assert.match(report.content, /native execution is unaffected/);
   await cleanup();
 });

@@ -1,10 +1,23 @@
 const str = { type: 'string' };
 const refs = { type: 'array', items: str, maxItems: 16 };
 const schema = (properties, required = []) => ({ type: 'object', properties, required, additionalProperties: false });
-const result = value => {
-  const content = JSON.stringify(value);
-  // Host output-schema validation requires JSON values, including nested fields.
-  return { output: JSON.parse(content), content, metadata: { opencode_trace: true } };
+import { present, boundedRaw } from './present.js';
+// P1 presentation: content is human Markdown + a fenced machine block (the
+// host persists content and the model reads it — Phase 0 spike); the raw
+// structured value rides in metadata.raw, size-bounded for host delivery.
+const result = async (name, value, trace) => {
+  const json = JSON.stringify(value);
+  const shown = present(name, value);
+  // The host truncates at 50 KiB / 2000 lines. Store a large response before
+  // delivery, so refs, pagination and coverage cannot disappear from its tail.
+  const oversized = Buffer.byteLength(shown.content, 'utf8') > 24000 || shown.content.split('\n').length > 1500;
+  const stored = oversized ? await trace.store.blob(value, 'json') : null;
+  const retrieval = stored ? { result_ref: stored.ref, result_sha256: stored.sha256, result_bytes: stored.bytes } : {};
+  const content = stored
+    ? `### ${shown.title}\n\nFull structured result stored without loss. Retrieve with trace_expand(ref="${stored.ref}", limit=2048); follow next_offset until null.\n\n` +
+      '```json\n' + JSON.stringify({ ok: value.ok, ...retrieval, presentation_omitted: true, next_cursor: value.next_cursor, next_offset: value.next_offset }, null, 2) + '\n```'
+    : shown.content;
+  return { title: shown.title, output: content, content, metadata: { opencode_trace: true, title: shown.title, ...retrieval, raw: boundedRaw(value, json) } };
 };
 
 export function definitions(trace) {
@@ -14,10 +27,10 @@ export function definitions(trace) {
       try {
         await trace.ready;
         if (!host?.sessionID) throw new Error('Host session identity unavailable');
-        return result({ ok: true, ...await fn(input, host) });
+        return await result(name, { ok: true, ...await fn(input, host) }, trace);
       } catch (error) {
         trace.warning(name, error);
-        return result({ ok: false, error: String(error.code ?? error.message ?? 'Trace unavailable').slice(0, 160), native_execution: 'unaffected' });
+        return result(name, { ok: false, error: String(error.code ?? error.message ?? 'Trace unavailable').slice(0, 160), native_execution: 'unaffected' }, trace);
       }
     }
   });
