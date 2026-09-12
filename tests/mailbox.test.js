@@ -39,7 +39,7 @@ test('P3: proposal -> objection thread carries per-level evidence; sender identi
 
   // s2's context hook persists the admitted envelope: context_observed gains real evidence.
   const admitted = prompts[0].text;
-  await s2.context({ sessionID: 's2', agent: 'build', messages: [{ id: 'msg_adm1', type: 'user', role: 'user', text: admitted, time: { created: 1 } }], system: [] });
+  await s2.context({ sessionID: 's2', agent: 'build', messages: [{ id: 'msg_adm1', type: 'user', role: 'user', text: admitted, metadata: prompts[0].metadata, time: { created: 1 } }], system: [] });
   let inbox2 = await s2.inbox({}, hostOf('s2'));
   assert.equal(inbox2.inbox.length, 1);
   let levels = inbox2.inbox[0].levels;
@@ -160,6 +160,7 @@ test('P3: crash window - persisted without delivery is recovered by sweep; unkno
   const s2view = await traceWith(storeRoot, {});
   await s2view.context({ sessionID: 's2', agent: 'build', messages: [{ id: 'msg_cw1', type: 'user', role: 'user',
     text: '[opencode-trace mailbox] message_id=msgx_crashwindow0000000000000000000000ff thread_id=thr_crashwindow0000000000000000000000ff from=s1 type=note\nwindow content',
+    metadata: { opencode_trace_mailbox: { origin: 'peer-agent', sender: 's1', message_id: 'msgx_crashwindow0000000000000000000000ff', thread_id: 'thr_crashwindow0000000000000000000000ff' } },
     time: { created: 1 } }], system: [] });
   outbox = await recovered.inbox({ sweep: true }, hostOf('s1'));
   assert.deepEqual(outbox.swept.requires_manual_choice.filter(m => m.message_id === 'msgx_crashwindow0000000000000000000000ff'), [], 'reconciled from transcript evidence');

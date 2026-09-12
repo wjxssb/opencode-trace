@@ -133,6 +133,9 @@ test('cross-process store updates merge via immutable events and restart', async
   const second = await new Store(dir, path.join(dir, 'store')).init(); t.after(() => second.close());
   await Promise.all([store.record('prompt.received', host('s1'), { text: 'one' }), second.record('prompt.received', host('s2'), { text: 'two' })]);
   await new Promise(r => setTimeout(r, 30)); await store.flush(); await second.flush();
+  // Cross-process convergence also works with request-driven reconciliation
+  // when the host has exhausted inotify watches.
+  await store.reconcile(); await second.reconcile();
   assert.ok(store.sessions.has('s2')); assert.ok(second.sessions.has('s1'));
 });
 
@@ -150,7 +153,7 @@ test('direct tool output satisfies host presentation contract after real observa
   assert.equal(result.metadata.raw.ok, true);
   assert.equal(result.metadata.raw.ok, true);
   assert.equal(result.metadata.raw.recent[0].tool, 'read');
-  assert.match(result.title, /Memory:/);
+  assert.match(result.title, /Memory for s1:/);
 });
 
 test('V2 compaction ended archives trusted summary and rejects other workspace events', async t => {

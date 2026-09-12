@@ -19,10 +19,12 @@ function collectStrings(value, out) {
 }
 
 export class Store {
-  constructor(workspace, root = path.join(os.homedir(), '.local/share/opencode-trace'), warning = () => {}) {
+  constructor(workspace, root = path.join(os.homedir(), '.local/share/opencode-trace'), warning = () => {}, options = {}) {
     this.workspace = workspace; this.base = root; this.warning = warning;
     this.sessions = new Map(); this.seen = new Set(); this.watchJobs = new Set();
     this.watchRefs = new Set(); this.maxWatchJobs = 16; this.missedWatchEvents = 0;
+    this.watchFactory = options.watch ?? watch;
+    this.watcherState = { mode: 'initializing', error: null };
     // Completed tool calls, rebuilt from every ingested tool.after event.
     // Terminal evidence must not depend on the bounded pending display window:
     // a late out-of-order tool.before (watch overflow, reconcile batch order)
@@ -41,7 +43,13 @@ export class Store {
     this.root = path.join(this.base, 'workspaces', this.workspaceID);
     for (const d of ['events', 'blobs', 'sessions', 'recall', 'intents', 'state']) await fs.mkdir(path.join(this.root, d), { recursive: true, mode: 0o700 });
     // Watch before recovery to cover concurrent writers during the one startup scan.
-    this.watcher = watch(path.join(this.root, 'events'), (_event, filename) => {
+    const watcherFailed = error => {
+      this.watcher?.close(); this.watcher = null;
+      this.watcherState = { mode: 'reconcile_only', error: String(error?.code ?? error?.name ?? 'watch_error') };
+      this.warning('watch_unavailable', error);
+    };
+    try {
+    this.watcher = this.watchFactory(path.join(this.root, 'events'), (_event, filename) => {
       if (!/^evt_[a-f0-9]{64}\.json$/.test(filename ?? '')) return;
       const ref = filename.slice(0, -5);
       if (this.seen.has(ref) || this.watchRefs.has(ref)) return;
@@ -51,6 +59,9 @@ export class Store {
       this.watchJobs.add(job); job.finally(() => { this.watchJobs.delete(job); this.watchRefs.delete(ref); });
     });
     this.watcher.unref();
+    this.watcher.on('error', watcherFailed);
+    this.watcherState = { mode: 'watch_and_reconcile', error: null };
+    } catch (error) { watcherFailed(error); }
     const names = (await fs.readdir(path.join(this.root, 'events'))).filter(x => /^evt_[a-f0-9]{64}\.json$/.test(x));
     const recovered = [];
     for (const name of names) {
@@ -258,7 +269,7 @@ export class Store {
         try { await this.ingest(await this.readEvent(ref)); imported++; }
         catch (error) { this.warning('reconcile', error); }
       }
-      return { scanned, imported };
+      return { scanned, imported, scan_complete: !this.reconcileDirectory, watcher: this.watcherState };
     })();
     this.reconcileJob = job;
     try { return await job; } finally {
@@ -266,6 +277,19 @@ export class Store {
       if (this.closed && this.reconcileDirectory) {
         await this.reconcileDirectory.close().catch(() => {}); this.reconcileDirectory = null;
       }
+    }
+  }
+  // Explicit orchestration decisions must see completed writes from another
+  // worker process even when watching is unavailable. Unlike observer hooks,
+  // these infrequent tool calls take one fresh directory snapshot and ingest
+  // every unseen event in it before deciding a binding or settled outcome.
+  async reconcileSnapshot() {
+    if (this.closed) return;
+    const names = await fs.readdir(path.join(this.root, 'events'));
+    for (const name of names) {
+      if (!/^evt_[a-f0-9]{64}\.json$/.test(name)) continue;
+      const ref = name.slice(0, -5);
+      if (!this.seen.has(ref)) await this.ingest(await this.readEvent(ref));
     }
   }
   session(id) {

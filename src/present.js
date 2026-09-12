@@ -121,7 +121,7 @@ const formatters = {
     const body = [
       `- **query**: ${clip(compactJson(value?.query ?? {}), 200)}`,
       `- **matches**: ${value?.mode === 'deep' ? deepHits.length : indexResults.length}`,
-      value?.next_cursor ? `- **next cursor** (pass as \`cursor\` to continue): \`${String(value.next_cursor).slice(0, 120)}\`` : '- **next cursor**: (exhausted)',
+      value?.next_cursor ? '- **next cursor**: available; pass the complete `next_cursor` from the structured result below as `cursor`' : '- **next cursor**: (exhausted)',
       `- **indexed events**: ${value?.coverage?.indexed_events ?? '?'}`,
       '',
       rows.length ? rows.join('\n') : '_no matches_',
@@ -173,6 +173,7 @@ const formatters = {
     });
     const body = [
       `- **viewer**: \`${value?.viewer ?? '?'}\``,
+      value?.next_cursor ? '- **older messages**: pass the complete `next_cursor` below as `cursor`, keeping the same thread filter' : '- **older messages**: (end of ingested history)',
       '',
       inbox.length ? '**Inbound**\n' + inboxLines.join('\n') : '**Inbound**: (none)',
       '',
@@ -224,12 +225,13 @@ const formatters = {
     const notes = Array.isArray(value?.notes) ? value.notes : [];
     const unresolved = Array.isArray(value?.unresolved) ? value.unresolved : [];
     const peers = Array.isArray(value?.peers) ? value.peers : [];
-    const title = `Memory: ${notes.length} notes · ${unresolved.length} unresolved · ${peers.length} peers shown` +
+    const title = `Memory for ${value?.sessionID ?? 'current session'}: ${notes.length} notes · ${unresolved.length} unresolved · ${peers.length} peers shown` +
       (intent ? ` · intent ${intent.status ?? '?'}` : ' · no active intent');
     const peerLines = peers.map(p =>
       `- \`${p.sessionID ?? '?'}\` (${p.agent ?? '?'} · ${p.status ?? '?'})${p.intent ? ` · intent **${p.intent.status}**: ${clip(p.intent.summary ?? '', 90)}` : ''}`);
     const body = [
       `- **workspace**: \`${value?.workspace ?? '?'}\``,
+      `- **scope**: caller session \`${value?.sessionID ?? '?'}\`; this is a bounded observer view, not another worker's context`,
       intent ? `- **current intent** (${intent.status}): ${clip(intent.summary ?? '', 180)}` : '- **current intent**: (none declared)',
       `- **notes** (${notes.length}): ${notes.length ? notes.map(n => `\`${n.ref ?? '?'}\`(${n.kind ?? '?'})`).join(', ') : '(none)'}`,
       `- **unresolved** (${unresolved.length}): ${unresolved.length ? unresolved.map(n => `\`${n.ref ?? '?'}\``).join(', ') : '(none)'}`,

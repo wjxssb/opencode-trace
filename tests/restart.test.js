@@ -13,7 +13,8 @@ const open = (dir, session = {}) => {
   return trace.ready.then(() => trace);
 };
 const native = log => ({
-  create: async () => ({ data: { id: `ses_w_${++log.n}` } }),
+  get: async ({ sessionID }) => ({ data: log.bindings?.get(sessionID) ?? { id: sessionID, agent: 'build', model: { providerID: 'fixture-cloud', id: 'worker' } } }),
+  create: async ({ agent, model }) => { const value = { id: `ses_w_${++log.n}`, agent, model }; (log.bindings ??= new Map()).set(value.id, value); return { data: value }; },
   prompt: async ({ sessionID }) => { log.prompts.push(sessionID); if (log.submit) await log.submit(sessionID); return { data: { id: 'in' } }; },
   wait: async () => {},
   context: async () => ({ data: [{ id: 'a1', type: 'assistant', role: 'assistant', text: 'worker output', time: { created: 1, completed: 2 }, finish: 'stop' }] }),
@@ -112,8 +113,12 @@ test('P5.3: a real child-process restart rebuilds projections - crash window, wo
   }
   assert.equal(lateClaims.length, 1, 'exactly one late claim event exists');
   assert.equal(lateClaims[0].status, 'failure');
-  // The settled outcome was never rewritten.
+  // The old settled outcome was never rewritten, but the newer crashed
+  // attempt prevents presenting that older success as the plan's current state.
   const settled = await second.plan({ steps: [{ id: 'solo', text: 'worker work' }] }, hostOf('orchestrator', 'p2'));
-  assert.equal(settled.steps[0].state, 'already_settled(worker_reported_success)');
+  assert.equal(settled.steps[0].state, 'already_in_flight_unknown');
+  assert.equal(settled.steps[0].sessionID, 'ses_crashed');
+  const originalTerminal = JSON.parse((await second.store.expand(plan.steps[0].evidence_ref, 0, 24000)).exact_utf8);
+  assert.equal(originalTerminal.outcome, 'worker_reported_success');
   assert.equal((await second.deliveryOutcome(sent.message_id, 'worker')).state, 'unknown_crash_window', 'still never auto-redelivered');
 });

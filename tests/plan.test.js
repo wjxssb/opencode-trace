@@ -8,6 +8,19 @@ import { hash, stable } from '../src/util.js';
 
 async function fixture(t, session) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'opencode-trace-plan-'));
+  if (session?.create && !session.get) {
+    const original = session, selected = new Map();
+    session = { ...original,
+      get: async ({ sessionID }) => ({ data: selected.get(sessionID) ?? { id: sessionID, agent: 'build', model: { providerID: 'fixture-cloud', id: 'worker', variant: 'low' } } }),
+      create: async input => {
+        const response = await original.create(input);
+        const value = response?.data ?? response;
+        if (value?.id) selected.set(value.id, { ...value, agent: input.agent, model: input.model });
+        return response;
+      },
+      ...(original.switchAgent ? { switchAgent: async input => { const result = await original.switchAgent(input); const info = selected.get(input.sessionID); if (info) info.agent = input.agent; return result; } } : {}),
+    };
+  }
   const ctx = { location: { directory: dir }, ...(session ? { session } : {}) };
   const trace = new Trace(ctx, { storeRoot: path.join(dir, 'store') });
   await trace.ready;
@@ -19,7 +32,8 @@ const host = (sessionID = 's1', id = 'c1') => ({ sessionID, messageID: 'm1', id,
 // Simulated native sessions. log.submit, when set, runs inside the child turn
 // and stands in for the worker calling trace_step_result.
 const nativeSessions = log => ({
-  create: async ({ title }) => { const id = `ses_child_${log.create.push(title)}`; log.sessions.push(id); return { data: { id } }; },
+  get: async ({ sessionID }) => ({ data: log.bindings?.get(sessionID) ?? { id: sessionID, agent: 'build', model: { providerID: 'fixture-cloud', id: 'worker', variant: 'low' } } }),
+  create: async ({ title, agent, model }) => { const id = `ses_child_${log.create.push(title)}`; log.sessions.push(id); (log.bindings ??= new Map()).set(id, { id, agent, model }); return { data: { id, agent, model } }; },
   prompt: async ({ sessionID, text, metadata }) => {
     log.prompts.push({ sessionID, text, metadata });
     if (log.failPrompt?.has(sessionID)) throw new Error('step prompt rejected');
@@ -32,7 +46,7 @@ const nativeSessions = log => ({
     { id: `msg_a_${sessionID}`, type: 'assistant', role: 'assistant', text: `TRACE_FIXTURE_DONE ${sessionID}`, time: { created: 2, completed: 3 }, finish: 'stop' },
   ] }),
   interrupt: async ({ sessionID }) => { log.interrupts.push(sessionID); },
-  switchAgent: log.switchAgent ? async ({ sessionID, agent }) => { log.switches.push({ sessionID, agent }); } : undefined,
+  switchAgent: log.switchAgent ? async ({ sessionID, agent }) => { log.switches.push({ sessionID, agent }); log.bindings.get(sessionID).agent = agent; } : undefined,
 });
 
 test('P5.2: settled-with-worker-success gates the DAG; failure and unknown block dependents', async t => {

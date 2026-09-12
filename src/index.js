@@ -23,7 +23,7 @@ export default {
     await register('before', () => ctx.tool.hook('execute.before', e => trace.safe('before', () => trace.before(e))));
     await register('after', () => ctx.tool.hook('execute.after', e => trace.safe('after', () => trace.after(e))));
     await register('agents', () => ctx.agent.transform(editor => trace.safe('agents', async () => {
-      const agents = editor.list().map(a => ({ id: a.id, name: a.name, description: a.description, mode: a.mode }));
+      const agents = editor.list().map(a => ({ id: a.id, name: a.name, description: a.description, mode: a.mode, model: a.model }));
       await trace.store.record('agents.snapshot', {}, agents);
     })));
     await register('tools', () => ctx.tool.transform(editor => { for (const definition of definitions(trace)) editor.add(definition); }));
