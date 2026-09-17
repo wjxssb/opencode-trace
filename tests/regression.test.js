@@ -169,7 +169,9 @@ test('P1d: context recall distinguishes prepared from hook_applied; timeout reco
   Store.prototype.reconcile = function () { return new Promise(r => setTimeout(r, 1150)); };
   const second = event('s2');
   await hooks.context(second);
-  assert.equal(second.system.length, 0, 'timed-out recall is not silently injected');
+  assert.equal(second.system.length, 1, 'missing recall is explicitly reported without injecting late data');
+  assert.match(second.system[0].text, /OPENCODE_TRACE_RECALL_UNAVAILABLE/);
+  assert.match(second.system[0].text, /does not mean there is no history/);
   await new Promise(r => setTimeout(r, 1350));
   Store.prototype.reconcile = originalReconcile;
   stages = await count();
@@ -178,4 +180,21 @@ test('P1d: context recall distinguishes prepared from hook_applied; timeout reco
   assert.ok(stages.prepared.some(p => p.host.sessionID === 's2' && !stages.applied.some(a => a.checkpoint === p.ref)),
     'prepared without applied stays distinguishable');
   await cleanup();
+});
+
+
+test('automatic recall labels model claims and exposes observation age and capture degradation', async t => {
+  const { trace } = await fixture(t);
+  await trace.note({ kind: 'fact', text: 'Service was healthy yesterday', source_refs: [] }, { sessionID: 'worker' });
+  trace.errors = 2; trace.droppedObservations = 1;
+  const started = Date.now();
+  const recall = trace.recall('worker');
+  assert.match(recall, /not independently verified facts/);
+  assert.match(recall, /Recheck time-sensitive claims/);
+  const view = JSON.parse(recall.split('\n')[2]);
+  assert.ok(view.snapshot_at >= started);
+  assert.equal(view.observer.errors, 2);
+  assert.equal(view.observer.dropped_observations, 1);
+  assert.match(view.observer.meaning, /Zero errors does not prove complete/);
+  assert.equal(view.notes[0].text, 'Service was healthy yesterday');
 });

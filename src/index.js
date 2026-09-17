@@ -18,6 +18,8 @@ export default {
         // Evidence that the recall was actually appended to this hook object,
         // made durable before the host dispatches the model request.
         await trace.safe('context.applied', () => trace.markContextApplied(e, out));
+      } else if (Array.isArray(e.system)) {
+        e.system.push({ type: 'text', text: 'OPENCODE_TRACE_RECALL_UNAVAILABLE: Trace could not prepare recall for this request within its observer budget. Historical evidence may be missing from this prompt; this does not mean there is no history or that prior work is resolved. Use native conversation records and trace_status/trace_find as needed. Native execution continues.' });
       }
     }));
     await register('before', () => ctx.tool.hook('execute.before', e => trace.safe('before', () => trace.before(e))));

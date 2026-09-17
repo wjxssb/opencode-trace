@@ -18,6 +18,17 @@ function collectStrings(value, out) {
   else if (value && typeof value === 'object') { for (const v of Object.values(value)) { collectStrings(v, out); if (out.length >= HINT_MAX_STRINGS) return; } }
 }
 
+// Filesystem errors carry absolute paths in message/path. Surface the ref and
+// the error code only, so tool output never leaks store layout. The code is
+// preserved because record() relies on ENOENT to detect a first write.
+function ioError(label, ref, error) {
+  const code = error?.code ?? 'IO_ERROR';
+  const notFound = code === 'ENOENT';
+  const clean = new Error(notFound ? `${label} not found ${ref}` : `${label} unreadable ${ref}: ${code}`);
+  clean.code = code;
+  return clean;
+}
+
 export class Store {
   constructor(workspace, root = path.join(os.homedir(), '.local/share/opencode-trace'), warning = () => {}, options = {}) {
     this.workspace = workspace; this.base = root; this.warning = warning;
@@ -293,8 +304,10 @@ export class Store {
     }
   }
   session(id) {
-    if (!this.sessions.has(id)) this.sessions.set(id, { sessionID: id, recent: [], notes: [], conflicts: [], intent_conflicts: [], pending: {}, compact: null, intent: null, lastActivity: 0 });
-    return this.sessions.get(id);
+    if (!this.sessions.has(id)) this.sessions.set(id, { sessionID: id, recent: [], notes: [], milestones: [], conflicts: [], intent_conflicts: [], pending: {}, compact: null, intent: null, lastActivity: 0 });
+    const s = this.sessions.get(id);
+    if (!s.milestones) s.milestones = [];
+    return s;
   }
   async blob(value, encoding = 'json') {
     const data = Buffer.from(encoding === 'json' ? stable(value) : value);
@@ -303,9 +316,15 @@ export class Store {
     return { ref, sha256: digest, bytes: data.length, encoding };
   }
   async readBlob(ref) {
-    if (!/^blob_[a-f0-9]{64}$/.test(ref)) throw new Error('Invalid blob ref');
+    if (!/^blob_[a-f0-9]{64}$/.test(ref)) throw new Error(`Invalid blob ref ${String(ref).slice(0, 80)}: expected blob_<64hex>`);
     const digest = ref.slice(5);
-    const data = await fs.readFile(path.join(this.root, 'blobs', digest.slice(0, 2), digest));
+    let data;
+    try {
+      data = await fs.readFile(path.join(this.root, 'blobs', digest.slice(0, 2), digest));
+    } catch (error) {
+      if (error?.code) throw ioError('Blob', ref, error);
+      throw error;
+    }
     if (hash(data) !== digest) throw new Error('Blob hash mismatch');
     return data;
   }
@@ -314,10 +333,16 @@ export class Store {
   // hash-verified because it is discovery only - exact evidence always goes
   // through expand(), which verifies the full blob.
   async readBlobRange(ref, start, length) {
-    if (!/^blob_[a-f0-9]{64}$/.test(ref)) throw new Error('Invalid blob ref');
+    if (!/^blob_[a-f0-9]{64}$/.test(ref)) throw new Error(`Invalid blob ref ${String(ref).slice(0, 80)}: expected blob_<64hex>`);
     if (!Number.isInteger(start) || start < 0 || !Number.isInteger(length) || length < 1) throw new Error('Invalid blob range');
     const digest = ref.slice(5);
-    const handle = await fs.open(path.join(this.root, 'blobs', digest.slice(0, 2), digest), 'r');
+    let handle;
+    try {
+      handle = await fs.open(path.join(this.root, 'blobs', digest.slice(0, 2), digest), 'r');
+    } catch (error) {
+      if (error?.code) throw ioError('Blob', ref, error);
+      throw error;
+    }
     try {
       const { size } = await handle.stat();
       const want = Math.min(length, Math.max(0, size - start));
@@ -328,14 +353,20 @@ export class Store {
     } finally { await handle.close(); }
   }
   async readEvent(ref) {
-    if (!/^evt_[a-f0-9]{64}$/.test(ref)) throw new Error('Invalid event ref');
-    const event = JSON.parse(await fs.readFile(path.join(this.root, 'events', `${ref}.json`), 'utf8'));
+    if (!/^evt_[a-f0-9]{64}$/.test(ref)) throw new Error(`Invalid event ref ${String(ref).slice(0, 80)}: expected evt_<64hex>`);
+    let event;
+    try {
+      event = JSON.parse(await fs.readFile(path.join(this.root, 'events', `${ref}.json`), 'utf8'));
+    } catch (error) {
+      if (error?.code) throw ioError('Event', ref, error);
+      throw error;
+    }
     const { at, ref: actual, ...body } = event;
     if (actual !== ref || `evt_${hash(stable(body))}` !== ref || body.workspaceID !== this.workspaceID || body.schema !== 1) throw new Error('Event integrity mismatch');
     return event;
   }
   async exists(ref) {
-    if (!refPattern.test(ref)) throw new Error('Invalid source ref');
+    if (!refPattern.test(ref)) throw new Error(`Invalid source ref ${String(ref).slice(0, 80)}: expected evt_<64hex> or blob_<64hex>`);
     return ref.startsWith('evt_') ? this.readEvent(ref) : this.readBlob(ref);
   }
   async record(type, host, data, extra = {}) {
@@ -374,7 +405,27 @@ export class Store {
     if (!s.identityRef || event.at > s.lastActivity || (event.at === s.lastActivity && event.ref.localeCompare(s.identityRef) > 0)) {
       Object.assign(s, event.host); s.lastActivity = event.at; s.identityRef = event.ref;
     }
-    if (event.type === 'trace.note') s.notes = keep(s.notes, { ...item, ...event.note }, 64);
+    if (event.type === 'trace.note') {
+      const noteItem = { ...item, ...event.note };
+      s.notes = keep(s.notes, noteItem, 64);
+      if (!s.milestones) s.milestones = [];
+      const isMilestone = Boolean(
+        event.note?.milestone ||
+        ['decision', 'unresolved', 'baseline', 'handoff', 'correction', 'blocker', 'verification', 'state_change'].includes(event.note?.kind)
+      );
+      if (isMilestone) {
+        if (!s.milestones.some(m => m.ref === noteItem.ref)) {
+          s.milestones.push(noteItem);
+          s.milestones.sort((a, b) => a.at - b.at || a.ref.localeCompare(b.ref));
+        }
+        if (s.milestones.length > 256) {
+          const allSuperseded = new Set(s.milestones.flatMap(m => (m.supersedes ?? []).concat(m.milestone?.supersedes ?? [])));
+          const unsuperseded = s.milestones.filter(m => !allSuperseded.has(m.ref));
+          const superseded = s.milestones.filter(m => allSuperseded.has(m.ref)).slice(-32);
+          s.milestones = [...unsuperseded, ...superseded].sort((a, b) => a.at - b.at || a.ref.localeCompare(b.ref));
+        }
+      }
+    }
     if (event.type === 'trace.intent') {
       const cur = s.intent;
       // Same-millisecond intents are concurrent declarations with no provable
@@ -427,6 +478,7 @@ export class Store {
   async expand(ref, offset = 0, limit = 2048, metadataOnly = false) {
     if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 24000) throw new Error('Invalid expansion range');
     if (typeof metadataOnly !== 'boolean') throw new Error('Invalid metadata_only');
+    if (typeof ref !== 'string' || !refPattern.test(ref)) throw new Error(`Invalid ref ${String(ref).slice(0, 80)}: expected evt_<64hex> or blob_<64hex>`);
     let event, data;
     if (ref.startsWith('evt_')) {
       event = await this.readEvent(ref); data = await this.readBlob(event.payload.ref);

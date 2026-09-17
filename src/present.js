@@ -80,9 +80,14 @@ function deepHitLine(hit) {
 const formatters = {
   trace_note(value) {
     const note = value?.note ?? {};
-    const title = `Note saved (${note.kind ?? '?'})`;
+    const ms = note.milestone;
+    const title = ms ? `Milestone saved (${ms.kind ?? note.kind ?? '?'})` : `Note saved (${note.kind ?? '?'})`;
     const body = bullets([
-      `**text**: ${clip(note.text ?? '', 220)}`,
+      `**text**: ${clip(note.text ?? ms?.summary ?? '', 220)}`,
+      ms?.current_state ? `**current state**: ${ms.current_state}` : null,
+      ms?.what_changed ? `**what changed**: ${clip(ms.what_changed, 160)}` : null,
+      ms?.next_action ? `**next action**: ${clip(ms.next_action, 160)}` : null,
+      ms?.do_not_repeat?.length ? `**do not repeat**: ${ms.do_not_repeat.join('; ')}` : null,
       note.source_refs?.length ? `**source refs**: ${refList(note.source_refs)}` : null,
       note.supersedes?.length ? `**supersedes**: ${refList(note.supersedes)}` : null,
       note.depends_on?.length ? `**depends on**: ${refList(note.depends_on)}` : null,
@@ -286,7 +291,9 @@ export function present(name, value) {
  */
 export function boundedRaw(value, serialized, limit = RAW_LIMIT) {
   try {
-    if (Buffer.byteLength(serialized, 'utf8') <= limit) return value;
+    // Deliver the same JSON-safe value as the fenced body. Internal search filters
+    // contain undefined; passing those through metadata breaks native persistence.
+    if (Buffer.byteLength(serialized, 'utf8') <= limit) return JSON.parse(serialized);
     return {
       raw_omitted: true,
       serialized_bytes: Buffer.byteLength(serialized, 'utf8'),

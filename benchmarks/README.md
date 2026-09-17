@@ -13,6 +13,14 @@ full maintainer audit layout; it is not a standalone clean-checkout test.
 `closure_cases.py` contains bounded real-host ENOTDIR and lifecycle fixtures.
 The repository's standalone regression gate is `node --test tests/*.test.js`.
 
+`recall_budget.mjs STORE_ROOT BEFORE_PACKAGE OUTPUT_DIR` reads event files and
+replays both recall renderers against identical final state, without initializing
+or writing to the live store. It reports prepared and hook-applied bytes separately,
+paired recall costs for sessions with checkpoints, and serialized tool descriptions
+and input schemas. Output includes private per-session pairs and an event-ref manifest;
+keep the output directory outside the repository. This measures bytes, not billed
+tokens or model task success. Live event lists are captured per workspace.
+
 ## Portable component measurements
 
 Use fresh output directories outside your project. The storage sweep retains

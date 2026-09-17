@@ -220,3 +220,14 @@ test('oversized native result is durably addressable before host truncation', as
   const json = await store.readBlob(result.metadata.result_ref);
   assert.deepEqual(JSON.parse(json), {ok:true,...value});
 });
+
+
+test('raw metadata uses the JSON wire value, including nested optional search filters', () => {
+  const value = { ok: true, query: { session: 'worker', tool: undefined, source: { path: undefined } }, results: [], next_cursor: null };
+  const serialized = JSON.stringify(value);
+  const delivered = boundedRaw(value, serialized);
+  assert.deepEqual(delivered, { ok: true, query: { session: 'worker', source: {} }, results: [], next_cursor: null });
+  assert.equal(Object.hasOwn(delivered.query, 'tool'), false);
+  assert.deepEqual(JSON.parse(JSON.stringify(delivered)), delivered);
+  assert.equal(Object.hasOwn(value.query, 'tool'), true, 'normalization does not mutate stored input');
+});

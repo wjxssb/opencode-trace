@@ -1,0 +1,111 @@
+{
+  "measured_at": "2026-09-13T04:25:41.879Z",
+  "census": {
+    "events": 26852,
+    "checkpoints": 4568,
+    "applied": 3499,
+    "prepared_without_applied": 1069,
+    "notes": 46,
+    "superseding_notes": 1,
+    "note_sessions": 22,
+    "applied_sessions": 244,
+    "checkpoint_sessions": 255,
+    "all_observed_sessions": 288
+  },
+  "historical": {
+    "hook_applied_bytes": {
+      "count": 3499,
+      "total": 34173576,
+      "mean": 9766.669334095455,
+      "median": 11188,
+      "min": 765,
+      "max": 12288
+    },
+    "prepared_bytes": {
+      "count": 4568,
+      "total": 45085112,
+      "mean": 9869.77057793345,
+      "median": 11435,
+      "min": 765,
+      "max": 12288
+    },
+    "applied_bytes_per_session": {
+      "count": 244,
+      "total": 34173576,
+      "mean": 140055.6393442623,
+      "median": 30812,
+      "min": 1518,
+      "max": 6527374
+    },
+    "latest_snapshot_bytes": {
+      "count": 255,
+      "total": 1943674,
+      "mean": 7622.250980392157,
+      "median": 7431,
+      "min": 1518,
+      "max": 12273
+    }
+  },
+  "paired_end_state_replay": {
+    "before": {
+      "count": 255,
+      "total": 2777020,
+      "mean": 10890.274509803921,
+      "median": 11403,
+      "min": 3247,
+      "max": 12281
+    },
+    "after": {
+      "count": 255,
+      "total": 1489952,
+      "mean": 5842.949019607843,
+      "median": 5852,
+      "min": 2751,
+      "max": 12185
+    },
+    "peers_before": {
+      "count": 255,
+      "total": 1492998,
+      "mean": 5854.894117647059,
+      "median": 5771,
+      "min": 2,
+      "max": 8604
+    },
+    "peers_after": {
+      "count": 255,
+      "total": 331134,
+      "mean": 1298.5647058823529,
+      "median": 980,
+      "min": 2,
+      "max": 3226
+    },
+    "static_before": {
+      "count": 255,
+      "total": 420240,
+      "mean": 1648,
+      "median": 1648,
+      "min": 1648,
+      "max": 1648
+    },
+    "static_after": {
+      "count": 255,
+      "total": 249390,
+      "mean": 978,
+      "median": 978,
+      "min": 978,
+      "max": 978
+    }
+  },
+  "tool_surface": {
+    "count": 10,
+    "before_bytes": 9084,
+    "after_bytes": 7162,
+    "measurement": "JSON name/description/input; excludes host framing, inline review and tokenizer costs"
+  },
+  "limitations": [
+    "Hook applied is not proof of model consumption or billing.",
+    "Prepared bytes are separate and must not be added to applied bytes.",
+    "Paired replay renders identical final event state, not counterfactual historical prompts or model-quality acceptance.",
+    "Live event lists are captured per workspace; concurrent writes after each listing are excluded."
+  ]
+}

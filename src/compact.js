@@ -4,7 +4,7 @@ export const MAP_START = '<opencode-trace-map-v1>';
 export const MAP_END = '</opencode-trace-map-v1>';
 const fields = ['current_refs', 'unresolved_refs', 'important_refs', 'recent_refs', 'retrieve_if_needed', 'supersedes', 'depends_on'];
 
-export const compactGuidance = `During native compaction, keep OpenCode's normal human summary. You may append ${MAP_START}{"current_refs":[],"unresolved_refs":[],"important_refs":[],"recent_refs":[],"retrieve_if_needed":[],"supersedes":[],"depends_on":[]}${MAP_END}. Use only existing trace evt_/blob_ refs, at most 8 per field and 4096 bytes total. Never invent refs. Missing or invalid maps only reduce trace recovery; native compaction proceeds normally.`;
+export const compactGuidance = `Compaction: keep the native summary; optionally append ${MAP_START}{"current_refs":[],"unresolved_refs":[],"important_refs":[],"recent_refs":[],"retrieve_if_needed":[],"supersedes":[],"depends_on":[]}${MAP_END}. Existing evt_/blob_ refs only; <=8/field, <=4096 bytes. Invalid/missing maps reduce recovery only.`;
 
 export async function parseMap(summary, store) {
   const start = summary.indexOf(MAP_START), end = summary.indexOf(MAP_END, start + MAP_START.length);
