@@ -2,6 +2,7 @@ const str = { type: 'string' };
 const refs = { type: 'array', items: str, maxItems: 16 };
 const schema = (properties, required = []) => ({ type: 'object', properties, required, additionalProperties: false });
 import { present, boundedRaw } from './present.js';
+import { normalizeTraceIntentInput } from './normalization.js';
 // P1 presentation: content is human Markdown + a fenced machine block (the
 // host persists content and the model reads it — Phase 0 spike); the raw
 // structured value rides in metadata.raw, size-bounded for host delivery.
@@ -30,6 +31,9 @@ export function definitions(trace) {
         return await result(name, { ok: true, ...await fn(input, host) }, trace);
       } catch (error) {
         trace.warning(name, error);
+        if (name === 'trace_intent' && host?.sessionID) {
+          trace.recordIntentFailure(host.sessionID, error, input);
+        }
         return result(name, { ok: false, error: String(error.message ?? error.code ?? 'Trace unavailable').slice(0, 320), native_execution: 'unaffected' }, trace);
       }
     }
@@ -101,7 +105,35 @@ export function definitions(trace) {
         retry_failed: { type: 'boolean' },
       }, ['steps']), (i, h) => trace.plan(i, h)),
     tool('trace_intent', 'Declare your current intent and explicit paths/resources. Overlap produces advisory information only. Update to done/cancelled when finished.',
-      schema({ summary: str, paths: { type: 'array', items: str, maxItems: 64 }, resources: { type: 'array', items: str, maxItems: 32 }, status: { enum: ['active', 'waiting', 'done', 'cancelled'] }, related_refs: refs }, ['summary', 'paths', 'status']), (i, h) => trace.intent(i, h)),
+      schema({
+        summary: str,
+        paths: {
+          anyOf: [
+            { type: 'array', items: str, maxItems: 64 },
+            { type: 'string' },
+            { type: 'null' }
+          ]
+        },
+        resources: {
+          anyOf: [
+            { type: 'array', items: str, maxItems: 32 },
+            { type: 'string' },
+            { type: 'null' }
+          ]
+        },
+        status: { enum: ['active', 'waiting', 'done', 'cancelled'] },
+        related_refs: refs,
+        attempt: { type: 'integer', minimum: 1 },
+        recovered: { type: 'boolean' },
+        previous_error: str
+      }, ['status']), async (i, h) => {
+        const recovery = h?.sessionID ? trace.consumeIntentRecovery(h.sessionID) : null;
+        const normalized = normalizeTraceIntentInput({
+          ...i,
+          ...(recovery ?? {})
+        });
+        return trace.intent(normalized, h);
+      }),
     tool('trace_status', 'Page memory, peer declarations and historical lifecycle observations with source refs and degradation counters. Display limits do not limit peer checks. include_storage counts files/bytes; no retention/quota.',
       schema({ peer_offset: { type: 'integer', minimum: 0 }, peer_limit: { type: 'integer', minimum: 1, maximum: 64 }, include_storage: { type: 'boolean' } }), async (i, h) => {
         const offset = i.peer_offset ?? 0, limit = i.peer_limit ?? 8;

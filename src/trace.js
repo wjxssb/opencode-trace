@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { Store } from './store.js';
 import { atomic, bytes, stable, hash, identity, callKey, locator, mutationPaths, canonical, overlaps, messageID, messageRole, messageContentFingerprint, textFromMessage, refPattern, unwrap } from './util.js';
 import { compactGuidance, compactions, saveCompact } from './compact.js';
+import { normalizeTraceIntentInput } from './normalization.js';
 
 const NOTE_KINDS = ['fact', 'finding', 'decision', 'unresolved', 'handoff', 'correction'];
 const MILESTONE_KINDS = ['decision', 'state_change', 'verification', 'blocker', 'correction', 'handoff', 'baseline'];
@@ -178,6 +179,7 @@ export class Trace {
   constructor(ctx, options = {}) {
     this.ctx = ctx; this.options = options; this.errors = 0; this.hydrated = new Set(); this.hydrating = new Map(); this.messageSeen = new Set(); this.compactSeen = new Set();
     this.contextBindings = new Map();
+    this.intentFailures = new Map();
     this.observerJobs = new Set(); this.maxObserverJobs = 8; this.droppedObservations = 0;
     this.warning = (where, error) => {
       this.errors++;
@@ -461,17 +463,51 @@ export class Trace {
     const event = await this.store.record('trace.note', identity(host), note, { callID: host.id, note });
     return { ref: event.ref, note };
   }
-  async intent(input, host) {
-    if (!['active', 'waiting', 'done', 'cancelled'].includes(input.status) || typeof input.summary !== 'string' || bytes(input.summary) > 2048 || !input.summary.trim() || !Array.isArray(input.paths) || input.paths.length > 64 || input.paths.some(p => typeof p !== 'string' || !p || bytes(p) > 4096) || bytes(input) > 16000) throw new Error('Invalid intent schema or size');
-    const resources = input.resources ?? [];
-    if (!Array.isArray(resources) || resources.length > 32 || resources.some(r => typeof r !== 'string' || !r || bytes(r) > 256)) throw new Error('Invalid resources');
+  recordIntentFailure(sessionID, error, input) {
+    if (!sessionID) return;
+    const existing = this.intentFailures.get(sessionID);
+    const attempt = (existing?.attempt ?? 0) + 1;
+    this.intentFailures.set(sessionID, {
+      error: String(error?.message ?? error).slice(0, 320),
+      input,
+      timestamp: Date.now(),
+      attempt,
+    });
+  }
+  consumeIntentRecovery(sessionID) {
+    if (!sessionID) return null;
+    const failed = this.intentFailures.get(sessionID);
+    if (!failed) return null;
+    if (Date.now() - failed.timestamp > 300000) {
+      this.intentFailures.delete(sessionID);
+      return null;
+    }
+    this.intentFailures.delete(sessionID);
+    return {
+      recovered: true,
+      attempt: failed.attempt + 1,
+      previous_error: failed.error,
+    };
+  }
+  async intent(rawInput, host) {
+    const input = normalizeTraceIntentInput(rawInput);
     await this.store.reconcile();
-    const intent = { summary: input.summary, status: input.status, paths: [...new Set(await Promise.all(input.paths.map(p => canonical(path.resolve(this.store.workspace, p)))))], resources, related_refs: await this.refs(input.related_refs, 'related_refs') };
+    const intent = { summary: input.summary, status: input.status, paths: [...new Set(await Promise.all(input.paths.map(p => canonical(path.resolve(this.store.workspace, p)))))], resources: input.resources, related_refs: await this.refs(input.related_refs, 'related_refs') };
     const event = await this.store.record('trace.intent', identity(host), intent, { callID: host.id, intent });
     await atomic(path.join(this.store.root, 'intents', `${hash(host.sessionID)}.json`), stable({ ref: event.ref, at: event.at,
       sessionID: host.sessionID, workspaceID: this.store.workspaceID, ...intent }));
-    const advisories = ACTIVE.has(intent.status) ? await this.conflicts(host.sessionID, intent.paths, resources, event.ref) : [];
-    return { ref: event.ref, intent, advisories, execution_effect: 'none' };
+    const advisories = ACTIVE.has(intent.status) ? await this.conflicts(host.sessionID, intent.paths, input.resources, event.ref) : [];
+    const recovered = input.recovered === true;
+    return {
+      ref: event.ref,
+      intent: {
+        ...intent,
+        ...(recovered ? { recovered: true, attempt: input.attempt, previous_error: input.previous_error } : {})
+      },
+      advisories,
+      execution_effect: 'none',
+      ...(recovered ? { recovered: true, attempt: input.attempt, previous_error: input.previous_error } : {})
+    };
   }
   async conflicts(sid, paths, resources, sourceRef) {
     const result = [];

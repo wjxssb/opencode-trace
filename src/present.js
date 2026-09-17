@@ -99,12 +99,16 @@ const formatters = {
   trace_intent(value) {
     const intent = value?.intent ?? {};
     const advisories = Array.isArray(value?.advisories) ? value.advisories : [];
-    const title = `Intent (${intent.status ?? '?'})`;
+    const isRecovered = value?.recovered === true || intent?.recovered === true;
+    const attempt = value?.attempt ?? intent?.attempt ?? 1;
+    const prevError = value?.previous_error ?? intent?.previous_error;
+    const title = `Intent (${intent.status ?? '?'})${isRecovered ? ' · recovered ✓' : ''}`;
     const advisoryLines = advisories.length
       ? advisories.map(a => `  - peer \`${a.peer ?? '?'}\` shares: ${clip([...(a.paths ?? []), ...(a.resources ?? [])].join(', '), 140)} (advisory only, never blocking)`)
       : ['  - none'];
     const body = bullets([
       `**summary**: ${clip(intent.summary ?? '', 220)}`,
+      isRecovered ? `**recovery**: recovered from validation failure on attempt ${attempt}${prevError ? ` (repaired from error: \`${clip(prevError, 160)}\`)` : ''}` : null,
       `**paths** (${(intent.paths ?? []).length}): ${clip((intent.paths ?? []).join(', '), 200)}`,
       (intent.resources ?? []).length ? `**resources**: ${intent.resources.join(', ')}` : null,
       (intent.related_refs ?? []).length ? `**related refs**: ${refList(intent.related_refs)}` : null,
