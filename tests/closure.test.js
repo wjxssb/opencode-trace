@@ -94,14 +94,20 @@ test('watcher event burst caps pending reads and recovers missed notifications m
   const readEvent = reader.readEvent.bind(reader); let release;
   const gate = new Promise(resolve => { release = resolve; });
   reader.readEvent = async ref => { await gate; return readEvent(ref); };
+  const burstRefs = [];
   for (let n = 0; n < 40; n++) {
     const event = await store.record('prompt.received', { sessionID: `burst-${n}` }, { n });
+    burstRefs.push(event.ref);
     notify('rename', `${event.ref}.json`);
   }
   await new Promise(resolve => setTimeout(resolve, 20));
   assert.ok(reader.watchJobs.size <= 16); assert.ok(reader.missedWatchEvents > 0);
   release(); await reader.flush(); reader.readEvent = readEvent;
-  await reader.reconcile(); assert.equal(reader.seen.size, 40);
+  await reader.reconcile();
+  // Phase C: the watcher-miss coverage marker is an additional durable event;
+  // the invariant under test is that every overflowed original is recovered.
+  assert.ok(burstRefs.every(r => reader.seen.has(r)), 'all overflowed originals recovered');
+  assert.ok(reader.seen.size >= 40);
 });
 
 test('adversarial peer prose never enters automatic recall or current intent, but remains exact by ref', async t => {

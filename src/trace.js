@@ -220,9 +220,19 @@ export class Trace {
     this.ready = this.store.init();
     this.ready.catch(error => this.warning('startup', error));
   }
+  noteObserverDrop(where) {
+    // Phase C: observer drops become durable coverage evidence (best-effort;
+    // marker dedupe keeps this amortized cheap under overload).
+    try {
+      this.store.coverage.counters.dropped_total++;
+      this.store.coverage.noteGap({ reason: 'observer_drop', component: where });
+    } catch { /* coverage metadata must never break the observer guard */ }
+  }
+
   async safe(where, fn) {
     if (this.observerJobs.size >= this.maxObserverJobs) {
       this.droppedObservations++;
+      this.noteObserverDrop(where);
       this.warning(where, { code: 'OBSERVER_BUSY' });
       return undefined;
     }
@@ -236,7 +246,7 @@ export class Trace {
       return await Promise.race([job, new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error('observer_timeout')), 1000); timer.unref?.();
       })]);
-    } catch (error) { this.warning(where, error); return undefined; }
+    } catch (error) { this.noteObserverDrop(where); this.warning(where, error); return undefined; }
     finally { clearTimeout(timer); }
   }
   async hydrate(sid) {
@@ -792,6 +802,13 @@ export class Trace {
   }
   recallSnapshot(sid) {
     const view = this.projection(sid);
+    // Phase C: a compact structured warning only when coverage is incomplete
+    // (never flood the runtime context with historical gap details).
+    const captureCoverage = this.store.coverage.status();
+    if (captureCoverage.status !== 'complete') {
+      view.capture_coverage = { status: captureCoverage.status, known_gaps: captureCoverage.known_gaps,
+        meaning: 'capture has known discontinuities; absence of evidence is not established' };
+    }
     view.snapshot_at = Date.now();
     view.observer = { errors: this.errors, dropped_observations: this.droppedObservations,
       missed_watcher_notifications: this.store.missedWatchEvents, watcher: this.store.watcherState,
@@ -885,6 +902,8 @@ export class Trace {
       { stage: 'hook_applied', checkpoint, recallBytes: bytes(recall) }, { stage: 'hook_applied', checkpoint });
   }
   async find(input = {}, host = {}) {
+    // Opportunistic flush of pending coverage markers (no-op when none).
+    this.store.coverage.flushPending().catch(() => {});
     const f = {};
     f.type = input.type === undefined ? undefined : (Array.isArray(input.type)
       ? input.type.map(t => refOf(t, 64)).filter(Boolean).slice(0, 8)
@@ -1122,6 +1141,7 @@ export class Trace {
     }
     return { indexed_events: this.store.index.size, oldest_at: oldest, newest_at: newest, watcher: this.store.watcherState,
       catch_up: reconcile, pending_watcher_jobs: this.store.watchJobs.size, missed_watcher_notifications: this.store.missedWatchEvents,
+      capture: this.store.coverage.status(),
       note: 'Index is derived, memory-only and rebuilt from authoritative events at startup. It covers exactly the events this process has ingested; use queries to catch up.' };
   }
 

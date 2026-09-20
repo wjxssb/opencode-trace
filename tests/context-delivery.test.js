@@ -19,7 +19,7 @@ async function fixture(t, contextDelivery, contextDataModels = [qualifiedModel])
     agent: { transform: async fn => fn({ list: () => [] }) }, event: { async *subscribe() {} },
   });
   const store = await new Store(directory, storeRoot).init();
-  t.after(async () => { await cleanup(); store.close(); await fs.rm(directory, { recursive: true, force: true }); });
+  t.after(async () => { await cleanup(); await store.close(); await fs.rm(directory, { recursive: true, force: true, maxRetries: 8, retryDelay: 50 }); });
   let sequence = 0;
   const invoke = async (name, input, sessionID = 'worker') => {
     const result = await tools.get(name).execute(input, { sessionID, messageID: 'turn', id: `call_${++sequence}`, agent: 'build' });

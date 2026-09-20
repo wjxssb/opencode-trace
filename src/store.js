@@ -4,6 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { atomic, canonical, hash, stable, refPattern } from './util.js';
 import { SequenceAllocator } from './sequence.js';
+import { CoverageTracker } from './coverage.js';
 
 const keep = (items, item, limit) => [...items.filter(x => x.ref !== item.ref), item].sort((a, b) => a.at - b.at || a.ref.localeCompare(b.ref)).slice(-limit);
 
@@ -53,6 +54,8 @@ export class Store {
     // consumes a sequence number within this process.
     this.sequences = null;
     this.replayGuard = new Map();
+    // Phase C: measurable coverage state + durable gap markers.
+    this.coverage = new CoverageTracker(this);
   }
   async init() {
     this.workspace = await canonical(this.workspace);
@@ -71,7 +74,7 @@ export class Store {
       if (!/^evt_[a-f0-9]{64}\.json$/.test(filename ?? '')) return;
       const ref = filename.slice(0, -5);
       if (this.seen.has(ref) || this.watchRefs.has(ref)) return;
-      if (this.watchJobs.size >= this.maxWatchJobs) { this.missedWatchEvents++; return; }
+      if (this.watchJobs.size >= this.maxWatchJobs) { this.noteWatcherMiss(); return; }
       this.watchRefs.add(ref);
       const job = this.readEvent(ref).then(e => this.ingest(e)).catch(e => this.warning('watch', e));
       this.watchJobs.add(job); job.finally(() => { this.watchJobs.delete(job); this.watchRefs.delete(ref); });
@@ -91,13 +94,17 @@ export class Store {
       try { await this.ingest(event); }
       catch (error) { this.warning('recovery', error); }
     }
+    await this.coverage.rebuild(); // seed watermarks/markers; enables live gap detection
     await atomic(path.join(this.root, 'state', 'schema.json'), stable({ schema: 1, workspace: this.workspace, workspaceID: this.workspaceID }));
     return this;
   }
   close() {
     this.closed = true; this.watcher?.close();
+    // Drain in-flight coverage marker writes (bounded) so cleanup that
+    // follows close() never races an unfinished evidence write.
+    const settled = this.coverage?.flushPending(2).catch(() => {}) ?? Promise.resolve();
     const directory = this.reconcileDirectory; this.reconcileDirectory = null;
-    return directory?.close().catch(() => {});
+    return Promise.allSettled([settled, directory?.close().catch(() => {})]);
   }
   async flush() { await Promise.allSettled([...this.watchJobs]); }
   async ingest(event) {
@@ -313,6 +320,13 @@ export class Store {
       if (!this.seen.has(ref)) await this.ingest(await this.readEvent(ref));
     }
   }
+  /** Watcher overflow: count + durable coverage gap evidence (Phase C). */
+  noteWatcherMiss() {
+    this.missedWatchEvents++;
+    this.coverage.counters.missed_watcher_total++;
+    this.coverage.noteGap({ reason: 'watcher_gap', component: 'watcher' });
+  }
+
   session(id) {
     if (!this.sessions.has(id)) this.sessions.set(id, { sessionID: id, recent: [], notes: [], milestones: [], conflicts: [], intent_conflicts: [], pending: {}, compact: null, intent: null, lastActivity: 0 });
     const s = this.sessions.get(id);
@@ -509,6 +523,10 @@ export class Store {
         target.conflicts = keep(target.conflicts, { ...item, peers: event.peers, paths: event.paths, resources: event.resources }, 16);
       }
     }
+    // Phase C: sequence-continuity observation (durable gap markers are
+    // written best-effort by the coverage tracker; markers themselves are
+    // skipped inside ingestSeq).
+    this.coverage.ingestSeq(sid, event.session_seq, event.type);
   }
   async expand(ref, offset = 0, limit = 2048, metadataOnly = false) {
     if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 24000) throw new Error('Invalid expansion range');
