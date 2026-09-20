@@ -91,6 +91,26 @@ attempt mis-routed to the production service before isolation was
 understood (a handful of GLM requests, reported in the campaign report);
 every subsequent run was pinned to the local model.
 
+## Production-prep additions (a7fef31, round-2 reviewed)
+
+- **Registry lifecycle**: `HandleRegistry.release(sessionID)` drops active +
+  retired mappings; wired to `session.deleted` in `Trace.lifecycle`. A
+  conservative TTL sweep (6h default, ≤1 run/minute, age-based only) bounds
+  growth for sessions whose disposal signal was never delivered; a live turn
+  (seconds–minutes) can never be evicted. Regression: R1–R6.
+- **trace_status discovery**: canonical filter is now `util.refPattern`
+  (evt_ AND blob_); recent output blobs are registered and annotated too (S1).
+- **Resolution metadata**: when a call resolves ≥1 handle, the middleware
+  records an additive `trace.handle_resolution` event
+  `{tool, resolutions:[{handle, ref}], raw_call_key}` and the tool result gains
+  `handles_resolved`. Raw input echoes are untouched; handles are
+  correspondence only, never durable identity (M1/M2).
+- **raw_call_key join semantics**: recomputable deterministically as
+  `callKey({sessionID, id, tool, input})` over the RAW input (no messageID —
+  envelope-stable). It intentionally does NOT byte-match the `callKey` hint on
+  `tool.before/after` events (those include messageID). Join by recomputation,
+  pinned by test M1.
+
 ## Limitations (honest)
 
 - Handles are process-local: two concurrent sessions in *different* processes
