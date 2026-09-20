@@ -143,6 +143,28 @@ test('E14: runtime-context stays late with marker intact; budget receipt recorde
   assert.ok(snapshot.context_budget?.unit === 'tokens');
   assert.ok(snapshot.context_budget?.estimated > 0);
   assert.ok(snapshot.context_budget?.tokens_exact == null || snapshot.context_budget.tokens_exact > 0);
+  // §8.8 final-frame invariant: the receipt's estimate describes the FINAL
+  // model-visible frame (marker + JSON + active memory + handles + receipt +
+  // guidance + separators) and must fit the configured budget whenever the
+  // mandatory-frame floor (~1400 est tokens) leaves room to fit.
+  assert.ok(snapshot.context_budget.estimated <= 2000,
+    `final frame estimate ${snapshot.context_budget.estimated} exceeds configured budget 2000`);
+});
+
+test('E15: sub-floor budgets degrade honestly (documented §18 tolerance)', async t => {
+  const { trace } = await fixture(t, { runtimeContextTokenBudget: 300 });
+  await pressure(trace, 8);
+  const { snapshot } = trace.recallSnapshot('s1');
+  // Documented behavior: below the mandatory-frame floor (~1400 est tokens of
+  // marker/policy/guidance + coverage/observer skeleton + receipt) the
+  // pipeline prunes every prunable class, then reports estimated > budget
+  // honestly in the receipt. The byte ceiling remains the hard backstop and
+  // recall_truncated semantics are unchanged (a Trace-side display budget,
+  // never session/model/execution exhaustion).
+  assert.ok(snapshot.active_memory, 'critical floor preserved even below the frame floor');
+  assert.ok(snapshot.context_budget?.estimated > snapshot.context_budget?.budget,
+    'sub-floor budget reported honestly (estimated > budget)');
+  assert.equal(snapshot.recall_truncated, undefined, 'byte ceiling not hit; no truncation flag');
 });
 
 test('E0: default budget is evidence-based and configurable', async t => {
