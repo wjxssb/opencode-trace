@@ -1,0 +1,20 @@
+{
+  "source_checkout": "/home/frank/src/opencode-trace",
+  "source_head": "6cc648062d76933e4849d7bf3b3f494ff5762a2a",
+  "source_status": " M package.json\n M src/store.js\n M src/tools.js\n M src/trace.js\n M tests/critical-milestone.test.js\n",
+  "installed_directory": "/home/frank/.local/share/opencode-trace/versions/0.1.4-worker-audit-19a180cce557",
+  "files": {
+    "package.json": "5a73e297418ad1e332f7a52e8bffc655a17c027e7f63134c9b03c94609ef0236",
+    "server.js": "f1768f3184f7ae60d4c0febeb97cd61b7d0b942c0925862757d033b0daa0a4d8",
+    "src/compact.js": "aded452ac41b3adce868d68cee980007acd4c4745a065c4e3a614575dd4e6f09",
+    "src/context-delivery.js": "2935e9c6f63e51142cb7d511ad644efef0bc00d4c04a41769e9c65b2b22fe356",
+    "src/index.js": "c3298fef1e805866978c69a75582112b281c7c5c8ebc78ff863aebf491c63a8f",
+    "src/normalization.js": "a12c773a8fef0dd496fb6c7699f5e2970a70d321aab07f3524328313958147cf",
+    "src/note-validation.js": "f7fcb30e0ca99b67819c7ad8e74fd3407c5f6a7f1b938e63601e5fb99ba4498d",
+    "src/present.js": "45e48b5ed4e916519bceefe594c89bde870e7d97b07fa1b2560f2ba25680b163",
+    "src/store.js": "4e4f8188512609ccf09e89a1b62a5fc86535732b09416084a25b506b6cc1d24a",
+    "src/tools.js": "8f1ada869529c03127a7f4a6f42719d5ff12bffd21cc05d8e952e76606274c88",
+    "src/trace.js": "5ce163a9e9edfa2061f9686f2b1abeb46d378b27e75f4ca41b4066d4a986fca6",
+    "src/util.js": "335a7ebd86fb94f59cb18bc9eba88ed702b9d4fb130974055f2543beef96bfaf"
+  }
+}

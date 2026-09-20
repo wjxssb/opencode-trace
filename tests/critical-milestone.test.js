@@ -324,7 +324,7 @@ test('Scenario 10: Evidence semantics - worker self-claim without evidence stays
   assert.equal(verified.note.milestone.current_state, 'VERIFIED');
 });
 
-test('Scenario 11: Historical compatibility - real historical trace store loads cleanly without errors', async t => {
+test('Scenario 11: Historical compatibility - real historical trace store loads cleanly without errors', { skip: process.env.TRACE_TEST_LIVE_HISTORY !== '1' }, async t => {
   const realStorePath = '/home/frank/.local/share/opencode-trace';
   const trace = new Trace({ location: { directory: '/home/frank' } }, { storeRoot: realStorePath });
   await trace.ready;
