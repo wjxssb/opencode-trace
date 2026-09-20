@@ -143,12 +143,20 @@ test('E14: runtime-context stays late with marker intact; budget receipt recorde
   assert.ok(snapshot.context_budget?.unit === 'tokens');
   assert.ok(snapshot.context_budget?.estimated > 0);
   assert.ok(snapshot.context_budget?.tokens_exact == null || snapshot.context_budget.tokens_exact > 0);
-  // §8.8 final-frame invariant: the receipt's estimate describes the FINAL
-  // model-visible frame (marker + JSON + active memory + handles + receipt +
-  // guidance + separators) and must fit the configured budget whenever the
+  // §8.8 final-frame invariant, part 1: the receipt's estimate describes the
+  // FINAL model-visible frame and must fit the configured budget whenever the
   // mandatory-frame floor (~1400 est tokens) leaves room to fit.
   assert.ok(snapshot.context_budget.estimated <= 2000,
     `final frame estimate ${snapshot.context_budget.estimated} exceeds configured budget 2000`);
+  // Part 2 (regression detector): the receipt must describe the DELIVERED
+  // frame. An independent measurement of the returned recall text must agree
+  // with the recorded estimate. This fails if budgeting regresses to
+  // measuring an intermediate object and appending handles/receipt afterwards
+  // (the receipt would under-measure the delivered frame coherently with the
+  // bug, so the <= budget assertion alone cannot catch it).
+  const independent = new TokenCounter({}).estimate(recall);
+  assert.ok(Math.abs(independent - snapshot.context_budget.estimated) <= 4,
+    `receipt estimated ${snapshot.context_budget.estimated} but the delivered frame independently measures ${independent}`);
 });
 
 test('E15: sub-floor budgets degrade honestly (documented §18 tolerance)', async t => {
