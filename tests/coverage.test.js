@@ -129,10 +129,15 @@ test('3B: gap markers advance the watermark (marker seq never looks missing)', a
   // Ten ordinary events allocated through the allocator: seqs 1..10.
   for (let s = 1; s <= 10; s++) await store.record('probe.a', { sessionID: 'sM' }, { n: s });
   // A known loss at 7..8 recorded explicitly (simulating detected capture loss).
+  // noteGap itself persists the durable marker event, which consumes the next
+  // allocator slot (11). Flush first so the allocation is deterministic: an
+  // extra manual marker write here used to race the async noteGap write and
+  // shift every later expectation (test defect; product behavior is correct).
   store.coverage.noteGap({ session: 'sM', from_seq: 7, to_seq: 8, reason: 'capture_gap', component: 'sequence' });
-  // The durable marker event itself is allocated the next session_seq (11).
-  const marker = await store.record('trace.capture_gap', { sessionID: 'sM' }, { session: 'sM', reason: 'capture_gap', ranges: [{ from: 7, to: 8 }], status: 'detected' }, { session: 'sM' });
-  assert.equal(marker.session_seq, 11, 'marker occupies the next allocator slot');
+  await store.coverage.flushPending();
+  const markers = store.findEntriesAll({ type: 'trace.capture_gap', session: 'sM' });
+  assert.equal(markers.length, 1, 'noteGap wrote exactly one durable marker');
+  assert.equal(markers[0].seq, 11, 'marker occupies the next allocator slot');
   // Ordinary seq 12 afterwards must NOT be reported as missing 11.
   const after = await store.record('probe.a', { sessionID: 'sM' }, { afterMarker: true });
   assert.equal(after.session_seq, 12);
@@ -148,7 +153,11 @@ test('3B: gap markers advance the watermark (marker seq never looks missing)', a
 test('3C: coverage is session-scoped; unrelated stale sessions do not poison queries', async t => {
   const { trace, store } = await fixture(t);
   await store.record('probe.a', { sessionID: 'fresh' }, { i: 1 });
-  await craft(store, 'stale-legacy', { event_schema: 2, session_seq: 99 }); // old loss elsewhere
+  // A REAL detected loss in a legacy session: continuity baseline first, then
+  // a jump (2..98 missing). Coverage detects gaps at watermark transitions —
+  // a lone first event establishes the baseline and proves nothing by itself.
+  await store.record('probe.a', { sessionID: 'stale-legacy' }, { i: 1 });
+  await craft(store, 'stale-legacy', { event_schema: 2, session_seq: 99 });
   await store.coverage.flushPending();
   const found = await trace.find({ text: 'no-such-thing-913', session: 'fresh' });
   assert.equal(found.coverage.capture.session_coverage.status, 'complete', 'fresh session queries are complete');

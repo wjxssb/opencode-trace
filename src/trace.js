@@ -854,7 +854,6 @@ export class Trace {
       ? Number(this.options.runtimeContextTokenBudget) : DEFAULT_TOKEN_BUDGET;
     const dropped = [];
     const pruneSteps = [
-      ['evidence_handles', () => (view.evidence_handles?.length ? (view.evidence_handles.pop(), true) : false)],
       ['peers', () => (view.peers.length ? (view.peers.pop(), true) : false)],
       ['recent', () => (view.recent.length ? (view.recent.shift(), true) : false)],
       ['unresolved_old', () => (view.unresolved.length > 1 ? (view.unresolved.shift(), true) : false)],
@@ -875,12 +874,41 @@ export class Trace {
         return false;
       }],
     ];
+    // Phase E §8.1/§18: content is pruned FIRST; handles are a pure function
+    // of the surviving evidence and are assigned afterwards, so the mapping
+    // always describes exactly what the final frame shows (§15: handle rows
+    // are never pruned while their refs survive — dropping content shrinks
+    // them with it). The receipt is part of the frame it measures; its byte
+    // size stays constant while its value changes, so re-measuring converges.
+    // The main loop targets budget minus a reserve headroom for handles +
+    // receipt; the bounded corrective pass then measures the FULL final frame
+    // and prunes further if the reserve was insufficient (documented
+    // estimator tolerance: the reserve; the byte ceiling stays the hard
+    // backstop when no corrective step remains).
+    const HANDLE_RESERVE = 192;
+    const target = Math.max(0, tokenBudget - HANDLE_RESERVE);
+    const receipt = () => {
+      view.context_budget = { unit: 'tokens', budget: tokenBudget,
+        estimated: this.tokens.estimate(render()), mode: this.tokens.mode,
+        dropped: [...new Set(dropped)] };
+    };
     let guard = 0;
-    while (this.tokens.estimate(render()) > tokenBudget && guard++ < 400) {
+    while (this.tokens.estimate(render()) > target && guard++ < 400) {
       const step = pruneSteps.find(([, drop]) => drop());
       if (!step) break;
       dropped.push(step[0]);
     }
+    let assignments = assignSnapshotHandles(view);
+    receipt();
+    let corrective = 0;
+    while (this.tokens.estimate(render()) > tokenBudget && corrective++ < 24) {
+      const step = pruneSteps.find(([, drop]) => drop());
+      if (!step) break;
+      dropped.push(step[0]);
+      assignments = assignSnapshotHandles(view);
+      receipt();
+    }
+    receipt(); // the recorded estimate describes the true final frame
     // Byte ceiling hard safety net behind the token budget (estimator drift).
     if (bytes(render()) > ceiling) {
       let byteGuard = 0;
@@ -888,11 +916,14 @@ export class Trace {
         const step = pruneSteps.find(([, drop]) => drop());
         if (!step) break;
         dropped.push(step[0]);
+        assignments = assignSnapshotHandles(view);
+        receipt();
       }
       if (bytes(render()) > ceiling) {
         // CRITICAL floor: keep goal/state/handoff instead of empty truncation.
         // Same hard invariant as every degraded frame: a Trace-side display
-        // budget, never session/model/execution exhaustion.
+        // budget, never session/model/execution exhaustion. (The emergency
+        // floor frame carries the critical content itself, not the receipt.)
         const minimal = { sessionID: sid, active_memory: view.active_memory, current_intent: view.current_intent,
           capture_coverage: view.capture_coverage, recall_truncated: true, reason: 'trace_runtime_budget',
           implies_session_exhaustion: false, session_context: 'not_observable_via_trace',
@@ -906,12 +937,6 @@ export class Trace {
         return { text: `${prefix}${stable(snapshot)}${staticGuidance}`, snapshot, assignments: [] };
       }
     }
-    view.context_budget = { unit: 'tokens', budget: tokenBudget, estimated: this.tokens.estimate(render()),
-      mode: this.tokens.mode, dropped: [...new Set(dropped)] };
-    // Handles are assigned AFTER trimming so the mapping describes exactly
-    // what this snapshot shows the model. Assignment is a pure function of
-    // the final view; handle rows are the first content dropped on overflow.
-    const assignments = assignSnapshotHandles(view);
     const text = render();
     if (bytes(text) > ceiling) {
       // Hard semantic invariant: recall truncation means ONLY that the bounded
@@ -954,7 +979,10 @@ export class Trace {
     // 'prepared' alone never proves the model saw this text; index.js records
     // 'context.applied' only after the recall was actually appended to the
     // host hook object.
-    return { recall, snapshot, checkpoint: event.ref };
+    // assignments are returned so callers observe the exact generation this
+    // request installed (real lifecycle: recallSnapshot -> assignments ->
+    // newGeneration here; recallSnapshot itself never mutates the registry).
+    return { recall, snapshot, assignments, checkpoint: event.ref };
   }
   async markContextApplied(e, { recall, checkpoint }) {
     await this.store.record('context.applied', identity(e),

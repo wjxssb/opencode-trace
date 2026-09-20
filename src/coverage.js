@@ -191,16 +191,22 @@ export class CoverageTracker {
       }
       return { known_gaps, pending_writes: pending, partially_reconciled: partial, unresolved_seqs };
     };
-    const own = summarize([...this.markers.values()].filter(m => m.session === session));
-    const global = summarize([...this.markers.values()].filter(m => m.session == null));
-    const sessionStatus = own.known_gaps + own.pending_writes > 0 ? 'incomplete' : 'complete';
-    const workspaceStatus = own.known_gaps + own.pending_writes + global.known_gaps + global.pending_writes > 0 ? 'incomplete' : 'complete';
+    const own = [...this.markers.values()].filter(m => m.session === session);
+    // Workspace-global = every known loss NOT scoped to the queried session:
+    // other sessions' gaps plus session-null losses (watcher/observer). An
+    // unrelated session's gap never poisons THIS session's scoped status, but
+    // it must stay visible separately: absence for the queried session is
+    // only as trustworthy as the whole workspace's capture health.
+    const external = [...this.markers.values()].filter(m => m.session !== session);
+    const ownSum = summarize(own), extSum = summarize(external);
+    const ownBad = ownSum.known_gaps + ownSum.pending_writes > 0;
+    const extBad = extSum.known_gaps + extSum.pending_writes > 0;
     return {
-      session, session_coverage: { status: sessionStatus, ...own },
-      workspace_global: { status: global.known_gaps + global.pending_writes > 0 ? 'incomplete' : 'complete', ...global,
+      session, session_coverage: { status: ownBad ? 'incomplete' : 'complete', ...ownSum },
+      workspace_global: { status: extBad ? 'incomplete' : 'complete', ...extSum,
         dropped_total: this.counters.dropped_total, missed_watcher_total: this.counters.missed_watcher_total },
-      status: workspaceStatus,
-      meaning: 'session_coverage is scoped to the queried session; workspace_global covers cross-session losses. incomplete means absence is NOT established.',
+      status: ownBad || extBad ? 'incomplete' : 'complete',
+      meaning: 'session_coverage is scoped to the queried session; workspace_global covers every known loss not scoped to it (other sessions + observer losses). incomplete means absence is NOT established.',
     };
   }
 

@@ -66,10 +66,16 @@ test('E8: the newest correction/decision note survives; older notes drop first',
   await new Promise(r => setTimeout(r, 5));
   await trace.note({ kind: 'decision', text: 'NEWEST decision gamma' }, host());
   await new Promise(r => setTimeout(r, 5));
+  // pressure() records a decision AFTER gamma ("chose approach A..."), so it
+  // is the true newest decision note. Retention is oldest-first under
+  // pressure, so gamma is correctly dropped BEFORE it; the invariant under
+  // test is that the newest note survives and older ones do not.
   await pressure(trace, 26);
   const { snapshot } = trace.recallSnapshot('s1');
   const texts = (snapshot.notes ?? []).map(n => n.text ?? '').join('|');
-  assert.ok(texts.includes('NEWEST decision gamma'), 'newest note retained');
+  assert.ok(texts.includes('chose approach A over B for the parser'), 'newest note retained');
+  assert.ok(!texts.includes('OLD decision alpha'), 'older notes drop first');
+  assert.ok(!texts.includes('OLD decision beta'), 'older notes drop first');
 });
 
 test('E9: low-priority classes drop first (order recorded)', async t => {
