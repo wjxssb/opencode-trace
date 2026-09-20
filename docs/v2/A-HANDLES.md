@@ -64,6 +64,33 @@ H1 ✓ H2 ✓ H3 ✓ H4 ✓ H5 ✓ H6 ✓ H7 ✓ H8 ✓ H9 ✓ H10 ✓ H11 ✓
 A1 determinism ✓ A2 find-discovery ✓ A3 milestone evidence_handles + strong-state
 downgrade unaffected ✓ A4 status discovery ✓
 
+## Real local model qualification (tests/local-qual-model.mjs, 2026-09-20)
+
+Resident model `qwen38-27b-dense` (vLLM 127.0.0.1:18080) drove a live agentic
+drill against the real candidate code (real store, real per-request context
+hook, real tool middleware): ran `echo qual-evidence-7f31`, expanded the
+resulting event via the SHORT HANDLE `e1` (never copying hex), saved a
+trace_note whose durable payload kept canonical-only refs, and received a
+clear structured rejection for unknown handle `e99`. All PASS.
+`expands=["e1","e99"] noteSourceRefs=["evt_b2277e38…6ff78"]`.
+
+Host-integration evidence: a production-service probe with the real local
+model (`--model local-qwen-auto/27b-dense`) exercised `trace_expand e99`
+through the real host tool path (native tool execution round-trip works).
+Full host-side activation of the candidate build was blocked by an
+environment limitation of the current server build: plugin sets are bound at
+service start from the global config, and standalone servers spawned with an
+isolated HOME do not register custom local `providers` in any config shape
+tested (4 combinations; `/api/model` empty), so a fully isolated second
+service with the candidate plugin could not be booted. The drill therefore
+drives the real host-equivalent context hook in-process. This limitation is
+environmental (server build), not a defect of the candidate.
+
+GLM/CodePlan usage: intentional non-local inference = 0. One qualification
+attempt mis-routed to the production service before isolation was
+understood (a handful of GLM requests, reported in the campaign report);
+every subsequent run was pinned to the local model.
+
 ## Limitations (honest)
 
 - Handles are process-local: two concurrent sessions in *different* processes
