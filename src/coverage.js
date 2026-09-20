@@ -106,6 +106,7 @@ export class CoverageTracker {
         session, reason: entry.reason, component: entry.component,
         status: reconciledAll ? 'reconciled' : 'partially_reconciled',
         reconciles_seq: seq, recovered_range: before, remaining: entry.ranges.map(r => ({ ...r })),
+        marker_key: k,
         reconciles_marker: entry.marker_ref ?? null, observed_at: Date.now(),
         semantics: 'reconciliation shrinks the remaining ranges; the original detected marker is preserved (forensic chronology)',
       }, { session }).then(event => { entry.last_followup_ref = event.ref; return event; }).catch(() => {});
@@ -154,11 +155,19 @@ export class CoverageTracker {
       } catch { /* unreadable marker: store integrity paths report it */ }
     }
     for (const { data } of followups) {
-      for (const m of this.markers.values()) {
-        if (m.session !== data.session || m.reason !== data.reason) continue;
-        if ((data.remaining ?? []).length) m.ranges = data.remaining.map(r => ({ ...r }));
-        m.status = m.ranges.length ? 'partially_reconciled' : 'reconciled';
+      // F3 (review advisory): a follow-up must shrink EXACTLY the marker it
+      // reconciles. Match by reconciles_marker (marker event ref) first, then
+      // by the recorded marker_key; unmatched/ambiguous follow-ups are
+      // skipped so sibling markers with the same session+reason can never be
+      // corrupted on restart. Persisted status is never rewritten here.
+      let target = null;
+      if (data.reconciles_marker) {
+        target = [...this.markers.values()].find(m => m.marker_ref === data.reconciles_marker) ?? null;
       }
+      if (!target && data.marker_key) target = this.markers.get(data.marker_key) ?? null;
+      if (!target) continue;
+      if ((data.remaining ?? []).length) target.ranges = data.remaining.map(r => ({ ...r }));
+      target.status = target.ranges.length ? 'partially_reconciled' : 'reconciled';
     }
     this.seeding = false;
   }

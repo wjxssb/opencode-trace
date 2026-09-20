@@ -239,6 +239,30 @@ test('C7: restart rebuilds coverage state from durable markers (ranges preserved
   } finally { store2.close(); }
 });
 
+test('C7b: a follow-up shrinks exactly its own marker after restart; siblings untouched (F3)', async t => {
+  const { store, dir } = await fixture(t);
+  // Two sibling gaps in the SAME session with the SAME reason.
+  await store.record('probe.a', { sessionID: 's1' }, { i: 1 });
+  await craft(store, 's1', { event_schema: 2, session_seq: 5 }); // gap 2..4
+  await craft(store, 's1', { event_schema: 2, session_seq: 9 }); // gap 6..8
+  await store.coverage.flushPending();
+  // Reconcile one sequence of the FIRST gap only (splits it to 3..4).
+  await craft(store, 's1', { event_schema: 2, session_seq: 2 });
+  await store.coverage.flushPending();
+  assert.equal(store.coverage.statusFor('s1').session_coverage.unresolved_seqs, 5, '3,4,6,7,8 before restart');
+  store.close();
+  const store2 = await new Store(path.join(dir), path.join(dir, 'store')).init();
+  try {
+    const scoped = store2.coverage.statusFor('s1');
+    // The follow-up must shrink ONLY the marker it reconciles: 3..4 from the
+    // first marker plus the untouched sibling 6..8. A session+reason broadcast
+    // would have corrupted the sibling with the first marker's remaining set.
+    assert.equal(scoped.session_coverage.unresolved_seqs, 5, 'sibling markers keep their own ranges after restart');
+    assert.equal(scoped.session_coverage.known_gaps, 2, 'both sibling markers remain');
+    assert.equal(scoped.session_coverage.status, 'incomplete');
+  } finally { store2.close(); }
+});
+
 test('C12: V2-A handles unaffected by coverage machinery', async t => {
   const { trace } = await fixture(t);
   await trace.after({ sessionID: 's1', messageID: 'm1', id: 'c1', agent: 'build', tool: 'shell', input: { command: 'c12' }, status: 'completed', result: { output: 'ok c12' } });
