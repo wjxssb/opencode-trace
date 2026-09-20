@@ -128,12 +128,13 @@ export function claimFromReceipt({ subject, scope, receipt, supersedes = [] }) {
     scope: String(scope ?? 'mechanical_check'),
     evidence: { kind: 'check_receipt', receipt: r },
     meaning: passed
-      ? `host-measured only: receipt ${r.checkID} reports kind=${r.kind} command_exit_code=0 under candidate `
-        + `${r.candidate.commit.slice(0, 12)} (output sha256 ${r.output.sha256.slice(0, 12)}). Narrow mechanical `
-        + 'execution evidence for scope "' + r.kind + '" — never implementation correctness.'
-      : `receipt ${r.checkID} contradicts the claimed success: command_exit_code=${r.commandExitCode}`
-        + `${r.timedOut ? ', timed out' : ''}${r.signal !== 'none' ? `, signal=${r.signal}` : ''}. `
-        + 'The prose claim and the mechanical evidence disagree; the contradiction stays visible.',
+      ? `structurally complete CheckReceipt bound: ${r.checkID} reports kind=${r.kind} command_exit_code=0 under `
+        + `candidate ${r.candidate.commit.slice(0, 12)} (output sha256 ${r.output.sha256.slice(0, 12)}). Receipt `
+        + 'authenticity is NOT established by this record — audit the checkID against reviewer records. Narrow '
+        + 'mechanical execution evidence for scope "' + r.kind + '" — never implementation correctness.'
+      : `CheckReceipt ${r.checkID} contradicts the claimed success: command_exit_code=${r.commandExitCode}`
+        + `${r.timedOut ? ', timed out' : ''}${r.signal !== 'none' ? `, signal=${r.signal}` : ''}. Receipt authenticity `
+        + 'is NOT established by this record. The prose claim and the receipt disagree; the contradiction stays visible.',
     supersedes: (Array.isArray(supersedes) ? supersedes : []).filter(r2 => typeof r2 === 'string' && refPattern.test(r2)),
     review_effect: 'none',
     semantics,

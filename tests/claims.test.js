@@ -51,7 +51,8 @@ test('F2: a valid CheckReceipt binds a NARROW VERIFIED_MECHANICAL (never impleme
   assert.equal(claim.status, 'VERIFIED_MECHANICAL');
   assert.equal(claim.evidence.kind, 'check_receipt');
   assert.equal(claim.evidence.receipt.commandExitCode, 0);
-  assert.match(claim.meaning, /host-measured only/);
+  assert.match(claim.meaning, /structurally complete CheckReceipt bound/);
+  assert.match(claim.meaning, /authenticity is NOT established by this record/);
   assert.match(claim.meaning, /never implementation correctness/);
   // The durable event carries the receipt verbatim for audit.
   const rows = trace.store.findEntriesAll({ type: 'trace.claim' });
@@ -82,6 +83,34 @@ test('F4: forged stdout / fake receipt JSON cannot verify', async t => {
   assert.throws(() => validateReceipt({ checkID: 'nope', kind: 'test', status: 'passed', commandExitCode: 0, timedOut: false, signal: 'none', candidate: { commit: COMMIT_A }, output: { sha256: 'd'.repeat(64) } }), TypeError);
   assert.throws(() => claimFromReceipt({ subject: 'x', receipt: null }), TypeError);
   assert.throws(() => claimFromReceipt({ subject: 'x', receipt: { ...validReceipt(), candidate: { commit: 'short' } } }), TypeError);
+  // A WELL-FORMED fabricated receipt does bind VERIFIED_MECHANICAL (the
+  // binding path cannot authenticate receipts) — the durable meaning must
+  // therefore never assert host provenance and must carry the authenticity
+  // caveat auditable via checkID (reviewer-prescribed honesty contract).
+  const forged = await trace.recordClaim({
+    subject: 'tests passed', scope: 'test_command_completed',
+    receipt: { ...validReceipt(), checkID: `chk_${'e'.repeat(32)}` },
+  }, host());
+  assert.equal(forged.claim.status, 'VERIFIED_MECHANICAL');
+  assert.match(forged.claim.meaning, /authenticity is NOT established by this record/);
+  assert.match(forged.claim.meaning, /audit the checkID against reviewer records/);
+  assert.doesNotMatch(forged.claim.meaning, /host-measured/);
+  const rows = trace.store.findEntriesAll({ type: 'trace.claim' });
+  const forgedPayload = JSON.parse(await trace.store.readBlob(rows.find(r => r.ref === forged.ref).payloadRef));
+  assert.match(forgedPayload.meaning, /authenticity is NOT established by this record/, 'caveat survives in the durable payload');
+  assert.equal(forgedPayload.bound_by, 'build', 'binding agent recorded for audit');
+});
+
+test('F7b: a receipt citing a mismatched CAS blob is rejected at binding time', async t => {
+  const { trace } = await fixture(t);
+  const stored = await trace.store.blob('real output', 'utf8');
+  const receipt = { ...validReceipt(), output: { sha256: 'f'.repeat(64), ref: stored.ref } };
+  await assert.rejects(
+    () => trace.recordClaim({ subject: 'tests passed', receipt }, host()),
+    /does not match stored blob/,
+    'sha256/content mismatch rejects the binding',
+  );
+  assert.equal(trace.store.findEntriesAll({ type: 'trace.claim' }).length, 0, 'nothing persisted for a rejected binding');
 });
 
 test('F5: a candidate-A receipt stays historical for A and cannot justify candidate B', async t => {
@@ -161,7 +190,7 @@ test('F11: the read surface distinguishes model assertions from mechanical facts
   const mech = await trace.recordClaim({ subject: 'tests passed', receipt: validReceipt() }, host());
   assert.notEqual(prose.claim.status, mech.claim.status);
   assert.match(prose.claim.meaning, /declaration/);
-  assert.match(mech.claim.meaning, /host-measured only/);
+  assert.match(mech.claim.meaning, /structurally complete CheckReceipt bound/);
   // Tool path exposes the same distinction with the required receipt fields.
   const tool = definitions(trace).find(d => d.name === 'trace_claim');
   const out = await tool.execute({ subject: 'search works', text: 'search works, I saw hits' }, host());

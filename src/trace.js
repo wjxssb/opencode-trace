@@ -565,6 +565,18 @@ export class Trace {
     const claim = input.receipt != null
       ? claimFromReceipt({ subject: input.subject, scope: input.scope, receipt: input.receipt, supersedes })
       : claimFromProse({ subject: input.subject, text: input.text, refs: input.refs, supersedes });
+    // Content-level cross-check (F7 hardening): when the receipt cites the
+    // canonical CAS blob holding the raw command output, verify the stored
+    // bytes actually hash to receipt.output.sha256. A receipt citing a blob
+    // it does not match is rejected outright; omitting output.ref remains
+    // possible (authenticity is auditable, never established, by this path).
+    if (input.receipt?.output?.ref != null) {
+      const data = await this.store.readBlob(input.receipt.output.ref);
+      const digest = hash(data);
+      if (digest !== input.receipt.output.sha256) {
+        throw new Error(`trace_claim: receipt.output.sha256 ${String(input.receipt.output.sha256).slice(0, 12)}… does not match stored blob ${String(input.receipt.output.ref).slice(0, 12)}… (actual sha256 ${digest.slice(0, 12)}…) — binding rejected`);
+      }
+    }
     // Orthogonal dimension (F8): capture coverage at claim time, recorded
     // independently — a VERIFIED_MECHANICAL command does not imply complete
     // capture coverage, and vice versa.
@@ -575,6 +587,7 @@ export class Trace {
       evidence: claim.evidence,
       meaning: claim.meaning,
       supersedes,
+      bound_by: typeof host?.agent === 'string' ? host.agent : null, // audit: who bound this receipt
       capture_coverage: this.store.coverage.statusFor(host?.sessionID ?? null),
       review_effect: 'none',
       semantics: claim.semantics,
