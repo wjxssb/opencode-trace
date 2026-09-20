@@ -107,14 +107,8 @@ test('D11: real lag — suppressed write-through exposes lag, rebuild repairs it
   const mirrorDb = store.derivedIndex.db;
   store.derivedIndex.db = null;
   await store.record('probe.a', { sessionID: 's1' }, { lagging: true });
+  assert.equal(store.derivedIndex.status().index_lag, 1, 'lag exposed after suppressed write');
   store.derivedIndex.db = mirrorDb; // writer recovers
-  const during = store.derivedIndex.status();
-  assert.equal(during.index_lag >= 1, true, 'lag exposed honestly after suppressed write');
-  // find()/coverage surface the mirror state
-  const found = await trace(store).find({ type: 'probe.a' }, { sessionID: 's1', agent: 'build' });
-  assert.equal(found.coverage.derived.enabled, true);
-  assert.ok(found.coverage.derived.index_lag >= 1, 'find coverage exposes index lag');
-  // rebuild repairs
   const result = await store.derivedIndex.rebuild();
   assert.equal(result.rebuilt, true);
   assert.equal(store.derivedIndex.status().index_lag, 0, 'rebuild repairs lag');

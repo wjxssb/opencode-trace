@@ -61,8 +61,11 @@ test('E6+E7: blockers and review debt/goal survive heavy pressure', async t => {
 test('E8: the newest correction/decision note survives; older notes drop first', async t => {
   const { trace } = await fixture(t, { runtimeContextTokenBudget: 1100 });
   await trace.note({ kind: 'decision', text: 'OLD decision alpha' }, host());
+  await new Promise(r => setTimeout(r, 5));
   await trace.note({ kind: 'decision', text: 'OLD decision beta' }, host());
+  await new Promise(r => setTimeout(r, 5));
   await trace.note({ kind: 'decision', text: 'NEWEST decision gamma' }, host());
+  await new Promise(r => setTimeout(r, 5));
   await pressure(trace, 26);
   const { snapshot } = trace.recallSnapshot('s1');
   const texts = (snapshot.notes ?? []).map(n => n.text ?? '').join('|');
@@ -117,7 +120,7 @@ test('E12: estimate tracks the real local tokenizer within 2.5x', async t => {
 test('E13: handles shown after pruning still resolve to canonical refs', async t => {
   const { trace } = await fixture(t, { runtimeContextTokenBudget: 1200 });
   await pressure(trace, 20);
-  const { snapshot, assignments } = trace.recallSnapshot('s1');
+  const { snapshot, assignments } = await trace.context({ sessionID: 's1', messages: [], agent: 'build', model: { providerID: 'local-qwen-auto', id: '27b-dense' } });
   assert.ok((assignments ?? []).length > 0, 'assignment produced for surviving rows');
   for (const a of assignments ?? []) {
     const resolved = trace.handles.resolve('s1', a.handle);

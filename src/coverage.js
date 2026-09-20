@@ -55,8 +55,11 @@ export class CoverageTracker {
     const write = this.store.record('trace.capture_gap', { sessionID: entry.session },
       this.#markerPayload(entry, k, extra),
       { session: entry.session ?? undefined }).then(event => {
+        // A completed write IS detection (range-less watcher losses stay
+        // 'detected' with unknown extent; only explicit reconciliation paths
+        // may flip them to 'reconciled').
         entry.marker_ref = event.ref;
-        if (entry.status === 'pending_write') entry.status = entry.ranges.length ? 'detected' : 'reconciled';
+        if (entry.status === 'pending_write') entry.status = 'detected';
       }).catch(() => {
         entry.status = 'pending_write';
         if (!this.retryQueue.includes(entry)) this.retryQueue.push(entry);
