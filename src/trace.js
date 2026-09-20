@@ -765,7 +765,7 @@ export class Trace {
         meaning: 'Bounded observer projection, not the entire task context. Follow trace_find cursors and correction refs for full ingested note history; absence here does not mean resolved.' },
       coordination: 'Snapshot may be stale; intents are declarations, and paths for arbitrary shell are unknown. Advisories never block execution.' };
   }
-  recall(sid) {
+  recallSnapshot(sid) {
     const view = this.projection(sid);
     view.snapshot_at = Date.now();
     view.observer = { errors: this.errors, dropped_observations: this.droppedObservations,
@@ -812,8 +812,16 @@ export class Trace {
       else { view.workspace = '(see trace_status)'; break; }
     }
     const text = render();
-    if (bytes(text) > ceiling) return `${prefix}${stable({ sessionID: sid, recall_truncated: true, retrieve: 'trace_status' })}${staticGuidance}`;
-    return text;
+    if (bytes(text) > ceiling) {
+      const snapshot = { sessionID: sid, recall_truncated: true, retrieve: 'trace_status' };
+      return { text: `${prefix}${stable(snapshot)}${staticGuidance}`, snapshot };
+    }
+    // The request projection and durable receipt describe one bounded snapshot.
+    // JSON round-trip drops undefined properties, matching the legacy rendering.
+    return { text, snapshot: JSON.parse(stable(view)) };
+  }
+  recall(sid) {
+    return this.recallSnapshot(sid).text;
   }
   async context(e) {
     if (selectedModel(e.model)) this.contextBindings.set(e.sessionID, { model: selectedModel(e.model), agent: e.agent, source: 'host_context_hook' });
@@ -821,7 +829,7 @@ export class Trace {
     await this.hydrate(e.sessionID);
     await this.observeMessages(e.sessionID, e.messages);
     const s = this.store.session(e.sessionID); if (e.agent !== undefined) s.agent = e.agent;
-    const recall = this.recall(e.sessionID);
+    const { text: recall, snapshot } = this.recallSnapshot(e.sessionID);
     const ids = (e.messages ?? []).map(messageID).filter(Boolean);
     // The exact messages are durable message.persisted events above. Avoid
     // copying the cumulative ID prefix on every turn (quadratic storage).
@@ -832,7 +840,7 @@ export class Trace {
     // 'prepared' alone never proves the model saw this text; index.js records
     // 'context.applied' only after the recall was actually appended to the
     // host hook object.
-    return { recall, checkpoint: event.ref };
+    return { recall, snapshot, checkpoint: event.ref };
   }
   async markContextApplied(e, { recall, checkpoint }) {
     await this.store.record('context.applied', identity(e),

@@ -8,3 +8,8 @@ export function usesRequestData(event, { contextDelivery, contextDataModels } = 
     && Array.isArray(contextDataModels) && contextDataModels.some(ref =>
       ref?.providerID === model.providerID && ref?.id === model.id && ref?.variant === model.variant);
 }
+
+export function usesRuntimeContext(event, { contextDelivery } = {}) {
+  return contextDelivery === 'runtime-context-v1' && event.runtimeContext?.version === 1
+    && Array.isArray(event.runtimeContext.entries);
+}
