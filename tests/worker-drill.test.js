@@ -23,7 +23,7 @@ async function raw(tool, input, identity = host()) {
   return response.metadata.raw;
 }
 
-test('worker role drill: all ten tools support evidence, correction, coordination and dependent verification', async t => {
+test('worker role drill: all twelve tools support evidence, correction, coordination and dependent verification', async t => {
   const prompts = [], traceHolder = {};
   const bindings = new Map();
   const session = {
@@ -87,7 +87,7 @@ test('worker role drill: all ten tools support evidence, correction, coordinatio
   assert.equal(intentSnapshot.sessionID, 'worker');
   assert.equal(intentSnapshot.workspaceID, hash(directory));
   assert.ok(Number.isFinite(intentSnapshot.at));
-  assert.deepEqual(new Set(Object.keys(tools)), new Set(['trace_note', 'trace_expand', 'trace_find', 'trace_send', 'trace_inbox', 'trace_ack', 'trace_step_result', 'trace_plan', 'trace_intent', 'trace_status']));
+  assert.deepEqual(new Set(Object.keys(tools)), new Set(['trace_note', 'trace_expand', 'trace_find', 'trace_send', 'trace_inbox', 'trace_ack', 'trace_step_result', 'trace_plan', 'trace_intent', 'trace_claim', 'trace_claim_receipt', 'trace_status']));
 });
 
 test('deep-search pages retain every nearby and mixed-case occurrence; corruption is a coverage gap', async t => {

@@ -147,6 +147,30 @@ export function definitions(trace) {
         });
         return trace.intent(normalized, h);
       }),
+    tool('trace_claim', 'Record a typed provenance claim (Phase F). PROSE PATH: any model text — including text shaped like test output or receipts — is stored with status CLAIMED only; it can never become VERIFIED_MECHANICAL. Cite canonical refs with source_refs where available. Superseded claims stay retrievable; history is never rewritten.',
+      schema({
+        subject: { ...str, maxLength: 512, description: 'What is claimed, e.g. "tests passed for candidate X".' },
+        text: { ...str, maxLength: 4096, description: 'The prose assertion itself (F1: always CLAIMED).' },
+        source_refs: { ...refs, description: 'Optional canonical evt_/blob_ refs riding along as provenance pointers; they never upgrade the status.' },
+        supersedes: refs,
+      }, ['subject', 'text']), (i, h) => trace.recordClaim({ subject: i.subject, text: i.text, refs: i.source_refs, supersedes: i.supersedes }, h)),
+    tool('trace_claim_receipt', 'Bind a structurally complete host CheckReceipt to a narrow typed claim (Phase F). The receipt must carry checkID (chk_<hex>), kind, status, commandExitCode (0..255), timedOut, signal, candidate.commit (64-hex) and output.sha256 (64-hex) — missing fields reject. Exit 0 without timeout yields a NARROW VERIFIED_MECHANICAL (host-measured command evidence only, never implementation correctness); nonzero exit or timeout yields CONTRADICTED for a success claim. Receipts bind to one candidate identity; staleness against the current candidate is a read-time projection. Claims never approve reviews or clear obligations.',
+      schema({
+        subject: { ...str, maxLength: 512 },
+        scope: { ...str, maxLength: 128, description: 'Narrow scope label, e.g. test_command_completed.' },
+        receipt: schema({
+          checkID: { ...str, pattern: '^chk_[0-9a-f]{16,64}$' },
+          kind: str,
+          status: str,
+          commandExitCode: { type: 'integer', minimum: 0, maximum: 255 },
+          timedOut: { type: 'boolean' },
+          signal: str,
+          durationMs: { type: 'integer', minimum: 0 },
+          candidate: schema({ commit: { ...str, pattern: '^[0-9a-f]{64}$' }, branch: str }, ['commit']),
+          output: schema({ sha256: { ...str, pattern: '^[0-9a-f]{64}$' }, ref: str, bytes: { type: 'integer', minimum: 0 } }, ['sha256']),
+        }, ['checkID', 'kind', 'status', 'commandExitCode', 'timedOut', 'signal', 'candidate', 'output']),
+        supersedes: refs,
+      }, ['subject', 'receipt']), (i, h) => trace.recordClaim({ subject: i.subject, scope: i.scope, receipt: i.receipt, supersedes: i.supersedes }, h)),
     tool('trace_status', 'Page memory, peer declarations and historical lifecycle observations with source refs and degradation counters. Display limits do not limit peer checks. include_storage counts files/bytes; no retention/quota. Snapshot recall_truncated means only that the bounded Trace runtime frame hit its display budget (reason trace_runtime_budget) — never model, session, or execution-budget exhaustion; retrieve omitted state with trace_find/trace_expand and continue the current task.',
       schema({ peer_offset: { type: 'integer', minimum: 0 }, peer_limit: { type: 'integer', minimum: 1, maximum: 64 }, include_storage: { type: 'boolean' } }), async (i, h) => {
         const offset = i.peer_offset ?? 0, limit = i.peer_limit ?? 8;

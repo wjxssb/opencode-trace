@@ -195,7 +195,7 @@ test('plugin store failure never throws native hooks, removes tools, or binds pe
   for (const fn of Object.values(hooks)) await assert.doesNotReject(() => fn(event));
   assert.deepEqual(Object.keys(native), ['shell', 'edit', 'subagent']);
   assert.deepEqual(Object.keys(hooks).sort(), ['context', 'execute.after', 'execute.before', 'prompt']);
-  assert.equal(added.length, 10);
+  assert.equal(added.length, 12);
   const report = await added[0].execute({ kind: 'fact', text: 'x', source_refs: [] }, host());
   assert.equal(report.metadata.raw.ok, false);
   assert.match(report.title, /trace_note failed/);

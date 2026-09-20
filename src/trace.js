@@ -7,6 +7,7 @@ import { compactGuidance, compactions, saveCompact } from './compact.js';
 import { normalizeTraceIntentInput } from './normalization.js';
 import { validateNoteInput, isAffirmativeState, hasExplicitFailure } from './note-validation.js';
 import { HandleRegistry, assignSnapshotHandles, renderEvidenceHandles, HANDLE_PATTERN, handleFailureMessage } from './handles.js';
+import { claimFromProse, claimFromReceipt, claimStaleness } from './claims.js';
 import { TokenCounter, DEFAULT_TOKEN_BUDGET } from './tokens.js';
 
 const NOTE_KINDS = ['fact', 'finding', 'decision', 'unresolved', 'handoff', 'correction'];
@@ -541,6 +542,53 @@ export class Trace {
     };
     const event = await this.store.record('trace.note', identity(host), note, { callID: host.id, note });
     return { ref: event.ref, note };
+  }
+  /**
+   * Phase F: record a typed provenance claim (durable `trace.claim` event).
+   * Two paths, with a hard trust boundary between them:
+   * - prose (no receipt): ALWAYS CLAIMED — any model text, including
+   *   receipt-shaped JSON, is a declaration, never verification (F1/F4).
+   * - structured CheckReceipt binding: narrow VERIFIED_MECHANICAL (exit 0,
+   *   no timeout) or CONTRADICTED (nonzero exit / timeout vs a success
+   *   claim) (F2/F3). The receipt snapshot (checkID, candidate binding,
+   *   output hashes) is persisted verbatim for audit; staleness against the
+   *   current candidate is a read-time projection (F5).
+   * Claims never approve reviews or clear obligations (F9/F10), and the
+   * capture-coverage snapshot rides along as an independent dimension (F8).
+   */
+  async recordClaim(input, host) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('trace_claim: input must be an object');
+    if (typeof input.subject !== 'string' || !input.subject.trim()) throw new Error('trace_claim: subject is required');
+    if (bytes(input.subject) > 512) throw new Error('trace_claim: subject exceeds 512 UTF-8 bytes');
+    const supersedes = (Array.isArray(input.supersedes) ? input.supersedes : [])
+      .filter(r => typeof r === 'string' && refPattern.test(r));
+    const claim = input.receipt != null
+      ? claimFromReceipt({ subject: input.subject, scope: input.scope, receipt: input.receipt, supersedes })
+      : claimFromProse({ subject: input.subject, text: input.text, refs: input.refs, supersedes });
+    // Orthogonal dimension (F8): capture coverage at claim time, recorded
+    // independently — a VERIFIED_MECHANICAL command does not imply complete
+    // capture coverage, and vice versa.
+    const payload = {
+      claim_status: claim.status,
+      subject: claim.subject,
+      scope: claim.scope ?? null,
+      evidence: claim.evidence,
+      meaning: claim.meaning,
+      supersedes,
+      capture_coverage: this.store.coverage.statusFor(host?.sessionID ?? null),
+      review_effect: 'none',
+      semantics: claim.semantics,
+    };
+    if (bytes(JSON.stringify(payload)) > 16000) throw new Error('trace_claim: normalized claim exceeds 16000 UTF-8 bytes');
+    const event = await this.store.record('trace.claim', identity(host), payload, { callID: host.id, claim_status: claim.status });
+    // `claim` is the pure builder projection (status/meaning/evidence); the
+    // durable event payload (claim_status + capture_coverage snapshot) is the
+    // CAS record. Both describe the same claim.
+    return { ref: event.ref, claim, payload };
+  }
+  /** Read-time staleness projection for a persisted claim (F5). */
+  claimStaleness(claimPayload, currentCandidate) {
+    return claimStaleness(claimPayload, currentCandidate);
   }
   recordIntentFailure(sessionID, error, input) {
     if (!sessionID) return;

@@ -593,6 +593,152 @@
       }
     },
     {
+      "name": "trace_claim",
+      "description": "Record a typed provenance claim (Phase F). PROSE PATH: any model text — including text shaped like test output or receipts — is stored with status CLAIMED only; it can never become VERIFIED_MECHANICAL. Cite canonical refs with source_refs where available. Superseded claims stay retrievable; history is never rewritten.",
+      "input": {
+        "type": "object",
+        "properties": {
+          "subject": {
+            "type": "string",
+            "maxLength": 512,
+            "description": "What is claimed, e.g. \"tests passed for candidate X\"."
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 4096,
+            "description": "The prose assertion itself (F1: always CLAIMED)."
+          },
+          "source_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "description": "Optional canonical evt_/blob_ refs riding along as provenance pointers; they never upgrade the status."
+          },
+          "supersedes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16
+          }
+        },
+        "required": [
+          "subject",
+          "text"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "trace_claim_receipt",
+      "description": "Bind a structurally complete host CheckReceipt to a narrow typed claim (Phase F). The receipt must carry checkID (chk_<hex>), kind, status, commandExitCode (0..255), timedOut, signal, candidate.commit (64-hex) and output.sha256 (64-hex) — missing fields reject. Exit 0 without timeout yields a NARROW VERIFIED_MECHANICAL (host-measured command evidence only, never implementation correctness); nonzero exit or timeout yields CONTRADICTED for a success claim. Receipts bind to one candidate identity; staleness against the current candidate is a read-time projection. Claims never approve reviews or clear obligations.",
+      "input": {
+        "type": "object",
+        "properties": {
+          "subject": {
+            "type": "string",
+            "maxLength": 512
+          },
+          "scope": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Narrow scope label, e.g. test_command_completed."
+          },
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "checkID": {
+                "type": "string",
+                "pattern": "^chk_[0-9a-f]{16,64}$"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "commandExitCode": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 255
+              },
+              "timedOut": {
+                "type": "boolean"
+              },
+              "signal": {
+                "type": "string"
+              },
+              "durationMs": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "candidate": {
+                "type": "object",
+                "properties": {
+                  "commit": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "branch": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "commit"
+                ],
+                "additionalProperties": false
+              },
+              "output": {
+                "type": "object",
+                "properties": {
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "ref": {
+                    "type": "string"
+                  },
+                  "bytes": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "required": [
+                  "sha256"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "checkID",
+              "kind",
+              "status",
+              "commandExitCode",
+              "timedOut",
+              "signal",
+              "candidate",
+              "output"
+            ],
+            "additionalProperties": false
+          },
+          "supersedes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16
+          }
+        },
+        "required": [
+          "subject",
+          "receipt"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
       "name": "trace_status",
       "description": "Page memory, peer declarations and historical lifecycle observations with source refs and degradation counters. Display limits do not limit peer checks. include_storage counts files/bytes; no retention/quota. Snapshot recall_truncated means only that the bounded Trace runtime frame hit its display budget (reason trace_runtime_budget) — never model, session, or execution-budget exhaustion; retrieve omitted state with trace_find/trace_expand and continue the current task.",
       "input": {
