@@ -39,12 +39,12 @@ export function definitions(trace) {
     }
   });
   return [
-    tool('trace_note', 'Save a concise durable decision, constraint, failure cause, blocker/next action, finding, handoff or structured milestone; skip routine logs. Cite evidence and label uncertainty; empty source_refs provides no corroboration. After verified correction/resolution, supersede your old note. Host supplies identity. Supply kind and text (summary is a compatibility alias), or milestone.kind and milestone.summary.',
+    tool('trace_note', 'Save a concise durable decision, constraint, failure cause, blocker/next action, finding, handoff or structured milestone; skip routine logs. Cite evidence and label uncertainty; empty source_refs provides no corroboration. After verified correction/resolution, supersede your old note. Host supplies identity. Top-level kind is exactly one of the six note kinds (fact, finding, decision, unresolved, handoff, correction): do not invent other kinds; a state change is kind "finding", or milestone.kind "state_change", which maps to finding. Supply kind and text (summary is a compatibility alias), or milestone.kind and milestone.summary. source_refs, supersedes and depends_on are optional: copy full canonical refs (evt_<64hex> or blob_<64hex>) verbatim from observed Trace output; never shorten, reconstruct or invent refs; omit the field when the exact ref is unavailable.',
       schema({
-        kind: { enum: ['fact', 'finding', 'decision', 'unresolved', 'handoff', 'correction'] },
+        kind: { enum: ['fact', 'finding', 'decision', 'unresolved', 'handoff', 'correction'], description: 'Top-level note kind; exactly these six values. Do not invent other kinds; a state change is expressed as "finding" (milestone.kind "state_change" maps to finding).' },
         text: { ...str, maxLength: 4096, description: 'Note body, at most 4096 UTF-8 bytes.' },
         summary: { ...str, maxLength: 4096, description: 'Compatibility alias for text. Prefer text; if both are supplied they must match.' },
-        source_refs: refs,
+        source_refs: { ...refs, description: 'Optional provenance refs. Full canonical refs (evt_<64hex> or blob_<64hex>) copied verbatim from observed Trace output. Never shorten, reconstruct or invent; omit when the exact ref is unavailable.' },
         supersedes: { ...refs, description: 'Your prior note refs, verified corrected/resolved. Hides from active recall, preserves history; never close still-open issues.' },
         depends_on: refs,
         milestone: schema({

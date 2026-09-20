@@ -377,10 +377,31 @@ export class Trace {
         if (error?.code === 'ENOENT') throw new Error(`Unknown ${field}[${i}] ${shown}: not found in this workspace; use trace_find then trace_expand for a valid ref`);
         const detail = String(error?.message ?? error?.code ?? 'invalid ref');
         const core = detail.replace(/^Invalid (source|event|blob) ref \S+:?\s*/, '');
-        throw new Error(`Invalid ${field}[${i}] ${shown}: ${core}`);
+        throw new Error(`Invalid ${field}[${i}] ${shown}: ${core}${await this.closestRefHint(ref)}`);
       }
     }
     return [...new Set(refs)];
+  }
+  // Deterministic, display-only hint for a malformed ref: if exactly one stored
+  // event ref shares a >=16 hex char prefix with the malformed value, point at
+  // the full canonical ref so the model can copy it verbatim. The malformed
+  // ref is still rejected; validation never loosens and the hint never accepts.
+  async closestRefHint(ref) {
+    const prefix = ref.startsWith('blob_') ? 'blob_' : ref.startsWith('evt_') ? 'evt_' : '';
+    if (!prefix) return '';
+    let names;
+    try { names = await fs.readdir(path.join(this.store.root, 'events')); } catch { return ''; }
+    let best = null;
+    for (const name of names) {
+      if (!name.endsWith('.json')) continue;
+      const stored = name.slice(0, -5);
+      let shared = 0;
+      while (shared < ref.length && shared < stored.length && ref[shared] === stored[shared]) shared++;
+      if (shared - prefix.length < 16) continue;
+      if (best === null) best = { ref: stored, shared };
+      else if (best.shared === shared || best.ref !== stored) return '';
+    }
+    return best ? ` Closest stored ref: ${best.ref} (copy it verbatim or omit this field; shortened or invented refs are rejected).` : '';
   }
   async isVerifiedEvidence(ref) {
     if (!ref || typeof ref !== 'string') return false;
