@@ -1,852 +1,892 @@
 {
- "traceCommit": "6d16534",
- "reviewerCommit": "55804520f324d8fb9fb6121e1acbe7ef2d4cbfbf",
- "traceTools": [
-  {
-   "name": "trace_note",
-   "description": "Save a concise durable decision, constraint, failure cause, blocker/next action, finding, handoff or structured milestone; skip routine logs. Cite evidence and label uncertainty; empty source_refs provides no corroboration. After verified correction/resolution, supersede your old note. Host supplies identity. Top-level kind is exactly one of the six note kinds (fact, finding, decision, unresolved, handoff, correction): do not invent other kinds; a state change is kind \"finding\", or milestone.kind \"state_change\", which maps to finding. Supply kind and text (summary is a compatibility alias), or milestone.kind and milestone.summary. source_refs, supersedes and depends_on are optional: copy full canonical refs (evt_<64hex> or blob_<64hex>) verbatim from observed Trace output; never shorten, reconstruct or invent refs; omit the field when the exact ref is unavailable.",
-   "input": {
-    "type": "object",
-    "properties": {
-     "kind": {
-      "enum": [
-       "fact",
-       "finding",
-       "decision",
-       "unresolved",
-       "handoff",
-       "correction"
-      ],
-      "description": "Top-level note kind; exactly these six values. Do not invent other kinds; a state change is expressed as \"finding\" (milestone.kind \"state_change\" maps to finding)."
-     },
-     "text": {
-      "type": "string",
-      "maxLength": 4096,
-      "description": "Note body, at most 4096 UTF-8 bytes."
-     },
-     "summary": {
-      "type": "string",
-      "maxLength": 4096,
-      "description": "Compatibility alias for text. Prefer text; if both are supplied they must match."
-     },
-     "source_refs": {
-      "type": "array",
-      "items": {
-       "type": "string"
-      },
-      "maxItems": 16,
-      "description": "Optional provenance refs. Full canonical refs (evt_<64hex> or blob_<64hex>) copied verbatim from observed Trace output. Never shorten, reconstruct or invent; omit when the exact ref is unavailable."
-     },
-     "supersedes": {
-      "type": "array",
-      "items": {
-       "type": "string"
-      },
-      "maxItems": 16,
-      "description": "Your prior note refs, verified corrected/resolved. Hides from active recall, preserves history; never close still-open issues."
-     },
-     "depends_on": {
-      "type": "array",
-      "items": {
-       "type": "string"
-      },
-      "maxItems": 16
-     },
-     "milestone": {
+  "traceCommit": "06aaf66",
+  "reviewerCommit": "55804520f324d8fb9fb6121e1acbe7ef2d4cbfbf",
+  "traceTools": [
+    {
+      "name": "trace_note",
+      "description": "Save a concise durable decision, constraint, failure cause, blocker/next action, finding, handoff or structured milestone; skip routine logs. Cite evidence and label uncertainty; empty source_refs provides no corroboration. After verified correction/resolution, supersede your old note. Host supplies identity. Top-level kind is exactly one of the six note kinds (fact, finding, decision, unresolved, handoff, correction): do not invent other kinds; a state change is kind \"finding\", or milestone.kind \"state_change\", which maps to finding. Supply kind and text (summary is a compatibility alias), or milestone.kind and milestone.summary. source_refs, supersedes and depends_on are optional: copy full canonical refs (evt_<64hex> or blob_<64hex>) verbatim from observed Trace output; never shorten, reconstruct or invent refs; omit the field when the exact ref is unavailable. This turn's short evidence handles (e1/b1/n1 from the Evidence list) are also accepted via source_handles/evidence_handles or inline in ref fields; handles are turn-scoped labels resolved before storage, and durable notes always keep full canonical refs.",
+      "input": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "enum": [
+              "fact",
+              "finding",
+              "decision",
+              "unresolved",
+              "handoff",
+              "correction"
+            ],
+            "description": "Top-level note kind; exactly these six values. Do not invent other kinds; a state change is expressed as \"finding\" (milestone.kind \"state_change\" maps to finding)."
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 4096,
+            "description": "Note body, at most 4096 UTF-8 bytes."
+          },
+          "summary": {
+            "type": "string",
+            "maxLength": 4096,
+            "description": "Compatibility alias for text. Prefer text; if both are supplied they must match."
+          },
+          "source_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "description": "Optional provenance refs. Full canonical refs (evt_<64hex> or blob_<64hex>) copied verbatim from observed Trace output, or this turn's short evidence handles (e1/b1/n1). Never shorten, reconstruct or invent; omit when the exact ref is unavailable."
+          },
+          "source_handles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "description": "Turn-scoped evidence handles (e1/b1/n1) from the current Evidence list; resolved to canonical refs before storage."
+          },
+          "supersedes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "description": "Your prior note refs, verified corrected/resolved. Hides from active recall, preserves history; never close still-open issues. Canonical refs or evidence handles."
+          },
+          "depends_on": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16
+          },
+          "milestone": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "decision",
+                  "state_change",
+                  "verification",
+                  "blocker",
+                  "correction",
+                  "handoff",
+                  "baseline"
+                ]
+              },
+              "summary": {
+                "type": "string",
+                "maxLength": 2048
+              },
+              "what_changed": {
+                "type": "string",
+                "maxLength": 2048
+              },
+              "why_it_matters": {
+                "type": "string",
+                "maxLength": 2048
+              },
+              "current_state": {
+                "type": "string",
+                "maxLength": 1024
+              },
+              "decision": {
+                "type": "string",
+                "maxLength": 2048
+              },
+              "evidence_refs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 16
+              },
+              "evidence_handles": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 16,
+                "description": "Turn-scoped evidence handles (e1/b1/n1); resolved to canonical evidence_refs before storage."
+              },
+              "unresolved": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 16
+              },
+              "next_action": {
+                "type": "string",
+                "maxLength": 2048
+              },
+              "do_not_repeat": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "maxItems": 16
+              },
+              "supersedes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 16
+              },
+              "depends_on": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 16
+              },
+              "to_session": {
+                "type": "string",
+                "maxLength": 256,
+                "description": "Explicit target session ID for handoff."
+              },
+              "to_worker": {
+                "type": "string",
+                "maxLength": 256,
+                "description": "Explicit target worker role or agent name."
+              },
+              "task_ref": {
+                "type": "string",
+                "maxLength": 256,
+                "description": "Shared task ID or plan ID for handoff binding."
+              },
+              "handoff_id": {
+                "type": "string",
+                "maxLength": 256,
+                "description": "Shared handoff token or transfer ID."
+              },
+              "continuation_of": {
+                "type": "string",
+                "maxLength": 256,
+                "description": "Session ID or note ref this session continues."
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "trace_expand",
+      "description": "Read exact stored evidence, not current files. ref accepts a canonical evt_/blob_ ref or this turn's short evidence handle (e1/b1/n1). metadata_only inspects refs; text_blobs hold tool text, payload_ref the event JSON. Default 2048 bytes, max 24000. Follow next_offset until null; repeated pages add nothing. SHA-256 verifies the whole blob; base64 preserves split byte boundaries.",
+      "input": {
+        "type": "object",
+        "properties": {
+          "ref": {
+            "type": "string"
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 24000
+          },
+          "metadata_only": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ref"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "trace_find",
+      "description": "Search all ingested history; return snippets/refs for trace_expand. text searches capped hints; deep scans exact bytes with a budget and resumable cursor. Results carry short discovery handles usable this turn. External operations may be absent; no match does not prove absence.",
+      "input": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 8
+              }
+            ]
+          },
+          "session": {
+            "type": "string",
+            "description": "Host sessionID whose captured event history to search, including another worker session."
+          },
+          "agent": {
+            "type": "string"
+          },
+          "tool": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "call_key": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "string"
+          },
+          "related": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "thread": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recipient": {
+            "type": "string"
+          },
+          "reply_to": {
+            "type": "string"
+          },
+          "proposal": {
+            "type": "string"
+          },
+          "plan": {
+            "type": "string"
+          },
+          "step": {
+            "type": "string"
+          },
+          "worker": {
+            "type": "string",
+            "description": "Plan-bound worker session filter for trace_plan step records only. Use session for general tool/message history."
+          },
+          "attempt_id": {
+            "type": "string"
+          },
+          "deep": {
+            "type": "boolean"
+          },
+          "deep_budget_bytes": {
+            "type": "integer",
+            "minimum": 1024,
+            "maximum": 16777216
+          },
+          "after": {
+            "type": "number",
+            "minimum": 0
+          },
+          "before": {
+            "type": "number",
+            "minimum": 0
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "cursor": {
+            "type": "string"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "trace_send",
+      "description": "Persist then deliver to observed workspace sessions through the host prompt queue/steer boundary. Host supplies sender. Receipts distinguish persisted, host_admitted, failed and uncertain. accept/reject/counter require an explicit proposal or counter message id.",
+      "input": {
+        "type": "object",
+        "properties": {
+          "to": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "maxItems": 8
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 16384
+          },
+          "type": {
+            "enum": [
+              "question",
+              "proposal",
+              "objection",
+              "counter",
+              "evidence",
+              "accept",
+              "reject",
+              "withdraw",
+              "handoff",
+              "note"
+            ]
+          },
+          "thread_id": {
+            "type": "string"
+          },
+          "in_reply_to": {
+            "type": "string"
+          },
+          "proposal": {
+            "type": "string"
+          },
+          "delivery": {
+            "enum": [
+              "steer",
+              "queue"
+            ]
+          },
+          "source_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16
+          },
+          "source_handles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "description": "Turn-scoped evidence handles; resolved to canonical source_refs before storage."
+          }
+        },
+        "required": [
+          "to",
+          "text"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "trace_inbox",
+      "description": "Page sent/received messages; keep thread filter with next_cursor (max 96/page). Evidence: persisted, host_admitted, context_observed (native peer metadata only), recipient_ack, reply_recorded. Receipt is not agreement. sweep retries only missing delivery records; uncertain admissions require manual choice.",
+      "input": {
+        "type": "object",
+        "properties": {
+          "thread_id": {
+            "type": "string"
+          },
+          "sweep": {
+            "type": "boolean"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 96
+          },
+          "cursor": {
+            "type": "string"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "trace_ack",
+      "description": "Acknowledge receipt of one trace message; never agreement or completion.",
+      "input": {
+        "type": "object",
+        "properties": {
+          "message_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message_id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "trace_step_result",
+      "description": "Report your bound plan step outcome. Host supplies identity/plan/step. Denied or failed operations mean failure; dependents require worker-reported success. A settled turn alone is outcome unknown.",
+      "input": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "enum": [
+              "success",
+              "failure"
+            ]
+          },
+          "summary": {
+            "type": "string",
+            "maxLength": 2048
+          },
+          "source_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16
+          },
+          "source_handles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "description": "Turn-scoped evidence handles; resolved to canonical source_refs before storage."
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "trace_plan",
+      "description": "Run up to 8 dependency-ordered steps in fresh native sessions; independent steps fan out. Inherit effective model/variant/agent; explicit step.agent must exist and honors its model. Read back bindings before prompting; unavailable/mismatched bindings fail closed. Dependents require trace_step_result success, not merely a settled turn. Reuse terminal steps; retry_failed retries terminal non-success only. Concurrent/unterminated attempts return in_flight_unknown and are never duplicated. Plan identity is caller-scoped; acceptance does not complete the parent task.",
+      "input": {
+        "type": "object",
+        "properties": {
+          "steps": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 8,
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9_-]{1,32}$"
+                },
+                "text": {
+                  "type": "string",
+                  "maxLength": 4096
+                },
+                "depends_on": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 8
+                },
+                "agent": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "text"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "retry_failed": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "steps"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "trace_intent",
+      "description": "Declare your current intent and explicit paths/resources. Overlap produces advisory information only. Update to done/cancelled when finished.",
+      "input": {
+        "type": "object",
+        "properties": {
+          "summary": {
+            "type": "string"
+          },
+          "paths": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 64
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "resources": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 32
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "enum": [
+              "active",
+              "waiting",
+              "done",
+              "cancelled"
+            ]
+          },
+          "related_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16
+          },
+          "related_handles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "description": "Turn-scoped evidence handles; resolved to canonical related_refs before validation."
+          },
+          "attempt": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "recovered": {
+            "type": "boolean"
+          },
+          "previous_error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "trace_status",
+      "description": "Page memory, peer declarations and historical lifecycle observations with source refs and degradation counters. Display limits do not limit peer checks. include_storage counts files/bytes; no retention/quota.",
+      "input": {
+        "type": "object",
+        "properties": {
+          "peer_offset": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "peer_limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 64
+          },
+          "include_storage": {
+            "type": "boolean"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "reviewer": {
+    "reviewInputSchema": {
       "type": "object",
       "properties": {
-       "kind": {
-        "enum": [
-         "decision",
-         "state_change",
-         "verification",
-         "blocker",
-         "correction",
-         "handoff",
-         "baseline"
-        ]
-       },
-       "summary": {
-        "type": "string",
-        "maxLength": 2048
-       },
-       "what_changed": {
-        "type": "string",
-        "maxLength": 2048
-       },
-       "why_it_matters": {
-        "type": "string",
-        "maxLength": 2048
-       },
-       "current_state": {
-        "type": "string",
-        "maxLength": 1024
-       },
-       "decision": {
-        "type": "string",
-        "maxLength": 2048
-       },
-       "evidence_refs": {
-        "type": "array",
-        "items": {
-         "type": "string"
+        "focus": {
+          "type": "string",
+          "maxLength": 4000,
+          "description": "Optional review focus or specific questions/invariants to audit"
         },
-        "maxItems": 16
-       },
-       "unresolved": {
-        "type": "array",
-        "items": {
-         "type": "string"
+        "handoff": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 16000
+            },
+            {
+              "type": "object"
+            }
+          ],
+          "description": "Your concise handoff for the reviewer: current goal, changes made, tests run, uncertainties"
         },
-        "maxItems": 16
-       },
-       "next_action": {
-        "type": "string",
-        "maxLength": 2048
-       },
-       "do_not_repeat": {
-        "type": "array",
-        "items": {
-         "type": "string",
-         "maxLength": 256
+        "why": {
+          "type": "string",
+          "maxLength": 2000,
+          "description": "Why review is requested at this specific checkpoint (optional, can also be supplied in handoff)"
         },
-        "maxItems": 16
-       },
-       "supersedes": {
-        "type": "array",
-        "items": {
-         "type": "string"
+        "questions": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "maxLength": 1000
+                  },
+                  {
+                    "type": "object"
+                  }
+                ]
+              },
+              "maxItems": 16
+            },
+            {
+              "type": "string",
+              "maxLength": 4000
+            }
+          ],
+          "description": "Questions or open trade-offs you want the reviewer's judgment on (optional)"
         },
-        "maxItems": 16
-       },
-       "depends_on": {
-        "type": "array",
-        "items": {
-         "type": "string"
+        "claims": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "maxLength": 1000
+                  },
+                  {
+                    "type": "object"
+                  }
+                ]
+              },
+              "maxItems": 16
+            },
+            {
+              "type": "string",
+              "maxLength": 4000
+            }
+          ],
+          "description": "Verify-me list of facts you believe hold that the reviewer should verify (optional)"
         },
-        "maxItems": 16
-       },
-       "to_session": {
-        "type": "string",
-        "maxLength": 256,
-        "description": "Explicit target session ID for handoff."
-       },
-       "to_worker": {
-        "type": "string",
-        "maxLength": 256,
-        "description": "Explicit target worker role or agent name."
-       },
-       "task_ref": {
-        "type": "string",
-        "maxLength": 256,
-        "description": "Shared task ID or plan ID for handoff binding."
-       },
-       "handoff_id": {
-        "type": "string",
-        "maxLength": 256,
-        "description": "Shared handoff token or transfer ID."
-       },
-       "continuation_of": {
-        "type": "string",
-        "maxLength": 256,
-        "description": "Session ID or note ref this session continues."
-       }
-      },
-      "required": [
-       "kind"
-      ],
-      "additionalProperties": false
-     }
-    },
-    "required": [],
-    "additionalProperties": false
-   }
-  },
-  {
-   "name": "trace_expand",
-   "description": "Read exact stored evidence, not current files. metadata_only inspects refs; text_blobs hold tool text, payload_ref the event JSON. Default 2048 bytes, max 24000. Follow next_offset until null; repeated pages add nothing. SHA-256 verifies the whole blob; base64 preserves split byte boundaries.",
-   "input": {
-    "type": "object",
-    "properties": {
-     "ref": {
-      "type": "string"
-     },
-     "offset": {
-      "type": "integer",
-      "minimum": 0
-     },
-     "limit": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 24000
-     },
-     "metadata_only": {
-      "type": "boolean"
-     }
-    },
-    "required": [
-     "ref"
-    ],
-    "additionalProperties": false
-   }
-  },
-  {
-   "name": "trace_find",
-   "description": "Search all ingested history; return snippets/refs for trace_expand. text searches capped hints; deep scans exact bytes with a budget and resumable cursor. External operations may be absent; no match does not prove absence.",
-   "input": {
-    "type": "object",
-    "properties": {
-     "type": {
-      "anyOf": [
-       {
-        "type": "string"
-       },
-       {
-        "type": "array",
-        "items": {
-         "type": "string"
+        "questions0": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object"
+            }
+          ]
         },
-        "maxItems": 8
-       }
-      ]
-     },
-     "session": {
-      "type": "string",
-      "description": "Host sessionID whose captured event history to search, including another worker session."
-     },
-     "agent": {
-      "type": "string"
-     },
-     "tool": {
-      "type": "string"
-     },
-     "status": {
-      "type": "string"
-     },
-     "call_key": {
-      "type": "string"
-     },
-     "ref": {
-      "type": "string"
-     },
-     "related": {
-      "type": "string"
-     },
-     "path": {
-      "type": "string"
-     },
-     "text": {
-      "type": "string"
-     },
-     "thread": {
-      "type": "string"
-     },
-     "message": {
-      "type": "string"
-     },
-     "recipient": {
-      "type": "string"
-     },
-     "reply_to": {
-      "type": "string"
-     },
-     "proposal": {
-      "type": "string"
-     },
-     "plan": {
-      "type": "string"
-     },
-     "step": {
-      "type": "string"
-     },
-     "worker": {
-      "type": "string",
-      "description": "Plan-bound worker session filter for trace_plan step records only. Use session for general tool/message history."
-     },
-     "attempt_id": {
-      "type": "string"
-     },
-     "deep": {
-      "type": "boolean"
-     },
-     "deep_budget_bytes": {
-      "type": "integer",
-      "minimum": 1024,
-      "maximum": 16777216
-     },
-     "after": {
-      "type": "number",
-      "minimum": 0
-     },
-     "before": {
-      "type": "number",
-      "minimum": 0
-     },
-     "limit": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 100
-     },
-     "cursor": {
-      "type": "string"
-     }
-    },
-    "required": [],
-    "additionalProperties": false
-   }
-  },
-  {
-   "name": "trace_send",
-   "description": "Persist then deliver to observed workspace sessions through the host prompt queue/steer boundary. Host supplies sender. Receipts distinguish persisted, host_admitted, failed and uncertain. accept/reject/counter require an explicit proposal or counter message id.",
-   "input": {
-    "type": "object",
-    "properties": {
-     "to": {
-      "type": "array",
-      "items": {
-       "type": "string"
-      },
-      "minItems": 1,
-      "maxItems": 8
-     },
-     "text": {
-      "type": "string",
-      "maxLength": 16384
-     },
-     "type": {
-      "enum": [
-       "question",
-       "proposal",
-       "objection",
-       "counter",
-       "evidence",
-       "accept",
-       "reject",
-       "withdraw",
-       "handoff",
-       "note"
-      ]
-     },
-     "thread_id": {
-      "type": "string"
-     },
-     "in_reply_to": {
-      "type": "string"
-     },
-     "proposal": {
-      "type": "string"
-     },
-     "delivery": {
-      "enum": [
-       "steer",
-       "queue"
-      ]
-     },
-     "source_refs": {
-      "type": "array",
-      "items": {
-       "type": "string"
-      },
-      "maxItems": 16
-     }
-    },
-    "required": [
-     "to",
-     "text"
-    ],
-    "additionalProperties": false
-   }
-  },
-  {
-   "name": "trace_inbox",
-   "description": "Page sent/received messages; keep thread filter with next_cursor (max 96/page). Evidence: persisted, host_admitted, context_observed (native peer metadata only), recipient_ack, reply_recorded. Receipt is not agreement. sweep retries only missing delivery records; uncertain admissions require manual choice.",
-   "input": {
-    "type": "object",
-    "properties": {
-     "thread_id": {
-      "type": "string"
-     },
-     "sweep": {
-      "type": "boolean"
-     },
-     "limit": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 96
-     },
-     "cursor": {
-      "type": "string"
-     }
-    },
-    "required": [],
-    "additionalProperties": false
-   }
-  },
-  {
-   "name": "trace_ack",
-   "description": "Acknowledge receipt of one trace message; never agreement or completion.",
-   "input": {
-    "type": "object",
-    "properties": {
-     "message_id": {
-      "type": "string"
-     }
-    },
-    "required": [
-     "message_id"
-    ],
-    "additionalProperties": false
-   }
-  },
-  {
-   "name": "trace_step_result",
-   "description": "Report your bound plan step outcome. Host supplies identity/plan/step. Denied or failed operations mean failure; dependents require worker-reported success. A settled turn alone is outcome unknown.",
-   "input": {
-    "type": "object",
-    "properties": {
-     "status": {
-      "enum": [
-       "success",
-       "failure"
-      ]
-     },
-     "summary": {
-      "type": "string",
-      "maxLength": 2048
-     },
-     "source_refs": {
-      "type": "array",
-      "items": {
-       "type": "string"
-      },
-      "maxItems": 16
-     }
-    },
-    "required": [
-     "status"
-    ],
-    "additionalProperties": false
-   }
-  },
-  {
-   "name": "trace_plan",
-   "description": "Run up to 8 dependency-ordered steps in fresh native sessions; independent steps fan out. Inherit effective model/variant/agent; explicit step.agent must exist and honors its model. Read back bindings before prompting; unavailable/mismatched bindings fail closed. Dependents require trace_step_result success, not merely a settled turn. Reuse terminal steps; retry_failed retries terminal non-success only. Concurrent/unterminated attempts return in_flight_unknown and are never duplicated. Plan identity is caller-scoped; acceptance does not complete the parent task.",
-   "input": {
-    "type": "object",
-    "properties": {
-     "steps": {
-      "type": "array",
-      "minItems": 1,
-      "maxItems": 8,
-      "items": {
-       "type": "object",
-       "properties": {
-        "id": {
-         "type": "string",
-         "pattern": "^[a-z0-9_-]{1,32}$"
+        "questions1": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object"
+            }
+          ]
         },
-        "text": {
-         "type": "string",
-         "maxLength": 4096
+        "questions2": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object"
+            }
+          ]
         },
-        "depends_on": {
-         "type": "array",
-         "items": {
+        "questions3": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object"
+            }
+          ]
+        },
+        "questions4": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object"
+            }
+          ]
+        },
+        "questions5": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object"
+            }
+          ]
+        },
+        "questions6": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object"
+            }
+          ]
+        },
+        "questions7": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object"
+            }
+          ]
+        },
+        "claims0": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object"
+            }
+          ]
+        },
+        "claims1": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object"
+            }
+          ]
+        },
+        "claims2": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object"
+            }
+          ]
+        },
+        "claims3": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object"
+            }
+          ]
+        },
+        "claims4": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object"
+            }
+          ]
+        },
+        "claims5": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object"
+            }
+          ]
+        },
+        "claims6": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object"
+            }
+          ]
+        },
+        "claims7": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object"
+            }
+          ]
+        },
+        "task": {
           "type": "string"
-         },
-         "maxItems": 8
         },
-        "agent": {
-         "type": "string"
+        "changes": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array"
+            }
+          ]
+        },
+        "verification": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array"
+            }
+          ]
+        },
+        "manual": {
+          "type": "boolean",
+          "description": "Ignored for initiator identity; manual review comes from trusted host context or a user review command."
+        },
+        "agentInitiated": {
+          "type": "boolean"
+        },
+        "directory": {
+          "type": "string",
+          "description": "Ignored for security (identity comes from host context)"
         }
-       },
-       "required": [
-        "id",
-        "text"
-       ],
-       "additionalProperties": false
-      }
-     },
-     "retry_failed": {
-      "type": "boolean"
-     }
-    },
-    "required": [
-     "steps"
-    ],
-    "additionalProperties": false
-   }
-  },
-  {
-   "name": "trace_intent",
-   "description": "Declare your current intent and explicit paths/resources. Overlap produces advisory information only. Update to done/cancelled when finished.",
-   "input": {
-    "type": "object",
-    "properties": {
-     "summary": {
-      "type": "string"
-     },
-     "paths": {
-      "anyOf": [
-       {
-        "type": "array",
-        "items": {
-         "type": "string"
-        },
-        "maxItems": 64
-       },
-       {
-        "type": "string"
-       },
-       {
-        "type": "null"
-       }
-      ]
-     },
-     "resources": {
-      "anyOf": [
-       {
-        "type": "array",
-        "items": {
-         "type": "string"
-        },
-        "maxItems": 32
-       },
-       {
-        "type": "string"
-       },
-       {
-        "type": "null"
-       }
-      ]
-     },
-     "status": {
-      "enum": [
-       "active",
-       "waiting",
-       "done",
-       "cancelled"
-      ]
-     },
-     "related_refs": {
-      "type": "array",
-      "items": {
-       "type": "string"
       },
-      "maxItems": 16
-     },
-     "attempt": {
-      "type": "integer",
-      "minimum": 1
-     },
-     "recovered": {
-      "type": "boolean"
-     },
-     "previous_error": {
-      "type": "string"
-     }
+      "additionalProperties": false
     },
-    "required": [
-     "status"
-    ],
-    "additionalProperties": false
-   }
-  },
-  {
-   "name": "trace_status",
-   "description": "Page memory, peer declarations and historical lifecycle observations with source refs and degradation counters. Display limits do not limit peer checks. include_storage counts files/bytes; no retention/quota.",
-   "input": {
-    "type": "object",
-    "properties": {
-     "peer_offset": {
-      "type": "integer",
-      "minimum": 0
-     },
-     "peer_limit": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 64
-     },
-     "include_storage": {
-      "type": "boolean"
-     }
-    },
-    "required": [],
-    "additionalProperties": false
-   }
+    "REVIEW_TOOL_NAME": "review"
   }
- ],
- "reviewer": {
-  "reviewInputSchema": {
-   "type": "object",
-   "properties": {
-    "focus": {
-     "type": "string",
-     "maxLength": 4000,
-     "description": "Optional review focus or specific questions/invariants to audit"
-    },
-    "handoff": {
-     "anyOf": [
-      {
-       "type": "string",
-       "maxLength": 16000
-      },
-      {
-       "type": "object"
-      }
-     ],
-     "description": "Your concise handoff for the reviewer: current goal, changes made, tests run, uncertainties"
-    },
-    "why": {
-     "type": "string",
-     "maxLength": 2000,
-     "description": "Why review is requested at this specific checkpoint (optional, can also be supplied in handoff)"
-    },
-    "questions": {
-     "anyOf": [
-      {
-       "type": "array",
-       "items": {
-        "anyOf": [
-         {
-          "type": "string",
-          "maxLength": 1000
-         },
-         {
-          "type": "object"
-         }
-        ]
-       },
-       "maxItems": 16
-      },
-      {
-       "type": "string",
-       "maxLength": 4000
-      }
-     ],
-     "description": "Questions or open trade-offs you want the reviewer's judgment on (optional)"
-    },
-    "claims": {
-     "anyOf": [
-      {
-       "type": "array",
-       "items": {
-        "anyOf": [
-         {
-          "type": "string",
-          "maxLength": 1000
-         },
-         {
-          "type": "object"
-         }
-        ]
-       },
-       "maxItems": 16
-      },
-      {
-       "type": "string",
-       "maxLength": 4000
-      }
-     ],
-     "description": "Verify-me list of facts you believe hold that the reviewer should verify (optional)"
-    },
-    "questions0": {
-     "anyOf": [
-      {
-       "type": "string"
-      },
-      {
-       "type": "object"
-      }
-     ]
-    },
-    "questions1": {
-     "anyOf": [
-      {
-       "type": "string"
-      },
-      {
-       "type": "object"
-      }
-     ]
-    },
-    "questions2": {
-     "anyOf": [
-      {
-       "type": "string"
-      },
-      {
-       "type": "object"
-      }
-     ]
-    },
-    "questions3": {
-     "anyOf": [
-      {
-       "type": "string"
-      },
-      {
-       "type": "object"
-      }
-     ]
-    },
-    "questions4": {
-     "anyOf": [
-      {
-       "type": "string"
-      },
-      {
-       "type": "object"
-      }
-     ]
-    },
-    "questions5": {
-     "anyOf": [
-      {
-       "type": "string"
-      },
-      {
-       "type": "object"
-      }
-     ]
-    },
-    "questions6": {
-     "anyOf": [
-      {
-       "type": "string"
-      },
-      {
-       "type": "object"
-      }
-     ]
-    },
-    "questions7": {
-     "anyOf": [
-      {
-       "type": "string"
-      },
-      {
-       "type": "object"
-      }
-     ]
-    },
-    "claims0": {
-     "anyOf": [
-      {
-       "type": "string"
-      },
-      {
-       "type": "object"
-      }
-     ]
-    },
-    "claims1": {
-     "anyOf": [
-      {
-       "type": "string"
-      },
-      {
-       "type": "object"
-      }
-     ]
-    },
-    "claims2": {
-     "anyOf": [
-      {
-       "type": "string"
-      },
-      {
-       "type": "object"
-      }
-     ]
-    },
-    "claims3": {
-     "anyOf": [
-      {
-       "type": "string"
-      },
-      {
-       "type": "object"
-      }
-     ]
-    },
-    "claims4": {
-     "anyOf": [
-      {
-       "type": "string"
-      },
-      {
-       "type": "object"
-      }
-     ]
-    },
-    "claims5": {
-     "anyOf": [
-      {
-       "type": "string"
-      },
-      {
-       "type": "object"
-      }
-     ]
-    },
-    "claims6": {
-     "anyOf": [
-      {
-       "type": "string"
-      },
-      {
-       "type": "object"
-      }
-     ]
-    },
-    "claims7": {
-     "anyOf": [
-      {
-       "type": "string"
-      },
-      {
-       "type": "object"
-      }
-     ]
-    },
-    "task": {
-     "type": "string"
-    },
-    "changes": {
-     "anyOf": [
-      {
-       "type": "string"
-      },
-      {
-       "type": "array"
-      }
-     ]
-    },
-    "verification": {
-     "anyOf": [
-      {
-       "type": "string"
-      },
-      {
-       "type": "array"
-      }
-     ]
-    },
-    "manual": {
-     "type": "boolean",
-     "description": "Ignored for initiator identity; manual review comes from trusted host context or a user review command."
-    },
-    "agentInitiated": {
-     "type": "boolean"
-    },
-    "directory": {
-     "type": "string",
-     "description": "Ignored for security (identity comes from host context)"
-    }
-   },
-   "additionalProperties": false
-  },
-  "REVIEW_TOOL_NAME": "review"
- }
 }
