@@ -164,6 +164,39 @@ test('3C: coverage is session-scoped; unrelated stale sessions do not poison que
   assert.equal(found.coverage.capture.workspace_global.status, 'incomplete', 'global uncertainty remains visible');
 });
 
+test('3A-restart: partial reconciliation survives restart (remaining range preserved)', async t => {
+  const { store, dir } = await fixture(t);
+  await store.record('probe.a', { sessionID: 's1' }, { i: 1 });
+  await store.record('probe.a', { sessionID: 's1' }, { i: 2 });
+  await craft(store, 's1', { event_schema: 2, session_seq: 5 }); // gap 3..4
+  await store.coverage.flushPending();
+  await craft(store, 's1', { event_schema: 2, session_seq: 3 }); // partial backfill -> 4..4 remains
+  await store.coverage.flushPending();
+  store.close();
+  const store2 = await new Store(path.join(dir), path.join(dir, 'store')).init();
+  try {
+    const scoped = store2.coverage.statusFor('s1');
+    assert.equal(scoped.session_coverage.status, 'incomplete', 'partial recovery stays incomplete across restart');
+    assert.equal(scoped.session_coverage.unresolved_seqs, 1, 'only seq 4 remains unresolved after restart');
+  } finally { store2.close(); }
+});
+
+test('C6: full directory reconcile reconciles watcher gaps; original marker remains', async t => {
+  const { store } = await fixture(t);
+  store.noteWatcherMiss(); // notification loss, unknown extent
+  await store.coverage.flushPending();
+  assert.equal(store.coverage.statusFor('s1').workspace_global.status, 'incomplete', 'watcher miss -> incomplete');
+  // Events persisted while notifications were lost; a complete authoritative
+  // directory scan imports (dedupes) them and is the reconciliation evidence.
+  await store.record('probe.a', { sessionID: 's1' }, { late: 1 });
+  await store.reconcile();
+  const payloads = [];
+  for (const m of store.findEntriesAll({ type: 'trace.capture_gap' })) payloads.push(JSON.parse(await store.readBlob(m.payloadRef)));
+  assert.ok(payloads.some(p => p.status === 'detected' && p.reason === 'watcher_gap'), 'original marker preserved');
+  assert.ok(payloads.some(p => p.status === 'reconciled' && p.reason === 'watcher_gap'), 'reconciliation marker recorded');
+  assert.equal(store.coverage.statusFor('s1').workspace_global.status, 'complete', 'loss recovered by full scan');
+});
+
 test('C4: watcher overflow becomes counted, durable workspace-global evidence', async t => {
   const { store } = await fixture(t);
   store.noteWatcherMiss();
