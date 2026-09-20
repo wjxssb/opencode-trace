@@ -297,7 +297,9 @@ export class Store {
         try { await this.ingest(await this.readEvent(ref)); imported++; }
         catch (error) { this.warning('reconcile', error); }
       }
-      return { scanned, imported, scan_complete: !this.reconcileDirectory, watcher: this.watcherState };
+      const scanComplete = !this.reconcileDirectory;
+      if (scanComplete && !this.closed && !this.coverage.seeding) await this.coverage.reconcileWatcherGaps();
+      return { scanned, imported, scan_complete: scanComplete, watcher: this.watcherState };
     })();
     this.reconcileJob = job;
     try { return await job; } finally {
@@ -527,6 +529,11 @@ export class Store {
     // written best-effort by the coverage tracker; markers themselves are
     // skipped inside ingestSeq).
     this.coverage.ingestSeq(sid, event.session_seq, event.type);
+  }
+
+  /** Watcher-miss coverage markers reconcile when a full scan imports everything. */
+  reconcileWatcherGaps() {
+    this.coverage?.reconcileWatcherGaps?.();
   }
   async expand(ref, offset = 0, limit = 2048, metadataOnly = false) {
     if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 24000) throw new Error('Invalid expansion range');

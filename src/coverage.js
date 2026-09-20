@@ -118,6 +118,23 @@ export class CoverageTracker {
     this.seeding = false;
   }
 
+  /** Watcher-miss markers reconcile when a full scan imports all unseen events. */
+  async reconcileWatcherGaps() {
+    for (const entry of this.markers.values()) {
+      if (entry.reason === 'watcher_gap' && entry.status === 'detected') {
+        entry.status = 'reconciled';
+        try {
+          const event = await this.store.record('trace.capture_gap', { sessionID: null }, {
+            session: null, from_seq: entry.from_seq, to_seq: entry.to_seq, reason: entry.reason,
+            status: 'reconciled', reconciles_marker: entry.marker_ref ?? null, observed_at: Date.now(),
+            semantics: 'full directory scan imported all unseen events; watcher loss fully recovered (original preserved)',
+          });
+          entry.marker_ref = event.ref ?? entry.marker_ref;
+        } catch { entry.status = 'detected'; }
+      }
+    }
+  }
+
   status() {
     let known_gaps = 0, reconciled_gaps = 0, pending_writes = 0;
     for (const m of this.markers.values()) {

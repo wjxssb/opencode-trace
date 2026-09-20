@@ -13,7 +13,7 @@ async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'opencode-trace-cov-'));
   const trace = new Trace({ location: { directory: dir } }, { storeRoot: path.join(dir, 'store') });
   await trace.ready;
-  t.after(async () => { trace.store.close(); await fs.rm(dir, { recursive: true, force: true }); });
+  t.after(async () => { await trace.store.close(); await fs.rm(dir, { recursive: true, force: true, maxRetries: 8, retryDelay: 50 }); });
   return { dir, trace, store: trace.store };
 }
 const host = (sessionID = 's1') => ({ sessionID, messageID: 'm1', id: 'c1', agent: 'build' });
