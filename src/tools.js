@@ -28,6 +28,10 @@ export function definitions(trace) {
       try {
         await trace.ready;
         if (!host?.sessionID) throw new Error('Host session identity unavailable');
+        // Ephemeral evidence handles resolve to canonical refs before any
+        // store validation; unknown/expired/foreign handles reject clearly.
+        // Optional call keeps test stubs and legacy hosts working unchanged.
+        await trace.resolveInputHandles?.(input, host.sessionID);
         return await result(name, { ok: true, ...await fn(input, host) }, trace);
       } catch (error) {
         trace.warning(name, error);
@@ -39,13 +43,14 @@ export function definitions(trace) {
     }
   });
   return [
-    tool('trace_note', 'Save a concise durable decision, constraint, failure cause, blocker/next action, finding, handoff or structured milestone; skip routine logs. Cite evidence and label uncertainty; empty source_refs provides no corroboration. After verified correction/resolution, supersede your old note. Host supplies identity. Top-level kind is exactly one of the six note kinds (fact, finding, decision, unresolved, handoff, correction): do not invent other kinds; a state change is kind "finding", or milestone.kind "state_change", which maps to finding. Supply kind and text (summary is a compatibility alias), or milestone.kind and milestone.summary. source_refs, supersedes and depends_on are optional: copy full canonical refs (evt_<64hex> or blob_<64hex>) verbatim from observed Trace output; never shorten, reconstruct or invent refs; omit the field when the exact ref is unavailable.',
+    tool('trace_note', 'Save a concise durable decision, constraint, failure cause, blocker/next action, finding, handoff or structured milestone; skip routine logs. Cite evidence and label uncertainty; empty source_refs provides no corroboration. After verified correction/resolution, supersede your old note. Host supplies identity. Top-level kind is exactly one of the six note kinds (fact, finding, decision, unresolved, handoff, correction): do not invent other kinds; a state change is kind "finding", or milestone.kind "state_change", which maps to finding. Supply kind and text (summary is a compatibility alias), or milestone.kind and milestone.summary. source_refs, supersedes and depends_on are optional: copy full canonical refs (evt_<64hex> or blob_<64hex>) verbatim from observed Trace output; never shorten, reconstruct or invent refs; omit the field when the exact ref is unavailable. This turn\'s short evidence handles (e1/b1/n1 from the Evidence list) are also accepted via source_handles/evidence_handles or inline in ref fields; handles are turn-scoped labels resolved before storage, and durable notes always keep full canonical refs.',
       schema({
         kind: { enum: ['fact', 'finding', 'decision', 'unresolved', 'handoff', 'correction'], description: 'Top-level note kind; exactly these six values. Do not invent other kinds; a state change is expressed as "finding" (milestone.kind "state_change" maps to finding).' },
         text: { ...str, maxLength: 4096, description: 'Note body, at most 4096 UTF-8 bytes.' },
         summary: { ...str, maxLength: 4096, description: 'Compatibility alias for text. Prefer text; if both are supplied they must match.' },
-        source_refs: { ...refs, description: 'Optional provenance refs. Full canonical refs (evt_<64hex> or blob_<64hex>) copied verbatim from observed Trace output. Never shorten, reconstruct or invent; omit when the exact ref is unavailable.' },
-        supersedes: { ...refs, description: 'Your prior note refs, verified corrected/resolved. Hides from active recall, preserves history; never close still-open issues.' },
+        source_refs: { ...refs, description: 'Optional provenance refs. Full canonical refs (evt_<64hex> or blob_<64hex>) copied verbatim from observed Trace output, or this turn\'s short evidence handles (e1/b1/n1). Never shorten, reconstruct or invent; omit when the exact ref is unavailable.' },
+        source_handles: { ...refs, description: 'Turn-scoped evidence handles (e1/b1/n1) from the current Evidence list; resolved to canonical refs before storage.' },
+        supersedes: { ...refs, description: 'Your prior note refs, verified corrected/resolved. Hides from active recall, preserves history; never close still-open issues. Canonical refs or evidence handles.' },
         depends_on: refs,
         milestone: schema({
           kind: { enum: ['decision', 'state_change', 'verification', 'blocker', 'correction', 'handoff', 'baseline'] },
@@ -55,6 +60,7 @@ export function definitions(trace) {
           current_state: { ...str, maxLength: 1024 },
           decision: { ...str, maxLength: 2048 },
           evidence_refs: refs,
+          evidence_handles: { ...refs, description: 'Turn-scoped evidence handles (e1/b1/n1); resolved to canonical evidence_refs before storage.' },
           unresolved: { type: 'array', items: str, maxItems: 16 },
           next_action: { ...str, maxLength: 2048 },
           do_not_repeat: { type: 'array', items: { ...str, maxLength: 256 }, maxItems: 16 },
@@ -67,9 +73,9 @@ export function definitions(trace) {
           continuation_of: { ...str, maxLength: 256, description: 'Session ID or note ref this session continues.' }
         }, ['kind'])
       }), (i, h) => trace.note(i, h)),
-    tool('trace_expand', 'Read exact stored evidence, not current files. metadata_only inspects refs; text_blobs hold tool text, payload_ref the event JSON. Default 2048 bytes, max 24000. Follow next_offset until null; repeated pages add nothing. SHA-256 verifies the whole blob; base64 preserves split byte boundaries.',
-      schema({ ref: str, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 24000 }, metadata_only: { type: 'boolean' } }, ['ref']), i => trace.store.expand(i.ref, i.offset, i.limit, i.metadata_only)),
-    tool('trace_find', 'Search all ingested history; return snippets/refs for trace_expand. text searches capped hints; deep scans exact bytes with a budget and resumable cursor. External operations may be absent; no match does not prove absence.',
+    tool('trace_expand', 'Read exact stored evidence, not current files. ref accepts a canonical evt_/blob_ ref or this turn\'s short evidence handle (e1/b1/n1). metadata_only inspects refs; text_blobs hold tool text, payload_ref the event JSON. Default 2048 bytes, max 24000. Follow next_offset until null; repeated pages add nothing. SHA-256 verifies the whole blob; base64 preserves split byte boundaries.',
+      schema({ ref: str, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 24000 }, metadata_only: { type: 'boolean' } }, ['ref']), (i, h) => trace.expandTool(i, h)),
+    tool('trace_find', 'Search all ingested history; return snippets/refs for trace_expand. text searches capped hints; deep scans exact bytes with a budget and resumable cursor. Results carry short discovery handles usable this turn. External operations may be absent; no match does not prove absence.',
       schema({
         type: { anyOf: [{ type: 'string' }, { type: 'array', items: str, maxItems: 8 }] },
         session: { ...str, description: 'Host sessionID whose captured event history to search, including another worker session.' }, agent: str, tool: str, status: str,
@@ -79,7 +85,7 @@ export function definitions(trace) {
         deep: { type: 'boolean' }, deep_budget_bytes: { type: 'integer', minimum: 1024, maximum: 16777216 },
         after: { type: 'number', minimum: 0 }, before: { type: 'number', minimum: 0 },
         limit: { type: 'integer', minimum: 1, maximum: 100 }, cursor: str,
-      }), i => trace.find(i)),
+      }), (i, h) => trace.find(i, h)),
     tool('trace_send', 'Persist then deliver to observed workspace sessions through the host prompt queue/steer boundary. Host supplies sender. Receipts distinguish persisted, host_admitted, failed and uncertain. accept/reject/counter require an explicit proposal or counter message id.',
       schema({
         to: { type: 'array', items: str, minItems: 1, maxItems: 8 },
@@ -88,13 +94,14 @@ export function definitions(trace) {
         thread_id: str, in_reply_to: str, proposal: str,
         delivery: { enum: ['steer', 'queue'] },
         source_refs: refs,
+        source_handles: { ...refs, description: 'Turn-scoped evidence handles; resolved to canonical source_refs before storage.' },
       }, ['to', 'text']), (i, h) => trace.send(i, h)),
     tool('trace_inbox', 'Page sent/received messages; keep thread filter with next_cursor (max 96/page). Evidence: persisted, host_admitted, context_observed (native peer metadata only), recipient_ack, reply_recorded. Receipt is not agreement. sweep retries only missing delivery records; uncertain admissions require manual choice.',
       schema({ thread_id: str, sweep: { type: 'boolean' }, limit: { type: 'integer', minimum: 1, maximum: 96 }, cursor: str }), (i, h) => trace.inbox(i, h)),
     tool('trace_ack', 'Acknowledge receipt of one trace message; never agreement or completion.',
       schema({ message_id: str }, ['message_id']), (i, h) => trace.ack(i, h)),
     tool('trace_step_result', 'Report your bound plan step outcome. Host supplies identity/plan/step. Denied or failed operations mean failure; dependents require worker-reported success. A settled turn alone is outcome unknown.',
-      schema({ status: { enum: ['success', 'failure'] }, summary: { ...str, maxLength: 2048 }, source_refs: refs }, ['status']), (i, h) => trace.stepResult(i, h)),
+      schema({ status: { enum: ['success', 'failure'] }, summary: { ...str, maxLength: 2048 }, source_refs: refs, source_handles: { ...refs, description: 'Turn-scoped evidence handles; resolved to canonical source_refs before storage.' } }, ['status']), (i, h) => trace.stepResult(i, h)),
     tool('trace_plan', 'Run up to 8 dependency-ordered steps in fresh native sessions; independent steps fan out. Inherit effective model/variant/agent; explicit step.agent must exist and honors its model. Read back bindings before prompting; unavailable/mismatched bindings fail closed. Dependents require trace_step_result success, not merely a settled turn. Reuse terminal steps; retry_failed retries terminal non-success only. Concurrent/unterminated attempts return in_flight_unknown and are never duplicated. Plan identity is caller-scoped; acceptance does not complete the parent task.',
       schema({
         steps: { type: 'array', minItems: 1, maxItems: 8, items: schema({
@@ -124,6 +131,7 @@ export function definitions(trace) {
         },
         status: { enum: ['active', 'waiting', 'done', 'cancelled'] },
         related_refs: refs,
+        related_handles: { ...refs, description: 'Turn-scoped evidence handles; resolved to canonical related_refs before validation.' },
         attempt: { type: 'integer', minimum: 1 },
         recovered: { type: 'boolean' },
         previous_error: str
@@ -141,11 +149,24 @@ export function definitions(trace) {
         if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 64) throw new Error('Invalid peer page');
         await trace.store.reconcile();
         await trace.hydrate(h.sessionID);
-        return { ...trace.projection(h.sessionID, offset, limit), store: trace.store.root, errors: trace.errors,
+        const view = { ...trace.projection(h.sessionID, offset, limit), store: trace.store.root, errors: trace.errors,
           observer: { outstanding_jobs: trace.observerJobs.size, maximum_jobs: trace.maxObserverJobs,
             dropped_observations: trace.droppedObservations, watcher_jobs: trace.store.watchJobs.size,
-            maximum_watcher_jobs: trace.store.maxWatchJobs, missed_watcher_notifications: trace.store.missedWatchEvents, watcher: trace.store.watcherState },
-          ...(i.include_storage ? { storage: await trace.store.storageUsage() } : {}) };
+            maximum_watcher_jobs: trace.store.maxWatchJobs, missed_watcher_notifications: trace.store.missedWatchEvents, watcher: trace.store.watcherState } };
+        // Discovery handles for this turn: own-session refs visible here become
+        // resolvable without copying hex. Additive, bounded, never durable.
+        const refs = [view.current_intent?.ref, ...(view.notes ?? []).map(n => n.ref), ...(view.unresolved ?? []).map(n => n.ref), ...(view.recent ?? []).map(r => r.ref)]
+          .filter(ref => typeof ref === 'string' && /^e(vt|blob)_[a-f0-9]{64}$/.test(ref));
+        const registered = trace.handles.register(h.sessionID, refs);
+        if (registered.length) {
+          const byRef = new Map(registered.map(entry => [entry.ref, entry.handle]));
+          for (const row of [...(view.notes ?? []), ...(view.unresolved ?? []), ...(view.recent ?? [])]) {
+            if (byRef.has(row.ref)) row.handle = byRef.get(row.ref);
+          }
+          if (view.current_intent && byRef.has(view.current_intent.ref)) view.current_intent.handle = byRef.get(view.current_intent.ref);
+          view.handles_registered = registered.length;
+        }
+        return { ...view, ...(i.include_storage ? { storage: await trace.store.storageUsage() } : {}) };
       })
   ];
 }

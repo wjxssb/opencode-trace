@@ -61,7 +61,7 @@ function document(title, body) {
 /** Format one trace_find entry row (index mode). */
 function findEntryLine(entry) {
   if (!entry || typeof entry !== 'object') return '- (malformed entry)';
-  const head = [`\`${entry.ref ?? '?'}\``, entry.type ?? '?'];
+  const head = [entry.handle ? `[\`${entry.handle}\`]` : null, `\`${entry.ref ?? '?'}\``, entry.type ?? '?'];
   if (entry.tool) head.push(`tool=${entry.tool}`);
   if (entry.status) head.push(`status=${entry.status}`);
   if (Number.isFinite(entry.at)) head.push(iso(entry.at));
@@ -74,7 +74,7 @@ function findEntryLine(entry) {
 /** Deep-scan hit line. */
 function deepHitLine(hit) {
   if (!hit || typeof hit !== 'object') return '- (malformed hit)';
-  return `- \`${hit.event_ref ?? '?'}\` · blob \`${hit.blob_ref ?? '?'}\` · byte ${hit.byte_offset ?? '?'}\n  ${clip(hit.snippet ?? '', 160)}`;
+  return `- ${hit.handle ? `[\`${hit.handle}\`] ` : ''}\`${hit.event_ref ?? '?'}\` · blob \`${hit.blob_ref ?? '?'}\` · byte ${hit.byte_offset ?? '?'}\n  ${clip(hit.snippet ?? '', 160)}`;
 }
 
 const formatters = {
@@ -146,6 +146,7 @@ const formatters = {
       `- **window**: bytes ${value?.offset ?? 0}–${(value?.offset ?? 0) + (value?.returned_bytes ?? 0)} of ${value?.total_bytes ?? 0} (hash_verified: ${value?.hash_verified ? 'true' : 'false'})`,
       `- **next offset**: ${value?.next_offset === null || value?.next_offset === undefined ? '(complete)' : `\`${value.next_offset}\``}`,
       (value?.related_refs ?? []).length ? `- **related refs**: ${refList(value.related_refs)}` : null,
+      (Array.isArray(value?.handles) && value.handles.length) ? `- **discovery handles**: ${value.handles.map(h => `[\`${h.handle}\`] \`${String(h.ref).slice(0, 15)}…\``).join(', ')}` : null,
       (Array.isArray(value?.text_blobs) && value.text_blobs.length) ? `- **text blobs**: ${value.text_blobs.map(b => `\`${b.ref ?? '?'}\` (${b.bytes ?? '?'} B)`).join(', ')}` : null,
       '',
       value?.metadata_only ? '_metadata_only: no payload bytes requested._' : '_Exact page bytes are in the structured result below._',
