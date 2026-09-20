@@ -222,6 +222,16 @@ export class Trace {
     };
     this.store = new Store(ctx.location?.directory ?? ctx.location?.project?.canonical ?? process.cwd(), options.storeRoot, this.warning);
     this.ready = this.store.init();
+    if (options.captureWriter) {
+      // Phase G: non-blocking capture (opt-in). Started after the store is
+      // ready (the coordinator needs the store root); failure degrades to the
+      // synchronous path with a warning — the host is never blocked by it.
+      this.ready = this.ready.then(async () => {
+        const { CaptureCoordinator } = await import('./capture.js');
+        this.capture = new CaptureCoordinator(this, options);
+        await this.capture.start();
+      });
+    }
     this.ready.catch(error => this.warning('startup', error));
   }
   noteObserverDrop(where) {
@@ -344,7 +354,55 @@ export class Trace {
     if (paths) await this.conflicts(e.sessionID, paths, [], event.ref);
     return event;
   }
+  /**
+   * Phase G: non-blocking capture path for tool.after events (§14.1). The
+   * envelope is fully built here — session sequence allocated through the
+   * durable per-session allocator, every content-addressed ref computed in
+   * memory — then handed to the bounded queue; persistence happens on the
+   * writer. Verification-milestone detection still runs on the host because
+   * milestone notes use the synchronous path.
+   */
+  async afterViaCapture(e) {
+    const blobs = [];
+    const outputs = [];
+    const pushOutput = text => {
+      const b = this.store.blobRef(text, 'utf8');
+      outputs.push({ ref: b.ref, bytes: b.bytes, encoding: 'utf8', sha256: b.sha256 });
+      blobs.push(b);
+    };
+    if (typeof e.result?.output === 'string') pushOutput(e.result.output);
+    for (const part of e.result?.content ?? []) if (part.type === 'text' && typeof part.text === 'string') pushOutput(part.text);
+    const beforeRef = this.store.findEntriesNewest({ callKey: callKey(e), type: 'tool.before' }, 1)[0]?.ref ?? null;
+    const data = { id: e.id, tool: e.tool, input: e.input, status: e.status, result: e.result, error: e.error };
+    const extra = { tool: e.tool, callID: e.id ?? null, callKey: callKey(e), source: locator(e.input), status: e.status, outputs, ...(beforeRef ? { caused_by: beforeRef } : {}) };
+    const { ref } = await this.capture.enqueue({ type: 'tool.after', host: identity(e), data, extra, blobs });
+    // High-value milestone trigger: test & verification transitions.
+    const cmd = typeof e.input?.command === 'string' ? e.input.command : (typeof e.input === 'string' ? e.input : null);
+    if (cmd && isVerificationCommand(cmd) && e.sessionID) {
+      const outcome = detectVerificationOutcome(e);
+      if (outcome !== 'UNKNOWN') {
+        const s = this.store.session(e.sessionID);
+        const prev = s.lastVerification?.command === cmd ? s.lastVerification : null;
+        s.lastVerification = { outcome, at: Date.now(), ref, command: cmd };
+        if (prev?.outcome === 'FAIL' && outcome === 'PASS') {
+          await this.autoRecordMilestone(e.sessionID, {
+            kind: 'state_change', summary: `Verification transition: FAIL -> PASS (${cmd.slice(0, 80)})`,
+            what_changed: 'Verification passed after prior failure', current_state: 'PASS',
+            evidence_refs: [ref, prev.ref].filter(Boolean), supersedes: prev.milestone_ref ? [prev.milestone_ref] : [],
+          }, identity(e));
+        } else if (prev?.outcome === 'PASS' && outcome === 'FAIL') {
+          await this.autoRecordMilestone(e.sessionID, {
+            kind: 'state_change', summary: `Regression detected: PASS -> FAIL (${cmd.slice(0, 80)})`,
+            what_changed: 'Verification failed after prior passing state', current_state: 'FAIL',
+            evidence_refs: [ref, prev.ref].filter(Boolean),
+          }, identity(e));
+        }
+      }
+    }
+    return { ref, enqueued: true };
+  }
   async after(e) {
+    if (this.capture?.active) return this.afterViaCapture(e);
     const outputs = [];
     if (typeof e.result?.output === 'string') outputs.push(await this.store.blob(e.result.output, 'utf8'));
     for (const part of e.result?.content ?? []) if (part.type === 'text' && typeof part.text === 'string') outputs.push(await this.store.blob(part.text, 'utf8'));
