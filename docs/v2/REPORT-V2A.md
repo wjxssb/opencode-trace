@@ -93,7 +93,21 @@ Unintentional: one early qualification run mis-routed to the production service
 (a handful of GLM requests) before isolation was understood; disclosed above.
 
 ## 31. FINAL STATE
-QUALIFIED BUT NOT PROMOTED — staged, reviewed, activation documented:
-  ln -sfn 2.0.7-trace-v2a-45db3ea ~/.local/share/opencode-runtime/current
-  opencode service restart
-Rollback: ln -sfn 2.0.7-runtime-context-tracefix-0169868e2ea …/current (CAS untouched).
+**TRACE V2-A PROMOTED_AND_VERIFIED** (production-prep round, 2026-09-20).
+Prep commit `a7fef31` (refPattern status filter + registry release/TTL lifecycle +
+trace.handle_resolution metadata) — suite 194/193/0/1, handles 15/15, drill 2/2,
+cache diff 0 lines; round-2 independent review PASS (rev_1789923775667_pj2nljcm);
+round-2 doc advisories applied (`1e2114a`).
+Promotion (journaled + idle-gated, NO bare switch):
+- release `2.0.7-trace-v2a-1e2114a` — trace dir sha256 c887c630…259257;
+  deterministic git-archive bundle fded6bdc…8e1594, release bytes verified equal
+- journal `~/.local/share/opencode-runtime/promotions/2026-09-20T17-12-51.582Z-trace-v2a.json`
+  (before-config backup + after-config + narrow-merge verification + symlink
+  before/after + idle-gate evidence with the openly-listed orphaned execution
+  mark ses_f71c232d… of 09-11 excluded by a 30-minute staleness bound)
+- config plugins[].package (trace) -> 2.0.7-trace-v2a-1e2114a path; current -> same
+- LIVE SMOKE: the host config watcher hot-reloaded the plugin after the journaled
+  config change; production runtime-context now delivers the EVIDENCE HANDLES
+  block ([e1]/[b1]/[n1]…) in the promoter's own session — activation verified live
+Rollback: restore `before-config` from the journal + symlink back to
+`2.0.7-runtime-context-tracefix-0169868e2ae` (CAS untouched at every step).
