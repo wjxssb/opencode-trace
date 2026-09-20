@@ -1,0 +1,14 @@
+# V2 PRODUCTION BASELINE (pre B-G campaign, 2026-09-20T17:27:22Z)
+- active release: 2.0.7-trace-v2a-1e2114a
+- release trace dir sha256: c887c630bb2c95ce5aa4926bc1141b0ce2bca19983beecaf45453cf02b259257
+- candidate repo HEAD: 501b516e2c79822e864245d53bf17cb93fab00cd (501b516 docs(trace): V2-A final state -> PROMOTED_AND_VERIFIED (journaled promotion 2.0.7-trace-v2a-1e2114a, live hot-reload smoke))
+- opencode: opencode v2.0.7+runtime.2a158a9d; node v22.16.0
+- release trace dir hash: 4fa847ee753744db854fafd04e38ee7d7787d4ee01f3613ba2d52c3dde6f5151
+- reviewer dir hash: 62d6f9f3247e2ea49171ce1ae85f75c06f5964744d5c263ac6d0850c5ef55faf
+- supervisor dir hash: a7ea38eff4d62e6ba659657d0f25a010438a523002f33976df70133f0f1fe8ce
+- runtime-context: opencode.runtime-context.v1, late injection, evidence_handles LIVE (host frame this session: e1-e4/b1-b4/n1)
+- config sha256: 7df2a1b8646895682a73d4b46f12c62749156962fcb3e8a29905237103fbf931
+- model: local-qwen-auto/27b-dense (nvidia/Qwen3.8-27B-NVFP4), vLLM epoch 09-19 22:35
+- events=51574 blobs=59606 sessions=194
+- tests: 194 total / 193 pass / 0 fail / 1 skip (HEAD 501b516)
+- live frame proof: runtime-context carries evidence_handles (e1..e4,b1..b4,n1); n1 -> evt_105429c…8d9c note whose payload stores full canonical refs only (verified in A-campaign)

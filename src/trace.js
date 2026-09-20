@@ -334,8 +334,10 @@ export class Trace {
     const outputs = [];
     if (typeof e.result?.output === 'string') outputs.push(await this.store.blob(e.result.output, 'utf8'));
     for (const part of e.result?.content ?? []) if (part.type === 'text' && typeof part.text === 'string') outputs.push(await this.store.blob(part.text, 'utf8'));
+    // Phase B causality: a completed tool call was caused by its begin event.
+    const beforeRef = this.store.findEntriesNewest({ callKey: callKey(e), type: 'tool.before' }, 1)[0]?.ref ?? null;
     const event = await this.store.record('tool.after', identity(e), { id: e.id, tool: e.tool, input: e.input, status: e.status, result: e.result, error: e.error },
-      { tool: e.tool, callID: e.id ?? null, callKey: callKey(e), source: locator(e.input), status: e.status, outputs });
+      { tool: e.tool, callID: e.id ?? null, callKey: callKey(e), source: locator(e.input), status: e.status, outputs, ...(beforeRef ? { caused_by: beforeRef } : {}) });
     
     // High-value milestone trigger: test & verification transitions
     const cmd = typeof e.input?.command === 'string' ? e.input.command : (typeof e.input === 'string' ? e.input : null);
@@ -1602,10 +1604,10 @@ export class Trace {
         if (actual?.id !== sid || actual?.agent !== agent || !sameModel(binding.actual.model, model)) throw new Error('Native child model/agent selection does not match requested binding; prompt withheld');
         binding.verified = true;
         phase = 'start';
-        await this.store.record('trace.step', identity(host), {
+        const startedRecord = await this.store.record('trace.step', identity(host), {
           plan_id, version, step: step.id, state: 'started', sessionID: sid, attempt_id, native: 'session.create+prompt+wait',
           agent, binding,
-        }, { plan_id, step: step.id, worker: sid });
+        }, { plan_id, step: step.id, worker: sid, caused_by: planEvent.ref });
         phase = 'prompt';
         const dependencies = (step.depends_on ?? []).map(id => {
           const dependency = results.find(r => r.id === id);
@@ -1642,7 +1644,7 @@ export class Trace {
           ...(submitted ? { result_ref: submitted.ref, worker_summary: (submitted.summary ?? '').slice(0, 512), worker_source_refs: submitted.source_refs ?? [] } : {}),
           evidence: { last_message_id: messageID(last) ?? null, output_preview: last ? textFromMessage(last).slice(0, 512) : null,
             note: 'settled means the child turn finished; outcome carries task success only from the worker structured result' },
-        }, { plan_id, step: step.id });
+        }, { plan_id, step: step.id, caused_by: startedRecord.ref });
         results.push({ id: step.id, execution: 'settled', outcome, sessionID: sid, attempt_id, binding, evidence_ref: record.ref, reused: false, state: `settled(${outcome})` });
         states.set(step.id, { execution: 'settled', outcome });
       } catch (error) {
@@ -1753,6 +1755,56 @@ export class Trace {
     return { ok: true, plan_id: binding.plan_id, step: binding.step, status: input.status, result_ref: event.ref,
       note: 'structured worker outcome recorded; settled-without-result stays outcome unknown' };
   }
+  // Phase B: internal integrity/continuity verification for one session's
+  // event chain. This is INTERNAL continuity evidence under the store model
+  // (ordering, linkage, containment) — NOT external cryptographic
+  // attestation of the outside world.
+  async verifyChain(sessionID) {
+    const rows = this.store.findEntriesAll({ session: sessionID });
+    const events = [];
+    for (const row of rows) {
+      try { events.push(await this.store.readEvent(row.ref)); } catch { /* unreadable events are reported by integrity checks elsewhere */ }
+    }
+    const byRef = new Map(), seqCount = new Map();
+    let legacy = 0;
+    for (const ev of events) {
+      if (ev.session_seq == null) { legacy++; continue; }
+      byRef.set(ev.ref, ev);
+      seqCount.set(ev.session_seq, (seqCount.get(ev.session_seq) ?? 0) + 1);
+    }
+    const seqs = [...seqCount.keys()].sort((a, b) => a - b);
+    const gaps = [];
+    for (let i = 1; i < seqs.length; i++) if (seqs[i] !== seqs[i - 1] + 1) gaps.push([seqs[i - 1] + 1, seqs[i] - 1]);
+    const broken = [], missing = [], cross_session = [], cycles = [];
+    const duplicate_seqs = [...seqCount.entries()].filter(([, n]) => n > 1).map(([seq, n]) => ({ seq, count: n }));
+    for (const ev of byRef.values()) {
+      const prev = ev.previous_event_ref;
+      if (!prev) continue;
+      let target = byRef.get(prev);
+      if (!target) {
+        // The referenced event may live in another session: classify honestly.
+        const foreign = await this.store.readEvent(prev).catch(() => null);
+        if (foreign) {
+          if (foreign.host?.sessionID !== ev.host?.sessionID) { cross_session.push({ ref: ev.ref, previous_event_ref: prev }); continue; }
+          missing.push({ ref: ev.ref, previous_event_ref: prev, note: 'same-session referenced event unreadable' });
+          continue;
+        }
+        missing.push({ ref: ev.ref, previous_event_ref: prev });
+        continue;
+      }
+      if (target.host?.sessionID !== ev.host?.sessionID) { cross_session.push({ ref: ev.ref, previous_event_ref: prev }); continue; }
+      if (target.session_seq >= ev.session_seq) cycles.push({ ref: ev.ref, previous_event_ref: prev, target_seq: target.session_seq, seq: ev.session_seq });
+      else if (target.session_seq !== ev.session_seq - 1) broken.push({ ref: ev.ref, expected_seq: ev.session_seq - 1, target_seq: target.session_seq });
+    }
+    return {
+      label: 'internal integrity/continuity evidence, not external attestation',
+      session: sessionID, checked: events.length, legacy_v1_events: legacy,
+      seq_range: seqs.length ? [seqs[0], seqs[seqs.length - 1]] : null,
+      ok: !gaps.length && !broken.length && !missing.length && !cross_session.length && !cycles.length && !duplicate_seqs.length,
+      gaps, broken, missing, cross_session, cycles, duplicate_seqs,
+    };
+  }
+
   async lifecycle(event) {
     const data = event.properties ?? event.data ?? {};
     const sid = data.sessionID ?? data.info?.id;

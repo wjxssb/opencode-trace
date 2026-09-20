@@ -3,6 +3,7 @@ import { watch } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { atomic, canonical, hash, stable, refPattern } from './util.js';
+import { SequenceAllocator } from './sequence.js';
 
 const keep = (items, item, limit) => [...items.filter(x => x.ref !== item.ref), item].sort((a, b) => a.at - b.at || a.ref.localeCompare(b.ref)).slice(-limit);
 
@@ -47,12 +48,18 @@ export class Store {
     // so deleting it loses nothing. Entries are bounded (~1KB each) via
     // capped string hints; exact bytes always live in the blob store.
     this.index = new Map();
+    // Phase B: durable per-session sequence allocator + replay guard
+    // (causality-free body hash -> ref) so duplicate delivery/retry never
+    // consumes a sequence number within this process.
+    this.sequences = null;
+    this.replayGuard = new Map();
   }
   async init() {
     this.workspace = await canonical(this.workspace);
     this.workspaceID = hash(this.workspace);
     this.root = path.join(this.base, 'workspaces', this.workspaceID);
-    for (const d of ['events', 'blobs', 'sessions', 'recall', 'intents', 'state']) await fs.mkdir(path.join(this.root, d), { recursive: true, mode: 0o700 });
+    for (const d of ['events', 'blobs', 'sessions', 'recall', 'intents', 'state', 'sequence']) await fs.mkdir(path.join(this.root, d), { recursive: true, mode: 0o700 });
+    this.sequences = new SequenceAllocator(path.join(this.root, 'sequence'));
     // Watch before recovery to cover concurrent writers during the one startup scan.
     const watcherFailed = error => {
       this.watcher?.close(); this.watcher = null;
@@ -171,6 +178,8 @@ export class Store {
       source: event.source && Object.keys(event.source).length ? event.source : null,
       payloadRef: event.payload?.ref ?? null, bytes: event.payload?.bytes ?? 0,
       outputs: (event.outputs ?? []).map(o => ({ ref: o.ref, bytes: o.bytes ?? null })).filter(o => typeof o.ref === 'string'),
+      seq: event.session_seq ?? null, previous: event.previous_event_ref ?? null,
+      causedBy: event.caused_by ?? null, parent: event.parent_event_ref ?? null,
       rels: [...new Set(rels)], hints: payloadHints,
     };
     this.index.set(event.ref, entry);
@@ -372,8 +381,33 @@ export class Store {
   }
   async record(type, host, data, extra = {}) {
     const payload = await this.blob(data);
-    const body = { schema: 1, workspaceID: this.workspaceID, type, host, payload, ...extra };
-    const ref = `evt_${hash(stable(body))}`;
+    // Replay guard: an identical causality-free body (retry / duplicate
+    // delivery) dedupes to the earlier event WITHOUT consuming a sequence
+    // number. Bounded map; cross-process replays are documented as outside
+    // this guarantee (single-writer workspace is the norm).
+    const v1 = { schema: 1, workspaceID: this.workspaceID, type, host, payload, ...extra };
+    const replayKey = stable(v1);
+    const seenRef = this.replayGuard.get(replayKey);
+    if (seenRef) {
+      const prior = await this.readEvent(seenRef).catch(() => null);
+      if (prior) return prior;
+      this.replayGuard.delete(replayKey);
+    }
+    // Phase B causality: durable per-session sequence + chain link, allocated
+    // atomically so the event ref is derived inside the critical section.
+    // Crash after allocation but before persistence leaves a detectable
+    // sequence gap (Phase C coverage marks it; never rewritten).
+    let body = v1, ref = `evt_${hash(stable(body))}`;
+    if (this.sequences && host?.sessionID) {
+      const built = await this.sequences.allocate(host.sessionID, (session_seq, previous_event_ref) => {
+        const body2 = { ...v1, event_schema: 2, session_seq, ...(previous_event_ref ? { previous_event_ref } : {}) };
+        return { ref: `evt_${hash(stable(body2))}`, body: body2 };
+      });
+      body = built.body;
+      ref = built.ref;
+    }
+    if (this.replayGuard.size >= 1024) this.replayGuard.delete(this.replayGuard.keys().next().value);
+    this.replayGuard.set(replayKey, ref);
     let event;
     try { event = await this.readEvent(ref); }
     catch (error) {
@@ -517,11 +551,27 @@ export class Store {
       const parentRef = this.mailEventRef(id);
       if (parentRef) inlineRels.push(parentRef);
     }
+    // Phase B causal projection: chain/causality metadata of this event plus
+    // resulting events (children) derived from the in-memory index. Additive
+    // and bounded; absent fields mean the event predates event_schema 2.
+    let causal = null;
+    if (event?.session_seq != null) {
+      causal = { session_seq: event.session_seq, ...(event.previous_event_ref ? { previous: event.previous_event_ref } : {}),
+        ...(event.caused_by ? { caused_by: event.caused_by } : {}), ...(event.parent_event_ref ? { parent: event.parent_event_ref } : {}) };
+    }
+    const children = [];
+    if (ref.startsWith('evt_')) {
+      for (const entry of this.index.values()) {
+        if (children.length >= 16) break;
+        if (entry.previous === ref || entry.causedBy === ref || entry.parent === ref) children.push(entry.ref);
+      }
+    }
     return { ref, payload_ref: event?.payload.ref ?? ref, sha256: hash(data), hash_verified: true,
       metadata_only: metadataOnly, offset, limit, returned_bytes: chunk.length, total_bytes: data.length,
       next_offset: offset + chunk.length < data.length ? offset + chunk.length : null,
       metadata: event ?? { sha256: hash(data), bytes: data.length }, source: event?.source ?? null,
       related_refs: [...new Set(inlineRels.filter(Boolean))],
+      ...(causal ? { causal } : {}), ...(children.length ? { children } : {}),
       text_blobs: event?.outputs ?? [],
       ...(metadataOnly ? {} : { exact_utf8: chunk.toString('utf8'), exact_base64: chunk.toString('base64'), encoding: 'utf8; base64 preserves page-boundary bytes' }) };
   }
