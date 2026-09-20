@@ -32,6 +32,13 @@ export const HANDLE_PATTERN = /^(?:[ebn][1-9][0-9]{0,3})$/;
 export const SNAPSHOT_HANDLE_CAP = 64;
 export const REGISTRATION_CAP = 64;
 export const GENERATION_CAP = 256;
+// Conservative TTL for generations of sessions whose disposal signal was
+// never observed (observer drop, crash, missed watcher event). Far beyond
+// any live turn (model turns are seconds to minutes), so eviction can never
+// hit a session that is mid-request.
+export const DEFAULT_HANDLE_TTL_MS = 6 * 60 * 60 * 1000;
+// Opportunistic sweep throttle: at most one scan per minute of process life.
+const SWEEP_INTERVAL_MS = 60 * 1000;
 
 export const isHandle = value => typeof value === 'string' && HANDLE_PATTERN.test(value);
 
@@ -100,10 +107,41 @@ export class HandleRegistry {
   constructor() {
     this.active = new Map();   // sessionID -> generation
     this.retired = new Map();  // sessionID -> previous generation (tombstone only)
+    this.lastSweepAt = Date.now();
+  }
+
+  /**
+   * Drop every mapping for a disposed/deleted session (active + retired
+   * tombstone). Called from the session lifecycle observer on
+   * `session.deleted`; safe to call for unknown sessions (no-op).
+   */
+  release(sessionID) {
+    const hadActive = this.active.delete(sessionID);
+    this.retired.delete(sessionID);
+    return hadActive;
+  }
+
+  /**
+   * Bounded GC for sessions whose disposal signal was never delivered
+   * (observer drop, crash, missed watcher event). Age-based only: a
+   * generation older than the TTL cannot belong to a live turn, so this can
+   * never clean a session that is still active. Returns evicted sessions.
+   */
+  sweep(now = Date.now(), ttlMs = DEFAULT_HANDLE_TTL_MS) {
+    const evicted = [];
+    for (const [sessionID, generation] of this.active) {
+      if (now - generation.created_at > ttlMs) { this.active.delete(sessionID); this.retired.delete(sessionID); evicted.push(sessionID); }
+    }
+    for (const [sessionID, generation] of this.retired) {
+      if (now - generation.created_at > ttlMs) this.retired.delete(sessionID);
+    }
+    return evicted;
   }
 
   /** Install the generation for a freshly prepared snapshot. */
   newGeneration(sessionID, assignments = []) {
+    const now = Date.now();
+    if (now - this.lastSweepAt >= SWEEP_INTERVAL_MS) { this.lastSweepAt = now; this.sweep(now); }
     const byHandle = new Map(), byRef = new Map();
     const next = { e: 0, b: 0, n: 0 };
     const previous = this.active.get(sessionID);

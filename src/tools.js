@@ -3,6 +3,7 @@ const refs = { type: 'array', items: str, maxItems: 16 };
 const schema = (properties, required = []) => ({ type: 'object', properties, required, additionalProperties: false });
 import { present, boundedRaw } from './present.js';
 import { normalizeTraceIntentInput } from './normalization.js';
+import { refPattern, callKey } from './util.js';
 // P1 presentation: content is human Markdown + a fenced machine block (the
 // host persists content and the model reads it — Phase 0 spike); the raw
 // structured value rides in metadata.raw, size-bounded for host delivery.
@@ -31,8 +32,11 @@ export function definitions(trace) {
         // Ephemeral evidence handles resolve to canonical refs before any
         // store validation; unknown/expired/foreign handles reject clearly.
         // Optional call keeps test stubs and legacy hosts working unchanged.
-        await trace.resolveInputHandles?.(input, host.sessionID);
-        return await result(name, { ok: true, ...await fn(input, host) }, trace);
+        const rawCallKey = callKey({ sessionID: host.sessionID, id: host.id, tool: name, input });
+        const resolvedHandles = await trace.resolveInputHandles?.(input, host.sessionID, name, host, rawCallKey);
+        const value = { ok: true, ...await fn(input, host) };
+        if (resolvedHandles?.length) value.handles_resolved = resolvedHandles;
+        return await result(name, value, trace);
       } catch (error) {
         trace.warning(name, error);
         if (name === 'trace_intent' && host?.sessionID) {
@@ -154,14 +158,16 @@ export function definitions(trace) {
             dropped_observations: trace.droppedObservations, watcher_jobs: trace.store.watchJobs.size,
             maximum_watcher_jobs: trace.store.maxWatchJobs, missed_watcher_notifications: trace.store.missedWatchEvents, watcher: trace.store.watcherState } };
         // Discovery handles for this turn: own-session refs visible here become
-        // resolvable without copying hex. Additive, bounded, never durable.
-        const refs = [view.current_intent?.ref, ...(view.notes ?? []).map(n => n.ref), ...(view.unresolved ?? []).map(n => n.ref), ...(view.recent ?? []).map(r => r.ref)]
-          .filter(ref => typeof ref === 'string' && /^e(vt|blob)_[a-f0-9]{64}$/.test(ref));
+        // resolvable without copying hex. Canonical evt_ and blob_ refs both
+        // qualify (util refPattern); additive, bounded, never durable.
+        const refs = [view.current_intent?.ref, ...(view.notes ?? []).map(n => n.ref), ...(view.unresolved ?? []).map(n => n.ref), ...(view.recent ?? []).flatMap(r => [r.ref, ...(r.outputs ?? []).map(o => o.ref)])]
+          .filter(ref => typeof ref === 'string' && refPattern.test(ref));
         const registered = trace.handles.register(h.sessionID, refs);
         if (registered.length) {
           const byRef = new Map(registered.map(entry => [entry.ref, entry.handle]));
           for (const row of [...(view.notes ?? []), ...(view.unresolved ?? []), ...(view.recent ?? [])]) {
             if (byRef.has(row.ref)) row.handle = byRef.get(row.ref);
+            for (const output of row.outputs ?? []) if (byRef.has(output.ref)) output.handle = byRef.get(output.ref);
           }
           if (view.current_intent && byRef.has(view.current_intent.ref)) view.current_intent.handle = byRef.get(view.current_intent.ref);
           view.handles_registered = registered.length;
