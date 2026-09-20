@@ -1,4 +1,5 @@
-// Phase C qualification: coverage watermarks + explicit gap semantics.
+// Phase C qualification (V2 revision): scoped coverage, partial reconciliation,
+// marker watermark advancement, durable gap evidence.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs/promises';
@@ -30,12 +31,11 @@ async function craft(store, sessionID, body) {
 test('C1: fresh store reports complete coverage', async t => {
   const { store } = await fixture(t);
   await store.record('probe.a', { sessionID: 's1' }, { i: 1 });
-  const status = store.coverage.status();
-  assert.equal(status.status, 'complete');
-  assert.equal(status.known_gaps, 0);
+  assert.equal(store.coverage.status().status, 'complete');
+  assert.equal(store.coverage.statusFor('s1').session_coverage.status, 'complete');
 });
 
-test('C2: a sequence jump becomes a durable trace.capture_gap marker', async t => {
+test('C2/C3: a sequence jump becomes a durable range marker (single + multi-event)', async t => {
   const { store } = await fixture(t);
   await store.record('probe.a', { sessionID: 's1' }, { i: 1 });
   await store.record('probe.a', { sessionID: 's1' }, { i: 2 });
@@ -44,32 +44,125 @@ test('C2: a sequence jump becomes a durable trace.capture_gap marker', async t =
   const markers = store.findEntriesAll({ type: 'trace.capture_gap' });
   assert.equal(markers.length, 1);
   const payload = JSON.parse(await store.readBlob(markers[0].payloadRef));
-  assert.deepEqual([payload.from_seq, payload.to_seq], [3, 4]);
-  assert.equal(payload.reason, 'capture_gap');
-  const status = store.coverage.status();
-  assert.equal(status.status, 'incomplete');
-  assert.equal(status.known_gaps, 1);
+  assert.deepEqual(payload.ranges, [{ from: 3, to: 4 }]);
+  assert.equal(payload.unresolved_count, 2);
+  const scoped = store.coverage.statusFor('s1');
+  assert.equal(scoped.session_coverage.status, 'incomplete');
+  assert.equal(scoped.session_coverage.unresolved_seqs, 2);
 });
 
-test('C3: multi-event loss is recorded as an explicit range', async t => {
+test('W1: full coverage -> complete; W8: no-match + complete distinguishes from W9', async t => {
+  const { trace } = await fixture(t);
+  const found = await trace.find({ text: 'no-such-marker-xyz-42' });
+  assert.deepEqual(found.matches ?? found.results, []);
+  assert.equal(found.coverage.capture.status, 'complete');
+});
+
+test('W9: no-match within an incomplete session reports scoped incompleteness', async t => {
+  const { trace, store } = await fixture(t);
+  await store.record('probe.a', { sessionID: 'sA' }, { i: 1 });
+  await craft(store, 'sA', { event_schema: 2, session_seq: 9 }); // gap in sA
+  await store.coverage.flushPending();
+  const inSession = await trace.find({ text: 'no-such-marker-xyz-42', session: 'sA' });
+  assert.equal(inSession.coverage.capture.session_coverage.status, 'incomplete');
+  const otherSession = await trace.find({ text: 'no-such-marker-xyz-42', session: 'sB' });
+  assert.equal(otherSession.coverage.capture.session_coverage.status, 'complete', 'unrelated session is NOT poisoned by sA gap');
+  assert.equal(otherSession.coverage.capture.workspace_global.status, 'incomplete', 'workspace-global uncertainty stays visible');
+});
+
+test('3A-partial: recovering seq 3 of gap 3..4 leaves 4..4 unresolved', async t => {
   const { store } = await fixture(t);
   await store.record('probe.a', { sessionID: 's1' }, { i: 1 });
   await store.record('probe.a', { sessionID: 's1' }, { i: 2 });
-  await craft(store, 's1', { event_schema: 2, session_seq: 10 });
+  await craft(store, 's1', { event_schema: 2, session_seq: 5 }); // gap 3..4
+  await store.coverage.flushPending();
+  await craft(store, 's1', { event_schema: 2, session_seq: 3 }); // partial backfill
   await store.coverage.flushPending();
   const markers = store.findEntriesAll({ type: 'trace.capture_gap' });
-  const payload = JSON.parse(await store.readBlob(markers[0].payloadRef));
-  assert.deepEqual([payload.from_seq, payload.to_seq], [3, 9], 'range loss recorded as from..to');
+  const payloads = [];
+  for (const m of markers) payloads.push(JSON.parse(await store.readBlob(m.payloadRef)));
+  const detected = payloads.find(p => p.status === 'detected');
+  assert.ok(detected, 'original detected marker preserved');
+  const followup = payloads.find(p => p.status === 'partially_reconciled');
+  assert.ok(followup, 'partial reconciliation recorded');
+  assert.deepEqual(followup.remaining, [{ from: 4, to: 4 }], 'remaining loss stays visible');
+  const scoped = store.coverage.statusFor('s1');
+  assert.equal(scoped.session_coverage.unresolved_seqs, 1, 'only seq 4 remains unresolved');
+  assert.equal(scoped.session_coverage.status, 'incomplete');
 });
 
-test('C4: watcher overflow becomes counted, durable gap evidence', async t => {
+test('3A-full: recovering every missing seq reconciles the whole marker', async t => {
+  const { store } = await fixture(t);
+  await store.record('probe.a', { sessionID: 's1' }, { i: 1 });
+  await store.record('probe.a', { sessionID: 's1' }, { i: 2 });
+  await craft(store, 's1', { event_schema: 2, session_seq: 5 }); // gap 3..4
+  await store.coverage.flushPending();
+  await craft(store, 's1', { event_schema: 2, session_seq: 4 });
+  await craft(store, 's1', { event_schema: 2, session_seq: 3 }); // out-of-order backfill
+  await store.coverage.flushPending();
+  const payloads = [];
+  for (const m of store.findEntriesAll({ type: 'trace.capture_gap' })) payloads.push(JSON.parse(await store.readBlob(m.payloadRef)));
+  assert.ok(payloads.some(p => p.status === 'detected'), 'original marker preserved');
+  assert.ok(payloads.some(p => p.status === 'reconciled'), 'full reconciliation recorded');
+  assert.equal(store.coverage.statusFor('s1').session_coverage.status, 'complete');
+  assert.equal(store.coverage.statusFor('s1').session_coverage.unresolved_seqs, 0);
+});
+
+test('3A-multi: out-of-order backfill across a wide gap splits ranges correctly', async t => {
+  const { store } = await fixture(t);
+  await store.record('probe.a', { sessionID: 's1' }, { i: 1 });
+  await craft(store, 's1', { event_schema: 2, session_seq: 8 }); // gap 2..7
+  await store.coverage.flushPending();
+  await craft(store, 's1', { event_schema: 2, session_seq: 5 }); // middle -> [2..4] [6..7]
+  await store.coverage.flushPending();
+  let scoped = store.coverage.statusFor('s1');
+  assert.equal(scoped.session_coverage.unresolved_seqs, 5);
+  await craft(store, 's1', { event_schema: 2, session_seq: 2 }); // head
+  await craft(store, 's1', { event_schema: 2, session_seq: 7 }); // tail (out of order)
+  await store.coverage.flushPending();
+  scoped = store.coverage.statusFor('s1');
+  assert.equal(scoped.session_coverage.unresolved_seqs, 3, 'only 3,4,6 remain');
+});
+
+test('3B: gap markers advance the watermark (marker seq never looks missing)', async t => {
+  const { store } = await fixture(t);
+  // Ten ordinary events allocated through the allocator: seqs 1..10.
+  for (let s = 1; s <= 10; s++) await store.record('probe.a', { sessionID: 'sM' }, { n: s });
+  // A known loss at 7..8 recorded explicitly (simulating detected capture loss).
+  store.coverage.noteGap({ session: 'sM', from_seq: 7, to_seq: 8, reason: 'capture_gap', component: 'sequence' });
+  // The durable marker event itself is allocated the next session_seq (11).
+  const marker = await store.record('trace.capture_gap', { sessionID: 'sM' }, { session: 'sM', reason: 'capture_gap', ranges: [{ from: 7, to: 8 }], status: 'detected' }, { session: 'sM' });
+  assert.equal(marker.session_seq, 11, 'marker occupies the next allocator slot');
+  // Ordinary seq 12 afterwards must NOT be reported as missing 11.
+  const after = await store.record('probe.a', { sessionID: 'sM' }, { afterMarker: true });
+  assert.equal(after.session_seq, 12);
+  await store.coverage.flushPending();
+  const gapPayloads = [];
+  for (const m of store.findEntriesAll({ type: 'trace.capture_gap', session: 'sM' })) gapPayloads.push(JSON.parse(await store.readBlob(m.payloadRef)));
+  const claimsMissing11 = gapPayloads.some(p => (p.ranges ?? []).some(r => r.from <= 11 && r.to >= 11));
+  assert.equal(claimsMissing11, false, 'seq 11 is the durable marker event, not a gap');
+  const lossMarker = gapPayloads.find(p => (p.ranges ?? []).some(r => r.from === 7 && r.to === 8));
+  assert.ok(lossMarker, 'the genuinely-detected 7..8 loss stays recorded');
+});
+
+test('3C: coverage is session-scoped; unrelated stale sessions do not poison queries', async t => {
+  const { trace, store } = await fixture(t);
+  await store.record('probe.a', { sessionID: 'fresh' }, { i: 1 });
+  await craft(store, 'stale-legacy', { event_schema: 2, session_seq: 99 }); // old loss elsewhere
+  await store.coverage.flushPending();
+  const found = await trace.find({ text: 'no-such-thing-913', session: 'fresh' });
+  assert.equal(found.coverage.capture.session_coverage.status, 'complete', 'fresh session queries are complete');
+  assert.equal(found.coverage.capture.workspace_global.status, 'incomplete', 'global uncertainty remains visible');
+});
+
+test('C4: watcher overflow becomes counted, durable workspace-global evidence', async t => {
   const { store } = await fixture(t);
   store.noteWatcherMiss();
   store.noteWatcherMiss();
   await store.coverage.flushPending();
   assert.equal(store.missedWatchEvents, 2);
   assert.equal(store.coverage.counters.missed_watcher_total, 2);
-  assert.equal(store.coverage.status().known_gaps >= 1, true, 'watcher gap marker present (deduped)');
+  assert.equal(store.coverage.statusFor('any-session').workspace_global.known_gaps >= 1, true, 'watcher gap marker present (deduped)');
 });
 
 test('C5: writer failure keeps the marker pending, then flush recovers it', async t => {
@@ -87,31 +180,10 @@ test('C5: writer failure keeps the marker pending, then flush recovers it', asyn
   await store.coverage.flushPending();
   const markers = store.findEntriesAll({ type: 'trace.capture_gap', session: 'sC5' });
   assert.equal(markers.length, 1, 'marker survived the writer failure via pending retry');
-  assert.equal(store.coverage.status().known_gaps, 1);
+  assert.equal(store.coverage.statusFor('sC5').session_coverage.known_gaps, 1);
 });
 
-test('C6: reconciliation keeps the original marker and adds a follow-up', async t => {
-  const { store } = await fixture(t);
-  await store.record('probe.a', { sessionID: 's1' }, { i: 1 });
-  await store.record('probe.a', { sessionID: 's1' }, { i: 2 });
-  await craft(store, 's1', { event_schema: 2, session_seq: 5 }); // gap 3..4
-  await store.coverage.flushPending();
-  await craft(store, 's1', { event_schema: 2, session_seq: 3 }); // backfill one missing seq
-  await store.coverage.flushPending();
-  const markers = store.findEntriesAll({ type: 'trace.capture_gap' });
-  const payloads = [];
-  for (const m of markers) payloads.push(JSON.parse(await store.readBlob(m.payloadRef)));
-  const detected = payloads.filter(p => p.status === 'detected');
-  const reconciled = payloads.filter(p => p.status === 'reconciled');
-  assert.equal(detected.length, 1, 'original gap marker preserved (never deleted)');
-  assert.equal(reconciled.length, 1, 'reconciliation recorded as follow-up evidence');
-  assert.equal(reconciled[0].reconciles_seq, 3);
-  const status = store.coverage.status();
-  assert.equal(status.known_gaps, 0, 'range 3..4 partially reconciled at seq 3 leaves no unresolved whole-marker');
-  assert.equal(status.reconciled_gaps, 1);
-});
-
-test('C7: restart rebuilds coverage state from durable markers', async t => {
+test('C7: restart rebuilds coverage state from durable markers (ranges preserved)', async t => {
   const { store, dir } = await fixture(t);
   await store.record('probe.a', { sessionID: 's1' }, { i: 1 });
   await craft(store, 's1', { event_schema: 2, session_seq: 9 }); // gap 2..8
@@ -119,39 +191,10 @@ test('C7: restart rebuilds coverage state from durable markers', async t => {
   store.close();
   const store2 = await new Store(path.join(dir), path.join(dir, 'store')).init();
   try {
-    const status = store2.coverage.status();
-    assert.equal(status.status, 'incomplete', 'coverage survives restart via durable markers');
-    assert.equal(status.known_gaps, 1);
+    const scoped = store2.coverage.statusFor('s1');
+    assert.equal(scoped.session_coverage.status, 'incomplete');
+    assert.deepEqual(scoped.session_coverage.known_gaps, 1);
   } finally { store2.close(); }
-});
-
-test('C8: no-match with complete coverage says so', async t => {
-  const { trace } = await fixture(t);
-  const found = await trace.find({ text: 'no-such-marker-xyz-42' });
-  assert.deepEqual(found.matches ?? found.results, []);
-  assert.equal(found.coverage.capture.status, 'complete');
-});
-
-test('C9: no-match with known gaps refuses to establish absence', async t => {
-  const { trace, store } = await fixture(t);
-  await store.record('probe.a', { sessionID: 's1' }, { i: 1 });
-  await craft(store, 's1', { event_schema: 2, session_seq: 9 });
-  await store.coverage.flushPending();
-  const found = await trace.find({ text: 'no-such-marker-xyz-42' });
-  assert.deepEqual(found.matches ?? found.results, []);
-  assert.equal(found.coverage.capture.status, 'incomplete');
-  assert.ok(found.coverage.capture.known_gaps >= 1);
-});
-
-test('C10/C11: trace_status exposes capture_coverage for Reviewer/Supervisor consumption', async t => {
-  const { trace, store } = await fixture(t);
-  await store.record('probe.a', { sessionID: 's1' }, { i: 1 });
-  await craft(store, 's1', { event_schema: 2, session_seq: 7 });
-  await store.coverage.flushPending();
-  const status = await definitions(trace).find(d => d.name === 'trace_status').execute({}, host());
-  assert.equal(status.metadata.raw.ok, true);
-  assert.equal(status.metadata.raw.capture_coverage.status, 'incomplete');
-  assert.ok(status.metadata.raw.capture_coverage.known_gaps >= 1);
 });
 
 test('C12: V2-A handles unaffected by coverage machinery', async t => {
@@ -162,14 +205,22 @@ test('C12: V2-A handles unaffected by coverage machinery', async t => {
   assert.equal(trace.handles.resolve('s1', 'e1').ok, true);
 });
 
-test('C13: runtime-context stays late; capture warning appears only when incomplete', async t => {
-  const { trace } = await fixture(t);
+test('C13: runtime-context stays late; scoped warning compact when incomplete', async t => {
+  const { trace, store } = await fixture(t);
   const clean = await trace.context({ sessionID: 's1', messages: [], agent: 'build', model: { providerID: 'local-qwen-auto', id: '27b-dense' } });
   assert.match(clean.recall, /^OPENCODE_TRACE_RECALL_V1/);
   assert.equal(clean.snapshot.capture_coverage, undefined, 'no coverage noise when complete');
-  await craft(trace.store, 's1', { event_schema: 2, session_seq: 9, __jump: true });
-  await trace.store.coverage.flushPending();
+  await craft(store, 's1', { event_schema: 2, session_seq: 9 });
+  await store.coverage.flushPending();
   const warned = await trace.context({ sessionID: 's1', messages: [], agent: 'build', model: { providerID: 'local-qwen-auto', id: '27b-dense' } });
   assert.match(warned.recall, /^OPENCODE_TRACE_RECALL_V1/);
-  assert.ok(warned.snapshot.capture_coverage?.status === 'incomplete' || warned.recall.includes('incomplete'), 'compact warning when incomplete');
+  assert.equal(warned.snapshot.capture_coverage?.status, 'incomplete');
+});
+
+test('status tool exposes scoped capture_coverage', async t => {
+  const { trace } = await fixture(t);
+  const status = await definitions(trace).find(d => d.name === 'trace_status').execute({}, host());
+  assert.equal(status.metadata.raw.ok, true);
+  assert.ok(status.metadata.raw.capture_coverage.session === 's1');
+  assert.equal(typeof status.metadata.raw.capture_coverage.session_coverage.status, 'string');
 });

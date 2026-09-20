@@ -13,6 +13,8 @@ import { DatabaseSync } from 'node:sqlite';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
 
+const SCHEMA_VERSION = 2; // bump when the projection (columns/FTS shape) changes -> rebuild
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS events (
   ref TEXT PRIMARY KEY, session TEXT, seq INTEGER, at INTEGER, type TEXT,
@@ -42,27 +44,35 @@ export class DerivedIndex {
       await fs.mkdir(this.dir, { recursive: true, mode: 0o700 });
       this.db = new DatabaseSync(path.join(this.dir, 'index.db'));
       this.db.exec(SCHEMA);
+      const version = this.db.prepare("SELECT v FROM meta WHERE k='schema_version'").get()?.v ?? null;
       this.persistedCount = Number(this.db.prepare("SELECT v FROM meta WHERE k='cas_count'").get()?.v ?? 0);
+      this.staleVersion = version !== null && Number(version) !== SCHEMA_VERSION;
       this.state = 'ready';
-      return true;
+      return !this.staleVersion;
     } catch (error) {
       this.db = null; this.state = 'error'; this.error = String(error?.message ?? error).slice(0, 200);
       return false;
     }
   }
 
-  /** Write-through upsert from store.indexEvent. Degrades to memory-only. */
+  /** Write-through upsert from store.indexEvent. Degrades to memory-only.
+   *  One logical FTS row per ref (delete-before-insert — FTS5 rows are not
+   *  unique by ref, so repeated upserts must not grow duplicate rows); the
+   *  cas_count watermark counts UNIQUE indexed refs, not upsert calls. */
   upsert(entry) {
     if (!this.db || this.state === 'error') return;
     try {
       const text = [entry.type, entry.tool ?? '', entry.status ?? '', ...(entry.hints ?? [])].join(' ').slice(0, 4000);
+      const known = this.db.prepare('SELECT 1 FROM events WHERE ref = ?').get(entry.ref);
       this.db.prepare('INSERT OR REPLACE INTO events (ref, session, seq, at, type, tool, status, path, caused_by, previous, parent, payload_ref, json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
         .run(entry.ref, entry.sessionID, entry.seq, entry.at, entry.type, entry.tool ?? null, entry.status ?? null,
           entry.source?.path ?? entry.source?.filePath ?? (Array.isArray(entry.paths) ? entry.paths[0] : null),
           entry.causedBy ?? null, entry.previous ?? null, entry.parent ?? null, entry.payloadRef,
           JSON.stringify({ ...entry, hints: entry.hints ?? [] }));
-      this.db.prepare('INSERT OR REPLACE INTO events_fts (ref, text) VALUES (?,?)').run(entry.ref, text);
-      this.db.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('cas_count', ?)").run(String(++this.persistedCount));
+      this.db.prepare('DELETE FROM events_fts WHERE ref = ?').run(entry.ref);
+      this.db.prepare('INSERT INTO events_fts (ref, text) VALUES (?,?)').run(entry.ref, text);
+      if (!known) this.persistedCount++; // unique indexed refs, never upsert-call count
+      this.db.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('cas_count', ?)").run(String(this.persistedCount));
     } catch (error) {
       this.state = 'error'; this.error = String(error?.message ?? error).slice(0, 200);
       try { this.db?.close(); } catch {}
@@ -91,9 +101,11 @@ export class DerivedIndex {
           n++;
         }
         this.db.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('cas_count', ?)").run(String(n));
+        this.db.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
+        this.db.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('built_at', ?)").run(String(Date.now()));
         this.db.exec('COMMIT');
         this.state = 'ready'; this.error = null; this.rebuilds++; this.persistedCount = n;
-        return { rebuilt: true, indexed: n };
+        return { rebuilt: true, indexed: n, schema_version: SCHEMA_VERSION };
       } catch (error) { this.db.exec('ROLLBACK'); throw error; }
     } catch (error) {
       this.state = 'error'; this.error = String(error?.message ?? error).slice(0, 200);
@@ -131,10 +143,9 @@ export class DerivedIndex {
 
   status() {
     const memory = this.store.index.size;
-    let persisted = null;
-    if (this.db && this.state === 'ready') {
-      try { persisted = Number(this.db.prepare("SELECT v FROM meta WHERE k='cas_count'").get()?.v ?? 0); } catch {}
-    }
+    // Last-known mirror watermark (in-memory, survives db handle loss) so a
+    // suppressed/failing writer still reports honest lag instead of null.
+    const persisted = this.persistedCount ?? null;
     return {
       enabled: !!this.db, state: this.state, error: this.error, rebuilds: this.rebuilds,
       indexed_through: persisted, memory_events: memory,

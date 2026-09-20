@@ -103,8 +103,13 @@ export class Store {
     // after the disposable index file was deleted/corrupted).
     this.derivedIndex = new DerivedIndex(this, path.join(this.root, 'derived'));
     if (await this.derivedIndex.open()) {
-      const persisted = Number(this.derivedIndex.db?.prepare("SELECT v FROM meta WHERE k='cas_count'").get()?.v ?? -1);
-      if (persisted !== this.index.size) await this.derivedIndex.rebuild();
+      // Count OR projection-version mismatch forces a disposable rebuild.
+      if (this.derivedIndex.staleVersion || this.derivedIndex.persistedCount !== this.index.size) await this.derivedIndex.rebuild();
+    } else {
+      // e.g. stale schema version refused by open(): wipe and start clean.
+      await fs.rm(path.join(this.root, 'derived'), { recursive: true, force: true });
+      this.derivedIndex = new DerivedIndex(this, path.join(this.root, 'derived'));
+      if (await this.derivedIndex.open()) await this.derivedIndex.rebuild();
     }
     await atomic(path.join(this.root, 'state', 'schema.json'), stable({ schema: 1, workspace: this.workspace, workspaceID: this.workspaceID }));
     return this;

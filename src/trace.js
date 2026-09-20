@@ -7,6 +7,7 @@ import { compactGuidance, compactions, saveCompact } from './compact.js';
 import { normalizeTraceIntentInput } from './normalization.js';
 import { validateNoteInput, isAffirmativeState, hasExplicitFailure } from './note-validation.js';
 import { HandleRegistry, assignSnapshotHandles, renderEvidenceHandles, HANDLE_PATTERN, handleFailureMessage } from './handles.js';
+import { TokenCounter, DEFAULT_TOKEN_BUDGET } from './tokens.js';
 
 const NOTE_KINDS = ['fact', 'finding', 'decision', 'unresolved', 'handoff', 'correction'];
 const MILESTONE_KINDS = ['decision', 'state_change', 'verification', 'blocker', 'correction', 'handoff', 'baseline'];
@@ -209,6 +210,7 @@ export class Trace {
     this.ctx = ctx; this.options = options; this.errors = 0; this.hydrated = new Set(); this.hydrating = new Map(); this.messageSeen = new Set(); this.compactSeen = new Set();
     this.contextBindings = new Map();
     this.handles = new HandleRegistry();
+    this.tokens = new TokenCounter(this.options); // Phase E: local tokenizer/estimator
     this.intentFailures = new Map();
     this.observerJobs = new Set(); this.maxObserverJobs = 8; this.droppedObservations = 0;
     this.warning = (where, error) => {
@@ -842,27 +844,68 @@ export class Trace {
       return prefix + stable(view) + activeSection + handlesSection + staticGuidance;
     };
     // Structural priorities only, no classification of shell text or semantic keywords.
-    while (bytes(render()) > ceiling) {
-      if (view.peers.length) view.peers.pop();
-      else if (view.recent.length) view.recent.shift();
-      else if (view.notes.length) view.notes.shift();
-      else if (view.advisories.length) view.advisories.shift();
-      else if (view.unresolved.length > 1) view.unresolved.shift();
-      else if (view.current_intent && !view.current_intent.omitted) view.current_intent = { ref: view.current_intent.ref, status: view.current_intent.status, omitted: true };
-      else if (view.unresolved.length && !view.unresolved[0].omitted) view.unresolved[0] = { ref: view.unresolved[0].ref, source_refs: view.unresolved[0].source_refs, omitted: true };
-      else if (view.active_memory && !view.active_memory.omitted) view.active_memory = { current_state: view.active_memory.current_state, next_action: view.active_memory.next_action, omitted: true };
-      else if (view.compact && !view.compact.omitted) view.compact = { ref: view.compact.ref, refs: view.compact.refs.slice(0, 8), omitted: true };
-      else { view.workspace = '(see trace_status)'; break; }
+    // Phase E: semantic-priority trimming against a token budget (the estimator
+    // is deterministic and local; the exact local-tokenizer count is recorded
+    // per request in context()). CRITICAL floor: goal/state/blockers/handoff
+    // and the newest note survive; display sugar drops first. The byte ceiling
+    // remains a hard safety net behind the token budget.
+    const tokenBudget = Number(this.options.runtimeContextTokenBudget) > 0
+      ? Number(this.options.runtimeContextTokenBudget) : DEFAULT_TOKEN_BUDGET;
+    const dropped = [];
+    const pruneSteps = [
+      ['evidence_handles', () => (view.evidence_handles?.length ? (view.evidence_handles.pop(), true) : false)],
+      ['peers', () => (view.peers.length ? (view.peers.pop(), true) : false)],
+      ['recent', () => (view.recent.length ? (view.recent.shift(), true) : false)],
+      ['unresolved_old', () => (view.unresolved.length > 1 ? (view.unresolved.shift(), true) : false)],
+      ['unresolved_oversized', () => (view.unresolved.length && !view.unresolved[0].omitted ? (view.unresolved[0] = { ref: view.unresolved[0].ref, source_refs: view.unresolved[0].source_refs, omitted: true }, true) : false)],
+      ['notes_old', () => (view.notes.length > 1 ? (view.notes.shift(), true) : false)],
+      ['advisories', () => (view.advisories.length ? (view.advisories.shift(), true) : false)],
+      ['intent_detail', () => (view.current_intent && !view.current_intent.omitted ? (view.current_intent = { ref: view.current_intent.ref, status: view.current_intent.status, omitted: true }, true) : false)],
+      ['compact_detail', () => (view.compact && !view.compact.omitted ? (view.compact = { ref: view.compact.ref, refs: view.compact.refs.slice(0, 8), omitted: true }, true) : false)],
+      ['active_memory_refs', () => {
+        const am = view.active_memory;
+        if (!am || am.omitted) return false;
+        if ((am.evidence_refs?.length ?? 0) > 4 || (am.do_not_repeat?.length ?? 0) > 4 || (am.latest_decisions?.length ?? 0) > 2) {
+          am.evidence_refs = (am.evidence_refs ?? []).slice(0, 4);
+          am.do_not_repeat = (am.do_not_repeat ?? []).slice(0, 4);
+          am.latest_decisions = (am.latest_decisions ?? []).slice(0, 2);
+          return true;
+        }
+        return false;
+      }],
+    ];
+    let guard = 0;
+    while (this.tokens.estimate(render()) > tokenBudget && guard++ < 400) {
+      const step = pruneSteps.find(([, drop]) => drop());
+      if (!step) break;
+      dropped.push(step[0]);
     }
+    // Byte ceiling hard safety net behind the token budget (estimator drift).
+    if (bytes(render()) > ceiling) {
+      let byteGuard = 0;
+      while (bytes(render()) > ceiling && byteGuard++ < 400) {
+        const step = pruneSteps.find(([, drop]) => drop());
+        if (!step) break;
+        dropped.push(step[0]);
+      }
+      if (bytes(render()) > ceiling) {
+        // CRITICAL floor: keep goal/state/handoff instead of empty truncation.
+        const minimal = { sessionID: sid, active_memory: view.active_memory, current_intent: view.current_intent,
+          capture_coverage: view.capture_coverage, recall_truncated: true, retrieve: 'trace_status' };
+        const mtext = `${prefix}${stable(minimal)}${staticGuidance}`;
+        const msnapshot = JSON.parse(stable(minimal));
+        if (bytes(mtext) <= ceiling) return { text: mtext, snapshot: msnapshot, assignments: assignSnapshotHandles(minimal) };
+        const snapshot = { sessionID: sid, recall_truncated: true, retrieve: 'trace_status' };
+        return { text: `${prefix}${stable(snapshot)}${staticGuidance}`, snapshot, assignments: [] };
+      }
+    }
+    view.context_budget = { unit: 'tokens', budget: tokenBudget, estimated: this.tokens.estimate(render()),
+      mode: this.tokens.mode, dropped: [...new Set(dropped)] };
     // Handles are assigned AFTER trimming so the mapping describes exactly
     // what this snapshot shows the model. Assignment is a pure function of
     // the final view; handle rows are the first content dropped on overflow.
     const assignments = assignSnapshotHandles(view);
-    let text = render();
-    while (bytes(text) > ceiling && view.evidence_handles.length) {
-      view.evidence_handles.pop();
-      text = render();
-    }
+    const text = render();
     if (bytes(text) > ceiling) {
       const snapshot = { sessionID: sid, recall_truncated: true, retrieve: 'trace_status' };
       return { text: `${prefix}${stable(snapshot)}${staticGuidance}`, snapshot, assignments: [] };
@@ -885,6 +928,8 @@ export class Trace {
     // its tool calls, replaced by the next request. Durable state keeps only
     // canonical refs; the handle -> ref mapping is process-memory only.
     this.handles.newGeneration(e.sessionID, assignments ?? []);
+    // Phase E receipt: exact local-tokenizer count when the endpoint is up.
+    if (snapshot?.context_budget) snapshot.context_budget.tokens_exact = await this.tokens.count(recall).catch(() => null);
     const ids = (e.messages ?? []).map(messageID).filter(Boolean);
     // The exact messages are durable message.persisted events above. Avoid
     // copying the cumulative ID prefix on every turn (quadratic storage).
@@ -936,11 +981,11 @@ export class Trace {
     // Bounded catch-up so a query never silently misses events written by
     // other processes since the last context hook.
     const reconcile = await this.store.reconcile();
-    const coverage = this.indexCoverage(reconcile);
     if (!deep) {
       const rows = this.store.findEntries(f, cursor ? { at: cursor.at, ref: cursor.ref } : null, limit + 1);
       const truncated = rows.length > limit;
       const last = truncated ? rows[limit - 1] : null;
+      const coverage = this.indexCoverage(reconcile, f.session);
       const results = rows.slice(0, limit).map(e => this.formatEntry(e, f.text));
       // Phase D: FTS fallback recall for text queries whose hint match missed
       // (multi-token matching over the persisted mirror). Candidates are
@@ -1019,6 +1064,7 @@ export class Trace {
       }
     }
     const exhausted = reachedStart && !brokeEarly && scannedBytes < budget;
+    const coverage = this.indexCoverage(reconcile, f.session);
     const priorFailures = Number.isInteger(cursor?.failed_blobs) ? cursor.failed_blobs : 0;
     const hitHandles = this.attachDiscoveryHandles(host, hits, 'event_ref');
     return { mode: 'deep', query: { ...f }, hits,
@@ -1143,7 +1189,7 @@ export class Trace {
       callKey: e.callKey ?? null, paths: e.paths ?? null, source: e.source ?? null,
       payload_ref: e.payloadRef, bytes: e.bytes, outputs: e.outputs.slice(0, 4), rels: e.rels.slice(0, 8), ...(hit ? { hit } : {}) };
   }
-  indexCoverage(reconcile) {
+  indexCoverage(reconcile, session = null) {
     let oldest = null, newest = null;
     for (const e of this.store.index.values()) {
       if (oldest === null || e.at < oldest) oldest = e.at;
@@ -1151,7 +1197,7 @@ export class Trace {
     }
     return { indexed_events: this.store.index.size, oldest_at: oldest, newest_at: newest, watcher: this.store.watcherState,
       catch_up: reconcile, pending_watcher_jobs: this.store.watchJobs.size, missed_watcher_notifications: this.store.missedWatchEvents,
-      capture: this.store.coverage.status(),
+      capture: session ? this.store.coverage.statusFor(session) : this.store.coverage.status(),
       derived: this.store.derivedIndex?.status?.() ?? { enabled: false, state: 'absent' },
       note: 'Index is derived, memory-only and rebuilt from authoritative events at startup. It covers exactly the events this process has ingested; use queries to catch up.' };
   }
