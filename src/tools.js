@@ -1,0 +1,151 @@
+const str = { type: 'string' };
+const refs = { type: 'array', items: str, maxItems: 16 };
+const schema = (properties, required = []) => ({ type: 'object', properties, required, additionalProperties: false });
+import { present, boundedRaw } from './present.js';
+import { normalizeTraceIntentInput } from './normalization.js';
+// P1 presentation: content is human Markdown + a fenced machine block (the
+// host persists content and the model reads it — Phase 0 spike); the raw
+// structured value rides in metadata.raw, size-bounded for host delivery.
+const result = async (name, value, trace) => {
+  const json = JSON.stringify(value);
+  const shown = present(name, value);
+  // The host truncates at 50 KiB / 2000 lines. Store a large response before
+  // delivery, so refs, pagination and coverage cannot disappear from its tail.
+  const oversized = Buffer.byteLength(shown.content, 'utf8') > 24000 || shown.content.split('\n').length > 1500;
+  const stored = oversized ? await trace.store.blob(value, 'json') : null;
+  const retrieval = stored ? { result_ref: stored.ref, result_sha256: stored.sha256, result_bytes: stored.bytes } : {};
+  const content = stored
+    ? `### ${shown.title}\n\nFull structured result stored without loss. Retrieve with trace_expand(ref="${stored.ref}", limit=2048); follow next_offset until null.\n\n` +
+      '```json\n' + JSON.stringify({ ok: value.ok, ...retrieval, presentation_omitted: true, next_cursor: value.next_cursor, next_offset: value.next_offset }, null, 2) + '\n```'
+    : shown.content;
+  return { title: shown.title, output: content, content, metadata: { opencode_trace: true, title: shown.title, ...retrieval, raw: boundedRaw(value, json) } };
+};
+
+export function definitions(trace) {
+  const tool = (name, description, input, fn) => ({ name, description, input, output: { type: 'object', additionalProperties: true },
+    options: { codemode: false, permission: name },
+    async execute(input, host) {
+      try {
+        await trace.ready;
+        if (!host?.sessionID) throw new Error('Host session identity unavailable');
+        return await result(name, { ok: true, ...await fn(input, host) }, trace);
+      } catch (error) {
+        trace.warning(name, error);
+        if (name === 'trace_intent' && host?.sessionID) {
+          trace.recordIntentFailure(host.sessionID, error, input);
+        }
+        return result(name, { ok: false, error: String(error.message ?? error.code ?? 'Trace unavailable').slice(0, 320), native_execution: 'unaffected' }, trace);
+      }
+    }
+  });
+  return [
+    tool('trace_note', 'Save a concise durable decision, constraint, failure cause, blocker/next action, finding, handoff or structured milestone; skip routine logs. Cite evidence and label uncertainty; empty source_refs provides no corroboration. After verified correction/resolution, supersede your old note. Host supplies identity. Supply kind and text (summary is a compatibility alias), or milestone.kind and milestone.summary.',
+      schema({
+        kind: { enum: ['fact', 'finding', 'decision', 'unresolved', 'handoff', 'correction'] },
+        text: { ...str, maxLength: 4096, description: 'Note body, at most 4096 UTF-8 bytes.' },
+        summary: { ...str, maxLength: 4096, description: 'Compatibility alias for text. Prefer text; if both are supplied they must match.' },
+        source_refs: refs,
+        supersedes: { ...refs, description: 'Your prior note refs, verified corrected/resolved. Hides from active recall, preserves history; never close still-open issues.' },
+        depends_on: refs,
+        milestone: schema({
+          kind: { enum: ['decision', 'state_change', 'verification', 'blocker', 'correction', 'handoff', 'baseline'] },
+          summary: { ...str, maxLength: 2048 },
+          what_changed: { ...str, maxLength: 2048 },
+          why_it_matters: { ...str, maxLength: 2048 },
+          current_state: { ...str, maxLength: 1024 },
+          decision: { ...str, maxLength: 2048 },
+          evidence_refs: refs,
+          unresolved: { type: 'array', items: str, maxItems: 16 },
+          next_action: { ...str, maxLength: 2048 },
+          do_not_repeat: { type: 'array', items: { ...str, maxLength: 256 }, maxItems: 16 },
+          supersedes: refs,
+          depends_on: refs,
+          to_session: { ...str, maxLength: 256, description: 'Explicit target session ID for handoff.' },
+          to_worker: { ...str, maxLength: 256, description: 'Explicit target worker role or agent name.' },
+          task_ref: { ...str, maxLength: 256, description: 'Shared task ID or plan ID for handoff binding.' },
+          handoff_id: { ...str, maxLength: 256, description: 'Shared handoff token or transfer ID.' },
+          continuation_of: { ...str, maxLength: 256, description: 'Session ID or note ref this session continues.' }
+        }, ['kind'])
+      }), (i, h) => trace.note(i, h)),
+    tool('trace_expand', 'Read exact stored evidence, not current files. metadata_only inspects refs; text_blobs hold tool text, payload_ref the event JSON. Default 2048 bytes, max 24000. Follow next_offset until null; repeated pages add nothing. SHA-256 verifies the whole blob; base64 preserves split byte boundaries.',
+      schema({ ref: str, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 24000 }, metadata_only: { type: 'boolean' } }, ['ref']), i => trace.store.expand(i.ref, i.offset, i.limit, i.metadata_only)),
+    tool('trace_find', 'Search all ingested history; return snippets/refs for trace_expand. text searches capped hints; deep scans exact bytes with a budget and resumable cursor. External operations may be absent; no match does not prove absence.',
+      schema({
+        type: { anyOf: [{ type: 'string' }, { type: 'array', items: str, maxItems: 8 }] },
+        session: { ...str, description: 'Host sessionID whose captured event history to search, including another worker session.' }, agent: str, tool: str, status: str,
+        call_key: str, ref: str, related: str, path: str, text: str,
+        thread: str, message: str, recipient: str, reply_to: str, proposal: str,
+        plan: str, step: str, worker: { ...str, description: 'Plan-bound worker session filter for trace_plan step records only. Use session for general tool/message history.' }, attempt_id: str,
+        deep: { type: 'boolean' }, deep_budget_bytes: { type: 'integer', minimum: 1024, maximum: 16777216 },
+        after: { type: 'number', minimum: 0 }, before: { type: 'number', minimum: 0 },
+        limit: { type: 'integer', minimum: 1, maximum: 100 }, cursor: str,
+      }), i => trace.find(i)),
+    tool('trace_send', 'Persist then deliver to observed workspace sessions through the host prompt queue/steer boundary. Host supplies sender. Receipts distinguish persisted, host_admitted, failed and uncertain. accept/reject/counter require an explicit proposal or counter message id.',
+      schema({
+        to: { type: 'array', items: str, minItems: 1, maxItems: 8 },
+        text: { ...str, maxLength: 16384 },
+        type: { enum: ['question', 'proposal', 'objection', 'counter', 'evidence', 'accept', 'reject', 'withdraw', 'handoff', 'note'] },
+        thread_id: str, in_reply_to: str, proposal: str,
+        delivery: { enum: ['steer', 'queue'] },
+        source_refs: refs,
+      }, ['to', 'text']), (i, h) => trace.send(i, h)),
+    tool('trace_inbox', 'Page sent/received messages; keep thread filter with next_cursor (max 96/page). Evidence: persisted, host_admitted, context_observed (native peer metadata only), recipient_ack, reply_recorded. Receipt is not agreement. sweep retries only missing delivery records; uncertain admissions require manual choice.',
+      schema({ thread_id: str, sweep: { type: 'boolean' }, limit: { type: 'integer', minimum: 1, maximum: 96 }, cursor: str }), (i, h) => trace.inbox(i, h)),
+    tool('trace_ack', 'Acknowledge receipt of one trace message; never agreement or completion.',
+      schema({ message_id: str }, ['message_id']), (i, h) => trace.ack(i, h)),
+    tool('trace_step_result', 'Report your bound plan step outcome. Host supplies identity/plan/step. Denied or failed operations mean failure; dependents require worker-reported success. A settled turn alone is outcome unknown.',
+      schema({ status: { enum: ['success', 'failure'] }, summary: { ...str, maxLength: 2048 }, source_refs: refs }, ['status']), (i, h) => trace.stepResult(i, h)),
+    tool('trace_plan', 'Run up to 8 dependency-ordered steps in fresh native sessions; independent steps fan out. Inherit effective model/variant/agent; explicit step.agent must exist and honors its model. Read back bindings before prompting; unavailable/mismatched bindings fail closed. Dependents require trace_step_result success, not merely a settled turn. Reuse terminal steps; retry_failed retries terminal non-success only. Concurrent/unterminated attempts return in_flight_unknown and are never duplicated. Plan identity is caller-scoped; acceptance does not complete the parent task.',
+      schema({
+        steps: { type: 'array', minItems: 1, maxItems: 8, items: schema({
+          id: { ...str, pattern: '^[a-z0-9_-]{1,32}$' },
+          text: { ...str, maxLength: 4096 },
+          depends_on: { type: 'array', items: str, maxItems: 8 },
+          agent: str,
+        }, ['id', 'text']) },
+        retry_failed: { type: 'boolean' },
+      }, ['steps']), (i, h) => trace.plan(i, h)),
+    tool('trace_intent', 'Declare your current intent and explicit paths/resources. Overlap produces advisory information only. Update to done/cancelled when finished.',
+      schema({
+        summary: str,
+        paths: {
+          anyOf: [
+            { type: 'array', items: str, maxItems: 64 },
+            { type: 'string' },
+            { type: 'null' }
+          ]
+        },
+        resources: {
+          anyOf: [
+            { type: 'array', items: str, maxItems: 32 },
+            { type: 'string' },
+            { type: 'null' }
+          ]
+        },
+        status: { enum: ['active', 'waiting', 'done', 'cancelled'] },
+        related_refs: refs,
+        attempt: { type: 'integer', minimum: 1 },
+        recovered: { type: 'boolean' },
+        previous_error: str
+      }, ['status']), async (i, h) => {
+        const recovery = h?.sessionID ? trace.consumeIntentRecovery(h.sessionID) : null;
+        const normalized = normalizeTraceIntentInput({
+          ...i,
+          ...(recovery ?? {})
+        });
+        return trace.intent(normalized, h);
+      }),
+    tool('trace_status', 'Page memory, peer declarations and historical lifecycle observations with source refs and degradation counters. Display limits do not limit peer checks. include_storage counts files/bytes; no retention/quota.',
+      schema({ peer_offset: { type: 'integer', minimum: 0 }, peer_limit: { type: 'integer', minimum: 1, maximum: 64 }, include_storage: { type: 'boolean' } }), async (i, h) => {
+        const offset = i.peer_offset ?? 0, limit = i.peer_limit ?? 8;
+        if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 64) throw new Error('Invalid peer page');
+        await trace.store.reconcile();
+        await trace.hydrate(h.sessionID);
+        return { ...trace.projection(h.sessionID, offset, limit), store: trace.store.root, errors: trace.errors,
+          observer: { outstanding_jobs: trace.observerJobs.size, maximum_jobs: trace.maxObserverJobs,
+            dropped_observations: trace.droppedObservations, watcher_jobs: trace.store.watchJobs.size,
+            maximum_watcher_jobs: trace.store.maxWatchJobs, missed_watcher_notifications: trace.store.missedWatchEvents, watcher: trace.store.watcherState },
+          ...(i.include_storage ? { storage: await trace.store.storageUsage() } : {}) };
+      })
+  ];
+}
