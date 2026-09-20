@@ -942,6 +942,16 @@ export class Trace {
       const truncated = rows.length > limit;
       const last = truncated ? rows[limit - 1] : null;
       const results = rows.slice(0, limit).map(e => this.formatEntry(e, f.text));
+      // Phase D: FTS fallback recall for text queries whose hint match missed
+      // (multi-token matching over the persisted mirror). Candidates are
+      // discovery only; verified bytes always come from trace_expand.
+      if (f.text && results.length < limit) {
+        for (const ref of this.store.derivedIndex?.ftsCandidates?.(f.text, 100) ?? []) {
+          if (results.length >= limit || results.some(r => r.ref === ref)) continue;
+          const entry = this.store.index.get(ref);
+          if (entry && this.store.matchesFilters(entry, f)) results.push(this.formatEntry(entry, f.text));
+        }
+      }
       const registered = this.attachDiscoveryHandles(host, results);
       return { mode: 'index', query: { ...f }, results,
         ...(registered.length ? { handles_registered: registered.length } : {}),
@@ -1142,6 +1152,7 @@ export class Trace {
     return { indexed_events: this.store.index.size, oldest_at: oldest, newest_at: newest, watcher: this.store.watcherState,
       catch_up: reconcile, pending_watcher_jobs: this.store.watchJobs.size, missed_watcher_notifications: this.store.missedWatchEvents,
       capture: this.store.coverage.status(),
+      derived: this.store.derivedIndex?.status?.() ?? { enabled: false, state: 'absent' },
       note: 'Index is derived, memory-only and rebuilt from authoritative events at startup. It covers exactly the events this process has ingested; use queries to catch up.' };
   }
 

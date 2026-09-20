@@ -155,6 +155,7 @@ export function definitions(trace) {
         await trace.hydrate(h.sessionID);
         const view = { ...trace.projection(h.sessionID, offset, limit), store: trace.store.root, errors: trace.errors,
           capture_coverage: trace.store.coverage.status(),
+          derived_index: trace.store.derivedIndex?.status?.() ?? { enabled: false, state: 'absent' },
           observer: { outstanding_jobs: trace.observerJobs.size, maximum_jobs: trace.maxObserverJobs,
             dropped_observations: trace.droppedObservations, watcher_jobs: trace.store.watchJobs.size,
             maximum_watcher_jobs: trace.store.maxWatchJobs, missed_watcher_notifications: trace.store.missedWatchEvents, watcher: trace.store.watcherState } };

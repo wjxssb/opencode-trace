@@ -5,6 +5,7 @@ import os from 'node:os';
 import { atomic, canonical, hash, stable, refPattern } from './util.js';
 import { SequenceAllocator } from './sequence.js';
 import { CoverageTracker } from './coverage.js';
+import { DerivedIndex } from './derived-index.js';
 
 const keep = (items, item, limit) => [...items.filter(x => x.ref !== item.ref), item].sort((a, b) => a.at - b.at || a.ref.localeCompare(b.ref)).slice(-limit);
 
@@ -56,6 +57,8 @@ export class Store {
     this.replayGuard = new Map();
     // Phase C: measurable coverage state + durable gap markers.
     this.coverage = new CoverageTracker(this);
+    // Phase D: persistent derived mirror (disposable; CAS authoritative).
+    this.derivedIndex = null;
   }
   async init() {
     this.workspace = await canonical(this.workspace);
@@ -95,6 +98,14 @@ export class Store {
       catch (error) { this.warning('recovery', error); }
     }
     await this.coverage.rebuild(); // seed watermarks/markers; enables live gap detection
+    // Phase D: open the persistent derived mirror; rebuild when it does not
+    // match the recovered in-memory index (e.g. first run after upgrade or
+    // after the disposable index file was deleted/corrupted).
+    this.derivedIndex = new DerivedIndex(this, path.join(this.root, 'derived'));
+    if (await this.derivedIndex.open()) {
+      const persisted = Number(this.derivedIndex.db?.prepare("SELECT v FROM meta WHERE k='cas_count'").get()?.v ?? -1);
+      if (persisted !== this.index.size) await this.derivedIndex.rebuild();
+    }
     await atomic(path.join(this.root, 'state', 'schema.json'), stable({ schema: 1, workspace: this.workspace, workspaceID: this.workspaceID }));
     return this;
   }
@@ -190,6 +201,7 @@ export class Store {
       rels: [...new Set(rels)], hints: payloadHints,
     };
     this.index.set(event.ref, entry);
+    this.derivedIndex?.upsert(entry); // Phase D write-through (best-effort, degrades honestly)
   }
   matchesFilters(entry, f) {
     if (f.type && !(Array.isArray(f.type) ? f.type.includes(entry.type) : entry.type === f.type)) return false;
