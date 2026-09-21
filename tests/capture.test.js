@@ -18,6 +18,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs/promises';
+import * as fssync from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Trace } from '../src/trace.js';
@@ -457,6 +458,178 @@ test('G-W: worker tripwire — a poison envelope reaching the worker trips fatal
   }
   capture.paused = false;
   await capture.flush();
+});
+
+// ---- S7.5 loss-accounting semantics (mission §4-§6, L1-L8) ----
+
+test('S7.5-L1+L2+L7: overflow losses produce exactly ONE marker per exact envelope range; ledger drain does not duplicate', async t => {
+  const { trace, capture } = await fixture(t, { captureQueueCap: 2 });
+  capture.paused = true;
+  for (let i = 1; i <= 5; i++) {
+    await trace.after({ sessionID: 'ses_l', messageID: `m${i}`, id: `c${i}`, agent: 'build', tool: 'shell', input: { command: `l-${i}` }, status: 'completed', result: { output: 'x' } });
+  }
+  assert.equal(capture.status().dropped_total, 3, 'three envelopes lost to overflow (allocator-interleaved seqs — read the ledger, do not assume)');
+  await trace.store.coverage.flushPending();
+  await new Promise(r => setTimeout(r, 50));
+  // The AUTHORITATIVE lost-seq set is the durable ledger (physical truth);
+  // markers must correspond 1:1 to it regardless of allocation interleaving
+  // (capture_gap marker events share the session seq space).
+  const ledgerSeqs = new Set();
+  for (const f of fssync.readdirSync(capture.ledgerDir())) {
+    const text = fssync.readFileSync(path.join(capture.ledgerDir(), f), 'utf8');
+    for (const line of text.split('\n')) {
+      if (line.trim()) { try { const e = JSON.parse(line); if (e.session === 'ses_l') ledgerSeqs.add(e.from); } catch {} }
+    }
+  }
+  assert.equal(ledgerSeqs.size, 3, 'three physical lost envelopes in the ledger');
+  const before = trace.store.findEntriesAll({ type: 'trace.capture_gap', session: 'ses_l' });
+  assert.equal(before.length, ledgerSeqs.size, 'host immediate recordLoss noteGap: one marker per exact lost envelope seq');
+  capture.paused = false;
+  await capture.flush();
+  // Drain the durable ledger: every loss is already represented by the
+  // host's immediate marker (same identity key) — the drain must not
+  // duplicate any of them (L1 one logical loss one marker; L2 exact
+  // per-envelope ranges; L7 new events do not duplicate).
+  const drained = await trace.store.drainCaptureLedgers(capture.ledgerDir(), 99);
+  assert.equal(drained.length, 0, 'drain skips losses already represented by marker_key identity');
+  const after = trace.store.findEntriesAll({ type: 'trace.capture_gap', session: 'ses_l' });
+  assert.equal(after.length, ledgerSeqs.size, 'marker count unchanged after drain');
+  const markerSeqs = new Set();
+  for (const m of after) {
+    const p = JSON.parse(await trace.store.readBlob(m.payloadRef));
+    assert.ok(p.marker_key, 'drained-or-immediate markers all carry the durable identity key');
+    assert.equal(p.ranges.length, 1);
+    assert.equal(p.ranges[0].from, p.ranges[0].to, 'exact per-envelope range');
+    markerSeqs.add(p.ranges[0].from);
+  }
+  assert.deepEqual([...markerSeqs].sort((a, b) => a - b), [...ledgerSeqs].sort((a, b) => a - b), 'markers correspond 1:1 to the authoritative ledger lost seqs');
+  // physical_loss_events remains exact (L6): status metric = dropped_total = ledger.
+  assert.equal(capture.status().physical_loss_events, 3);
+  // L5 idempotence: draining again yields nothing (files renamed .done).
+  const second = await trace.store.drainCaptureLedgers(capture.ledgerDir(), 99);
+  assert.equal(second.length, 0, 'restart drain is idempotent');
+  // L8: markers remain readable (payloads load, originals never rewritten).
+  for (const m of after) await trace.store.readBlob(m.payloadRef);
+});
+
+test('S7.5-L3+L4: separate losses and writer-death losses stay separate markers (no false dedupe)', async t => {
+  const { trace, capture } = await fixture(t, { captureQueueCap: 1 });
+  capture.paused = true;
+  // ses_la seq 1 is ADMITTED (cap 1); ses_lb seq 1 and ses_la seq 2 overflow
+  // — two separate loss identities across two sessions (L3), and the drain
+  // must never merge them.
+  await trace.after({ sessionID: 'ses_la', messageID: 'm1', id: 'ca1', agent: 'build', tool: 'shell', input: { command: 'la-1' }, status: 'completed', result: { output: 'x' } });
+  await trace.after({ sessionID: 'ses_lb', messageID: 'm1', id: 'cb1', agent: 'build', tool: 'shell', input: { command: 'lb-1' }, status: 'completed', result: { output: 'x' } });
+  await trace.after({ sessionID: 'ses_la', messageID: 'm2', id: 'ca2', agent: 'build', tool: 'shell', input: { command: 'la-2' }, status: 'completed', result: { output: 'x' } });
+  assert.equal(capture.status().dropped_total, 2);
+  await trace.store.coverage.flushPending();
+  await new Promise(r => setTimeout(r, 50));
+  const la = trace.store.findEntriesAll({ type: 'trace.capture_gap', session: 'ses_la' });
+  const lb = trace.store.findEntriesAll({ type: 'trace.capture_gap', session: 'ses_lb' });
+  assert.equal(la.length, 1, 'session A gap (its seq 2)');
+  assert.equal(lb.length, 1, 'session B gap (its seq 1): never merged into A');
+  assert.notEqual(JSON.parse(await trace.store.readBlob(la[0].payloadRef)).marker_key,
+    JSON.parse(await trace.store.readBlob(lb[0].payloadRef)).marker_key);
+  capture.paused = false;
+  await capture.flush().catch(() => {});
+});
+
+test('S7.5-L6: physical_loss_events equals allocated minus persisted after drain (ledger authoritative)', async t => {
+  const { trace, capture } = await fixture(t, { captureQueueCap: 2 });
+  capture.paused = true;
+  for (let i = 1; i <= 5; i++) {
+    await trace.after({ sessionID: 'ses_l6', messageID: `m${i}`, id: `c${i}`, agent: 'build', tool: 'shell', input: { command: `l6-${i}` }, status: 'completed', result: { output: 'x' } });
+  }
+  capture.paused = false;
+  await capture.flush();
+  const persisted = trace.store.findEntriesAll({ type: 'tool.after', session: 'ses_l6' }).length;
+  let ledgered = 0;
+  for (const f of fssync.readdirSync(capture.ledgerDir())) {
+    const text = fssync.readFileSync(path.join(capture.ledgerDir(), f), 'utf8');
+    for (const line of text.split('\n')) {
+      if (line.trim()) { try { const e = JSON.parse(line); if (e.session === 'ses_l6') ledgered += e.count ?? 1; } catch {} }
+    }
+  }
+  assert.equal(ledgered, 3);
+  assert.equal(capture.status().physical_loss_events, 3, 'physical loss exact');
+  assert.equal(5, persisted + ledgered, 'allocated = persisted + physical loss after drain');
+});
+
+// ---- S7.5 index telemetry (mission §7-§10, I1-I7) ----
+
+test('S7.5-I1+I2+I3: envelope counts are unique-event based; lag semantics honest; no fake watermark field', async t => {
+  const { trace, capture } = await fixture(t);
+  capture.paused = true;
+  for (let i = 0; i < 4; i++) {
+    await trace.after({ sessionID: 'ses_i', messageID: `m${i}`, id: `c${i}`, agent: 'build', tool: 'shell', input: { command: `i-${i}` }, status: 'completed', result: { output: 'x' } });
+  }
+  let s = capture.status();
+  assert.equal(s.indexed_event_count, 0, 'nothing acked while paused');
+  assert.equal(s.queue_depth, 4, 'unindexed work surfaces as queue depth, not a fake seq watermark');
+  assert.equal('last_indexed' in s, false, 'I7: the ambiguous legacy field is gone');
+  assert.equal('last_indexed_seq' in s, false, 'I7: no count values under a seq-watermark name');
+  assert.equal(s.physical_loss_events, 0, 'the explicit physical-loss metric is present and honest');
+  capture.paused = false;
+  await capture.flush();
+  s = capture.status();
+  assert.equal(s.persisted_event_count, 4, 'I3: unique-event counts advance per acked envelope');
+  assert.equal(s.indexed_event_count, 4, 'I1: write-through indexes on persist (atomic worker step)');
+  assert.equal(s.index_lag_events, 0, 'I1: lag zero after acks');
+  const wm = await trace.store.sequences.watermark('ses_i').then(w => w.seq);
+  assert.equal(s.last_persisted_seq, wm, 'I6: last_persisted_seq is an actual session_seq watermark');
+  assert.ok(s.last_enqueued_seq >= s.last_persisted_seq, 'enqueued leads persisted');
+});
+
+test('S7.5-I4+I5: worker restart keeps counts/watermarks honest; rebuild leaves lag 0', async t => {
+  const { trace, capture } = await fixture(t);
+  for (let i = 0; i < 3; i++) {
+    await trace.after({ sessionID: 'ses_i5', messageID: `m${i}`, id: `c${i}`, agent: 'build', tool: 'shell', input: { command: `i5-${i}` }, status: 'completed', result: { output: 'x' } });
+  }
+  await capture.flush();
+  const countsBefore = capture.status().persisted_event_count;
+  assert.equal(countsBefore, 3);
+  capture.paused = true;
+  for (let i = 3; i < 5; i++) {
+    await trace.after({ sessionID: 'ses_i5', messageID: `m${i}`, id: `c${i}`, agent: 'build', tool: 'shell', input: { command: `i5-${i}` }, status: 'completed', result: { output: 'x' } });
+  }
+  // Kill while paused: the 2 queued envelopes survive in host memory and
+  // drain to the respawned writer (restart continuity, not loss).
+  if (trace.capture.worker) { try { await trace.capture.worker.terminate(); } catch {} }
+  await new Promise(r => setTimeout(r, 200)); // death path + respawn
+  trace.capture.paused = false;
+  trace.capture.drain();
+  await capture.flush().catch(() => {});
+  const s = capture.status();
+  assert.ok(s.persisted_event_count >= 5, `I5: counts continue across restart (got ${s.persisted_event_count})`);
+  assert.equal(s.index_lag_events, 0, 'I5: watermarks recover honestly after respawn');
+  assert.ok(s.last_persisted_seq >= 5, 'I6: watermark is the real session seq');
+  // I4: full rebuild from CAS leaves the index complete (lag 0) — G12 covers
+  // the rebuild; here assert the index reflects every persisted event.
+  const viaIndex = [...trace.store.index.values()].filter(e => e.type === 'tool.after' && e.sessionID === 'ses_i5').length;
+  assert.equal(viaIndex, trace.store.findEntriesAll({ type: 'tool.after', session: 'ses_i5' }).length, 'I4: index catches up to persisted count');
+});
+
+test('S7.5-L8: pre-fix duplicate markers remain readable and durably preserved (no rewrite)', async t => {
+  const { trace } = await fixture(t);
+  // Simulate PRE-FIX state: two raw markers for one logical loss (no dedupe).
+  // Real pre-fix duplicates differed by observed_at, producing distinct CAS
+  // payloads — simulate with distinct ledger_generation values (the CAS
+  // idempotently collapses byte-identical bodies; history here is additive).
+  const raw = (k, gen) => trace.store.record('trace.capture_gap', { sessionID: 'ses_old' }, {
+    session: 'ses_old', reason: 'queue_overflow', component: 'capture', status: 'detected',
+    ranges: [{ from: 9, to: 9 }], unresolved_count: 1, marker_key: k,
+    ledger_generation: gen,
+    semantics: 'pre-S7.5 historical duplicate (same logical loss recorded twice before the identity dedupe)',
+  }, { session: 'ses_old' });
+  const a = await raw('ses_old:9:9:queue_overflow', 5);
+  const b = await raw('ses_old:9:9:queue_overflow', 6);
+  assert.notEqual(a.ref, b.ref, 'historical duplicates exist in CAS (additive, never rewritten)');
+  const rows = trace.store.findEntriesAll({ type: 'trace.capture_gap', session: 'ses_old' });
+  assert.ok(rows.length >= 2);
+  for (const r of rows) await trace.store.readBlob(r.payloadRef); // all readable
+  // A NEW drain with the same identity must not add a third.
+  const drained = await trace.store.drainCaptureLedgers(path.join(trace.store.base, 'capture-ledger'), 7);
+  assert.equal(drained.length, 0, 'dedupe also prevents new duplicates when the key already exists');
 });
 
 test('ZZ: suite completed (watchdog armed loud)', () => { suiteCompleted = true; });

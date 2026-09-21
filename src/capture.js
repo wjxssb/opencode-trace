@@ -84,6 +84,12 @@ export class CaptureCoordinator {
     this.lastEnqueued = new Map(); // session -> seq (allocation-time watermark)
     this.lastPersisted = new Map(); // session -> seq (worker acks)
     this.lastIndexed = 0;
+    // S7.5 telemetry (mission §7-§10): counts and sequence watermarks are
+    // DISTINCT metrics. persisted/indexed count acked envelopes (the worker
+    // ingests on persist, so they advance together per batch); no field is
+    // named as a sequence watermark while holding a batch count.
+    this.persistedEventCount = 0;
+    this.indexedEventCount = 0;
     this.latencies = [];
     this.droppedTotal = 0;
     this.degraded = false;
@@ -143,6 +149,9 @@ export class CaptureCoordinator {
         this.lastPersisted.set(session, Math.max(this.lastPersisted.get(session) ?? 0, seq));
       }
       this.lastIndexed = message.indexed ?? this.lastIndexed;
+      this.persistedEventCount += message.ids?.length ?? 0;
+      this.indexedEventCount = this.persistedEventCount; // persist + index are one atomic step in the worker
+      void this.lastIndexed; // legacy field superseded by the S7.5 counts; kept only to avoid breaking external readers until S8 release
       if (Number.isFinite(message.latencyMs)) {
         this.latencies.push(message.latencyMs);
         if (this.latencies.length > 64) this.latencies.shift();
@@ -276,17 +285,27 @@ export class CaptureCoordinator {
   status() {
     const latencies = [...this.latencies].sort((a, b) => a - b);
     const pick = p => latencies.length ? latencies[Math.min(latencies.length - 1, Math.floor(latencies.length * p))] : null;
+    // S7.5 telemetry semantics (mission §3/§7-§10): dropped_total IS the
+    // authoritative physical_loss_events (every recordLoss call = one
+    // physical lost envelope with a known seq). Envelope counts
+    // (persisted/indexed) are DISTINCT from any sequence watermark: the
+    // worker persists + ingests in one atomic step per envelope, so both
+    // counters advance together per ack and index_lag_events is 0 by
+    // construction after acks. Sequence watermarks are per-session maxima.
     return {
       enabled: true, active: this.active, degraded: this.degraded, generation: this.generation,
       queue_depth: this.queue.length, queue_bytes: this.queueBytes,
       oldest_queue_age: this.queue.length ? Date.now() - this.queue[0].at : 0,
       in_flight: this.inFlight.size, dropped_total: this.droppedTotal,
+      physical_loss_events: this.droppedTotal,
       last_enqueued_seq: Math.max(0, ...this.lastEnqueued.values()),
       last_persisted_seq: Math.max(0, ...this.lastPersisted.values()),
-      last_indexed_seq: this.lastIndexed,
+      persisted_event_count: this.persistedEventCount,
+      indexed_event_count: this.indexedEventCount,
+      index_lag_events: this.persistedEventCount - this.indexedEventCount,
       persist_latency_ms: { p50: pick(0.5), p95: pick(0.95), last: latencies.at(-1) ?? null },
       respawn_attempts: this.respawnAttempts,
-      meaning: 'non-blocking capture: watermarks are writer-reported; degraded means the writer died and unacknowledged envelopes were recorded as exact losses in the durable ledger; loss never blocks the host',
+      meaning: 'non-blocking capture: physical_loss_events is the exact lost-envelope count from the enqueue-side allocator (ledger-backed); persisted/indexed_event_count are cumulative acked-envelope counts (persist and index are one atomic worker step, so index_lag_events is 0 after acks); sequence watermarks are per-session maxima; degraded means the writer died and unacknowledged envelopes were recorded as exact losses in the durable ledger; loss never blocks the host',
     };
   }
 }

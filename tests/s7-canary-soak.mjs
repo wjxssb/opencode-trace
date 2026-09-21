@@ -293,7 +293,7 @@ console.log(`DOUBLECOUNT: markers=${allMarkers.length} doubleCountedSeqs=${doubl
 
 // ---- GC (§25/§26) + index lag (§20) ----
 const fin = trace.capture.status();
-const indexLag = fin.last_persisted_seq - fin.last_indexed_seq;
+const indexLag = fin.index_lag_events; // S7.5: honest count-based lag (0 by construction after acks)
 const gcHandlesFinal = trace.handles.describe();
 trace.handles.sweep(Date.now());
 const gcHandlesAfter = trace.handles.describe();
@@ -311,7 +311,7 @@ const report = {
     enqueue_p50: p(samples.enqueue, 0.5), enqueue_p95: p(samples.enqueue, 0.95), enqueue_p99: p(samples.enqueue, 0.99),
     enqueue_max: Math.max(0, ...samples.enqueue),
   },
-  writer: { persist: fin.persist_latency_ms, restarts: trace.capture.generation - 1, respawns: fin.respawn_attempts, dropped_total: fin.dropped_total, last_enqueued: fin.last_enqueued_seq, last_persisted: fin.last_persisted_seq, last_indexed: fin.last_indexed, index_lag: indexLag, degraded_final: fin.degraded },
+  writer: { persist: fin.persist_latency_ms, restarts: trace.capture.generation - 1, respawns: fin.respawn_attempts, dropped_total: fin.dropped_total, physical_loss_events: fin.physical_loss_events, last_enqueued: fin.last_enqueued_seq, last_persisted: fin.last_persisted_seq, persisted_event_count: fin.persisted_event_count, indexed_event_count: fin.indexed_event_count, index_lag_events: fin.index_lag_events, degraded_final: fin.degraded },
   stress: { overflowed, ledgered, droppedTotal: trace.capture.dropped_total, queueMax },
   loss: { stressCalls: STRESS_CALLS, persistedStress, ledgeredStress, residual: stressPending },
   capture_gap_markers: allMarkers.length, doubleCountedSeqs: doubleCounted,

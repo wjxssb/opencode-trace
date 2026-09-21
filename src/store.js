@@ -412,6 +412,20 @@ export class Store {
     try { files = (await fs.readdir(ledgerDir)).filter(f => f.endsWith('.jsonl')); }
     catch (error) { if (error?.code === 'ENOENT') return []; throw error; }
     const markers = [];
+    // S7.5 loss-accounting dedupe (mission §4/§5): a ledger entry whose
+    // logical loss is ALREADY represented by a durable capture_gap marker
+    // (e.g. the host's immediate recordLoss noteGap) must not produce a
+    // second logically equivalent marker. Identity = the existing coverage
+    // marker key: `${session}:${from}:${to}:${reason}` (exact; no fuzzy
+    // range matching). The key is durable — it rides in every
+    // trace.capture_gap payload as marker_key.
+    const existingKeys = new Set();
+    for (const row of this.findEntriesAll({ type: 'trace.capture_gap' })) {
+      try {
+        const p = JSON.parse((await this.readBlob(row.payloadRef)).toString());
+        if (p.marker_key) existingKeys.add(p.marker_key);
+      } catch { /* unreadable historical marker: never blocks the drain */ }
+    }
     for (const file of files) {
       const text = await fs.readFile(path.join(ledgerDir, file), 'utf8').catch(() => '');
       for (const line of text.split('\n')) {
@@ -419,14 +433,20 @@ export class Store {
         let entry;
         try { entry = JSON.parse(line); } catch { continue; }
         if (!entry.session || !Number.isInteger(entry.from)) continue;
+        const to = entry.to ?? entry.from;
+        const reason = 'queue_overflow';
+        const markerKey = `${entry.session}:${entry.from}:${to}:${reason}`;
+        if (existingKeys.has(markerKey)) continue; // S7.5: one logical loss, one marker
         const marker = await this.record('trace.capture_gap', { sessionID: entry.session }, {
-          session: entry.session, reason: 'queue_overflow', component: 'capture',
-          status: 'detected', ranges: [{ from: entry.from, to: entry.to ?? entry.from }],
+          session: entry.session, reason, component: 'capture',
+          status: 'detected', ranges: [{ from: entry.from, to }],
+          unresolved_count: to - entry.from + 1,
           lost_count: entry.count ?? 1, ledger_cause: entry.cause ?? null,
           ledger_generation: entry.generation ?? null, observed_at: entry.at ?? Date.now(),
-          semantics: 'bounded capture queue overflow / writer loss: exact sequence range recorded by the enqueue-side allocator; the durable ledger entry is the original loss evidence',
+          marker_key: markerKey,
+          semantics: 'bounded capture queue overflow / writer loss: exact sequence range recorded by the enqueue-side allocator; the durable ledger entry is the original loss evidence; marker_key identity prevents duplicate coverage markers for one logical loss',
         }, { session: entry.session }).catch(() => null);
-        if (marker) markers.push(marker.ref);
+        if (marker) { existingKeys.add(markerKey); markers.push(marker.ref); }
       }
       await fs.rename(path.join(ledgerDir, file), path.join(ledgerDir, `${file}.gen${generation}.done`)).catch(() => {});
     }
