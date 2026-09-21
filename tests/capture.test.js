@@ -17,7 +17,7 @@ import path from 'node:path';
 import { Trace } from '../src/trace.js';
 import { Store } from '../src/store.js';
 
-setTimeout(() => process.exit(0), 90000);
+setTimeout(() => process.exit(suiteCompleted ? 0 : 1), 90000);
 
 // Review round-6 advisory: make the watchdog LOUD — a hung test must not
 // masquerade as exit 0. The final test arms the completion flag; if the
