@@ -1,5 +1,6 @@
 import path from 'node:path';
 import * as fs from 'node:fs/promises';
+import { readFileSync as readFileSyncSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { Store } from './store.js';
 import { atomic, bytes, stable, hash, identity, callKey, locator, mutationPaths, canonical, overlaps, messageID, messageRole, messageContentFingerprint, textFromMessage, refPattern, unwrap } from './util.js';
@@ -1335,7 +1336,35 @@ export class Trace {
       catch_up: reconcile, pending_watcher_jobs: this.store.watchJobs.size, missed_watcher_notifications: this.store.missedWatchEvents,
       capture: session ? this.store.coverage.statusFor(session) : this.store.coverage.status(),
       derived: this.store.derivedIndex?.status?.() ?? { enabled: false, state: 'absent' },
+      // P3-A: unified awaiting-review projection. STRICTLY READ-ONLY bridge
+      // over the Reviewer durable state (the single authority for review
+      // obligation). Trace never clears an obligation, approves a review,
+      // changes a round, or mutates ReviewerSession. If the bridge cannot
+      // read the state, the projection reports state 'unknown' with the
+      // reason — NEVER 'false', because a bridge failure is not evidence of
+      // absence (mission §36).
+      ...(session ? { awaiting_review: this.awaitingReviewProjection(session) } : {}),
       note: 'Index is derived, memory-only and rebuilt from authoritative events at startup. It covers exactly the events this process has ingested; use queries to catch up.' };
+  }
+
+  /** Read-only projection of the Reviewer durable session (P3-A bridge). */
+  awaitingReviewProjection(session) {
+    try {
+      const xdg = process.env.XDG_DATA_HOME ?? path.join(os.homedir(), '.local', 'share');
+      const file = path.join(xdg, 'opencode', 'inline-reviewer', 'sessions', `${session}.json`);
+      const data = JSON.parse(fssync.readFileSync(file, 'utf8'));
+      const lastRound = Array.isArray(data.rounds) && data.rounds.length ? data.rounds[data.rounds.length - 1] : null;
+      return { state: 'available', source: 'reviewer_durable_state', read_only: true,
+        currentRound: data.currentRound ?? null,
+        reviewObligation: data.reviewObligation ?? null,
+        campaignObjective: data.campaignObjective ?? null,
+        last_round: lastRound ? { round: lastRound.round ?? null, verdict: lastRound.verdict ?? null,
+          gitHead: lastRound.gitHead ?? null, stale: lastRound.stale ?? false } : null };
+    } catch (error) {
+      return { state: 'unknown', reason: error?.code === 'ENOENT' ? 'no-reviewer-session-file' : `unreadable-${error?.code ?? error?.name ?? 'error'}`,
+        source: 'reviewer_durable_state', read_only: true,
+        meaning: 'Reviewer state could not be read; absence here is NOT a completed review and NOT an absence of obligation' };
+    }
   }
 
   // ---- Persistent directed negotiation ----
