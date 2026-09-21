@@ -228,6 +228,24 @@ export class Trace {
     this.store = new Store(ctx.location?.directory ?? ctx.location?.project?.canonical ?? process.cwd(), options.storeRoot, this.warning);
     this.ready = this.store.init();
     this.ready.catch(error => this.warning('startup', error));
+    // Phase G: non-blocking capture (opt-in, default OFF per §17 — production
+    // stays synchronous until explicit soak authorization). Started after the
+    // store is ready (the coordinator needs the store root); a start()
+    // failure TRULY degrades to the synchronous path — this.ready stays
+    // resolved so host hooks and tools keep working.
+    this.capture = undefined;
+    if (options.captureWriter) {
+      this.ready = this.ready.then(async () => {
+        try {
+          const { CaptureCoordinator } = await import('./capture.js');
+          this.capture = new CaptureCoordinator(this, options);
+          await this.capture.start();
+        } catch (error) {
+          this.capture = undefined;
+          this.warning('capture_start', error);
+        }
+      });
+    }
   }
   noteObserverDrop(where) {
     // Phase C: observer drops become durable coverage evidence (best-effort;
@@ -349,7 +367,43 @@ export class Trace {
     if (paths) await this.conflicts(e.sessionID, paths, [], event.ref);
     return event;
   }
+  /** Router: the capture writer owns tool.after persistence when active; otherwise the synchronous path. */
   async after(e) {
+    if (this.capture?.active) return this.afterViaCapture(e);
+    return this.afterSync(e);
+  }
+  /**
+   * Phase G: non-blocking capture path for tool.after events. The envelope
+   * is canonical-only: input handles were already resolved by the tool
+   * middleware, and the coordinator re-validates every identity field
+   * before queue admission (§14 — unresolved identities never enter G).
+   * Verification-milestone detection still runs on the host because
+   * milestone notes use the synchronous path. Any capture-path failure
+   * degrades to the synchronous record — native execution never breaks.
+   */
+  async afterViaCapture(e) {
+    try {
+      const blobs = [];
+      const outputs = [];
+      const pushOutput = text => {
+        const b = this.store.blobRef(text, 'utf8');
+        outputs.push({ ref: b.ref, bytes: b.bytes, encoding: 'utf8', sha256: b.sha256 });
+        blobs.push(b);
+      };
+      if (typeof e.result?.output === 'string') pushOutput(e.result.output);
+      for (const part of e.result?.content ?? []) if (part.type === 'text' && typeof part.text === 'string') pushOutput(part.text);
+      const beforeRef = this.store.findEntriesNewest({ callKey: callKey(e), type: 'tool.before' }, 1)[0]?.ref ?? null;
+      const data = { id: e.id, tool: e.tool, input: e.input, status: e.status, result: e.result, error: e.error };
+      const extra = { tool: e.tool, callID: e.id ?? null, callKey: callKey(e), source: locator(e.input), status: e.status, outputs, ...(beforeRef ? { caused_by: beforeRef } : {}) };
+      const { ref } = await this.capture.enqueue({ type: 'tool.after', host: identity(e), data, extra, blobs });
+      await this.verificationMilestone(e, ref, Date.now());
+      return { ref, enqueued: true };
+    } catch (error) {
+      this.warning('capture_after', error);
+      return this.afterSync(e);
+    }
+  }
+  async afterSync(e) {
     const outputs = [];
     if (typeof e.result?.output === 'string') outputs.push(await this.store.blob(e.result.output, 'utf8'));
     for (const part of e.result?.content ?? []) if (part.type === 'text' && typeof part.text === 'string') outputs.push(await this.store.blob(part.text, 'utf8'));
@@ -357,22 +411,28 @@ export class Trace {
     const beforeRef = this.store.findEntriesNewest({ callKey: callKey(e), type: 'tool.before' }, 1)[0]?.ref ?? null;
     const event = await this.store.record('tool.after', identity(e), { id: e.id, tool: e.tool, input: e.input, status: e.status, result: e.result, error: e.error },
       { tool: e.tool, callID: e.id ?? null, callKey: callKey(e), source: locator(e.input), status: e.status, outputs, ...(beforeRef ? { caused_by: beforeRef } : {}) });
-    
-    // High-value milestone trigger: test & verification transitions
+
+    await this.verificationMilestone(e, event.ref, event.at);
+    return event;
+  }
+  /** High-value milestone trigger: test & verification transitions. Shared
+   * by the sync and capture paths (the capture ref is allocated at enqueue,
+   * so milestones cite the same identity on both paths). */
+  async verificationMilestone(e, ref, at) {
     const cmd = typeof e.input?.command === 'string' ? e.input.command : (typeof e.input === 'string' ? e.input : null);
     if (cmd && isVerificationCommand(cmd) && e.sessionID) {
       const outcome = detectVerificationOutcome(e);
       if (outcome !== 'UNKNOWN') {
         const s = this.store.session(e.sessionID);
         const prev = s.lastVerification?.command === cmd ? s.lastVerification : null;
-        s.lastVerification = { outcome, at: event.at, ref: event.ref, command: cmd };
+        s.lastVerification = { outcome, at, ref, command: cmd };
         if (prev?.outcome === 'FAIL' && outcome === 'PASS') {
           await this.autoRecordMilestone(e.sessionID, {
             kind: 'state_change',
             summary: `Verification transition: FAIL -> PASS (${cmd.slice(0, 80)})`,
             what_changed: `Verification passed after prior failure`,
             current_state: 'PASS',
-            evidence_refs: [event.ref, prev.ref].filter(Boolean),
+            evidence_refs: [ref, prev.ref].filter(Boolean),
             supersedes: prev.milestone_ref ? [prev.milestone_ref] : []
           }, identity(e));
         } else if (prev?.outcome === 'PASS' && outcome === 'FAIL') {
@@ -381,12 +441,11 @@ export class Trace {
             summary: `Regression detected: PASS -> FAIL (${cmd.slice(0, 80)})`,
             what_changed: `Verification failed after prior passing state`,
             current_state: 'FAIL',
-            evidence_refs: [event.ref, prev.ref].filter(Boolean),
+            evidence_refs: [ref, prev.ref].filter(Boolean),
           }, identity(e));
         }
       }
     }
-    return event;
   }
   async refs(refs = [], field = 'source_refs') {
     return this.gateway.refs(refs, field);

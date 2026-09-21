@@ -59,6 +59,10 @@ export class Store {
     this.coverage = new CoverageTracker(this);
     // Phase D: persistent derived mirror (disposable; CAS authoritative).
     this.derivedIndex = null;
+    // Phase G: single index owner — while the capture writer is alive the
+    // host suppresses its own derived-index writes; the worker's Store owns
+    // the index. Restored on capture stop.
+    this.suppressDerivedWrites = false;
   }
   async init() {
     this.workspace = await canonical(this.workspace);
@@ -206,7 +210,7 @@ export class Store {
       rels: [...new Set(rels)], hints: payloadHints,
     };
     this.index.set(event.ref, entry);
-    this.derivedIndex?.upsert(entry); // Phase D write-through (best-effort, degrades honestly)
+    if (!this.suppressDerivedWrites) this.derivedIndex?.upsert(entry); // Phase D write-through (best-effort, degrades honestly); suppressed while the capture writer owns the index (single writer).
   }
   matchesFilters(entry, f) {
     if (f.type && !(Array.isArray(f.type) ? f.type.includes(entry.type) : entry.type === f.type)) return false;
@@ -357,6 +361,76 @@ export class Store {
     const digest = hash(data), ref = `blob_${digest}`;
     await atomic(path.join(this.root, 'blobs', digest.slice(0, 2), digest), data, true);
     return { ref, sha256: digest, bytes: data.length, encoding };
+  }
+  /**
+   * Phase G: pure blob reference — the content-addressed identity of `value`
+   * WITHOUT writing anything. The capture writer later persists the bytes
+   * idempotently; the ref is valid immediately.
+   */
+  blobRef(value, encoding = 'json') {
+    const data = Buffer.from(encoding === 'json' ? stable(value) : value, 'utf8');
+    const digest = hash(data);
+    return { ref: `blob_${digest}`, sha256: digest, bytes: data.length, encoding, content: data };
+  }
+  /**
+   * Phase G (writer side): persist a pre-built envelope idempotently — the
+   * payload blob, every output blob (hash-verified against its claimed ref),
+   * then the event file, then ingest (the writer owns coverage/derived-index
+   * state). Duplicate delivery is harmless: content-addressed writes are
+   * idempotent and an existing event file is reused, never rewritten.
+   */
+  async persistEnvelope(env) {
+    await atomic(path.join(this.root, 'blobs', env.payload.sha256.slice(0, 2), env.payload.sha256), Buffer.from(env.encoded, 'utf8'), true);
+    for (const b of env.blobs ?? []) {
+      const content = Buffer.isBuffer(b.content) ? b.content : Buffer.from(b.content ?? '', 'utf8');
+      if (hash(content) !== b.sha256 || `blob_${b.sha256}` !== b.ref) {
+        throw new Error(`persistEnvelope: output blob content does not match claimed ref ${String(b.ref).slice(0, 15)}…`);
+      }
+      await atomic(path.join(this.root, 'blobs', b.sha256.slice(0, 2), b.sha256), content, true);
+    }
+    const event = { ...env.body, ref: env.ref, at: env.at };
+    const filename = path.join(this.root, 'events', `${env.ref}.json`);
+    try { await atomic(filename, stable(event), true); }
+    catch (writeError) {
+      const existing = await this.readEvent(env.ref).catch(() => null);
+      if (!existing) throw writeError;
+    }
+    await this.ingest(event);
+    return event;
+  }
+  /**
+   * Phase G (writer side): drain durable loss-ledger files written by the
+   * host when the bounded queue overflowed or envelopes were lost to writer
+   * death. Each entry becomes a durable trace.capture_gap marker
+   * (reason=queue_overflow) carrying the EXACT per-envelope sequence range
+   * recorded by the enqueue-side allocator; drained files are renamed *.done
+   * so each file is converted once. Duplicate markers are harmless —
+   * coverage dedupes by marker key.
+   */
+  async drainCaptureLedgers(ledgerDir, generation) {
+    let files = [];
+    try { files = (await fs.readdir(ledgerDir)).filter(f => f.endsWith('.jsonl')); }
+    catch (error) { if (error?.code === 'ENOENT') return []; throw error; }
+    const markers = [];
+    for (const file of files) {
+      const text = await fs.readFile(path.join(ledgerDir, file), 'utf8').catch(() => '');
+      for (const line of text.split('\n')) {
+        if (!line.trim()) continue;
+        let entry;
+        try { entry = JSON.parse(line); } catch { continue; }
+        if (!entry.session || !Number.isInteger(entry.from)) continue;
+        const marker = await this.record('trace.capture_gap', { sessionID: entry.session }, {
+          session: entry.session, reason: 'queue_overflow', component: 'capture',
+          status: 'detected', ranges: [{ from: entry.from, to: entry.to ?? entry.from }],
+          lost_count: entry.count ?? 1, ledger_cause: entry.cause ?? null,
+          ledger_generation: entry.generation ?? null, observed_at: entry.at ?? Date.now(),
+          semantics: 'bounded capture queue overflow / writer loss: exact sequence range recorded by the enqueue-side allocator; the durable ledger entry is the original loss evidence',
+        }, { session: entry.session }).catch(() => null);
+        if (marker) markers.push(marker.ref);
+      }
+      await fs.rename(path.join(ledgerDir, file), path.join(ledgerDir, `${file}.gen${generation}.done`)).catch(() => {});
+    }
+    return markers;
   }
   async readBlob(ref) {
     if (!/^blob_[a-f0-9]{64}$/.test(ref)) throw new Error(`Invalid blob ref ${String(ref).slice(0, 80)}: expected blob_<64hex>`);
