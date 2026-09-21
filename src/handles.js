@@ -73,6 +73,14 @@ export function assignSnapshotHandles(view) {
   for (const row of view.recent ?? []) {
     for (const output of row.outputs ?? []) add('blob', output.ref, `output · ${output.bytes ?? '?'}B`);
   }
+  // Phase II handle-first fix (H12): active-memory evidence refs are the
+  // finalization-critical citations — they must always carry handles, or the
+  // model is forced back to copying 64-hex refs (the exact incident this
+  // closes: handoff notes citing gate-review events canonically because the
+  // refs surfaced in active memory had no current-turn handle).
+  for (const ref of view.active_memory?.evidence_refs ?? []) {
+    add('event', ref, 'active-memory evidence');
+  }
   for (const note of [...(view.notes ?? []), ...(view.unresolved ?? [])]) {
     add('note', note.ref, `note(${note.kind ?? '?'})`);
   }
@@ -158,6 +166,18 @@ export class HandleRegistry {
     const generation = { byHandle, byRef, next, created_at: Date.now() };
     this.active.set(sessionID, generation);
     return generation;
+  }
+
+  /** Session's current turn handles (bounded; diagnostics + error hints). */
+  listSession(sessionID, cap = 16) {
+    const generation = this.active.get(sessionID);
+    if (!generation) return [];
+    const out = [];
+    for (const [handle, meta] of generation.byHandle) {
+      out.push({ handle, kind: meta.kind });
+      if (out.length >= cap) break;
+    }
+    return out;
   }
 
   /**

@@ -452,6 +452,22 @@ export class Trace {
     }
     return false;
   }
+  /** Phase II handle-first: fail-closed invalid-ref error plus a diagnostic
+   * hint pointing at the current turn's live handles. Never auto-corrects,
+   * never fuzzy-matches — the malformed ref is still rejected outright. */
+  async refsOrHint(refs, field, host) {
+    try { return await this.refs(refs, field); }
+    catch (error) {
+      if (String(error.message).includes('not found in this workspace') && host?.sessionID) {
+        const handles = this.handles.listSession(host.sessionID, 12);
+        if (handles.length) {
+          const hint = handles.map(h => h.handle).join(' ');
+          throw new Error(`${error.message} Current turn evidence handles: ${hint} — pass one as source_handles/evidence_handles, or run trace_find/trace_expand to re-register historical evidence.`);
+        }
+      }
+      throw error;
+    }
+  }
   async note(input, host) {
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('trace_note: input must be an object');
     validateNoteInput(input);
@@ -479,7 +495,7 @@ export class Trace {
     if (typeof input.text !== 'string' || !input.text.trim()) throw new Error('trace_note: text must be a non-empty string; use {kind, text}, {kind, summary}, or {milestone: {kind, summary}}');
     if (bytes(input.text) > 4096) throw new Error('trace_note: text exceeds 4096 UTF-8 bytes; shorten or split the note');
     if (bytes(input) > 16000) throw new Error('trace_note: normalized input exceeds 16000 UTF-8 bytes');
-    const source_refs = await this.refs(input.source_refs, 'source_refs');
+    const source_refs = await this.refsOrHint(input.source_refs, 'source_refs', host);
     const supersedes = await this.refs(input.supersedes, 'supersedes');
     const depends_on = await this.refs(input.depends_on, 'depends_on');
 
@@ -792,7 +808,7 @@ export class Trace {
 
     return enforceActiveMemoryBudget(am, ACTIVE_MEMORY_BYTE_CAP);
   }
-  formatActiveMemory(am) {
+  formatActiveMemory(am, view) {
     if (!am || am.omitted) return '';
     const lines = [];
     if (am.handoff_source) lines.push(`• Inherited handoff from ${am.handoff_source.sessionID}: ${clip(am.current_state ?? am.handoff_source.summary, 120)}`);
@@ -805,7 +821,17 @@ export class Trace {
     else lines.push('• Open blockers: (none)');
     if (am.next_action) lines.push(`• Next action: ${clip(am.next_action, 160)}`);
     if (am.do_not_repeat?.length) lines.push(`• Do-not-repeat: ${am.do_not_repeat.map(r => clip(r, 100)).join('; ')}`);
-    if (am.evidence_refs?.length) lines.push(`• Evidence refs: ${am.evidence_refs.join(', ')}`);
+    if (am.evidence_refs?.length) {
+      // Phase II handle-first: render active-memory evidence with its current
+      // turn handle so the model cites [e#] instead of copying 64-hex refs.
+      const byTail = new Map((view?.evidence_handles ?? []).map(h => [h.ref, h.handle]));
+      const parts = am.evidence_refs.map(r => {
+        const t = typeof r === 'string' && r.length > 20 ? `${r.slice(0, 11)}…${r.slice(-4)}` : String(r ?? '');
+        const h = byTail.get(t);
+        return h ? `[${h}] ${r}` : r;
+      });
+      lines.push(`• Evidence refs: ${parts.join(', ')}`);
+    }
     return lines.join('\n');
   }
   projection(sid, peerOffset = 0, peerLimit = 8) {
@@ -900,7 +926,7 @@ export class Trace {
         && view.unresolved.length === unresolvedShown && !view.unresolved.some(n => n.omitted);
       view.coverage.notes_shown = view.notes.length;
       view.coverage.unresolved_shown = view.unresolved.length;
-      const activeText = this.formatActiveMemory(view.active_memory);
+      const activeText = this.formatActiveMemory(view.active_memory, view);
       const activeSection = activeText ? `\n\n=== ACTIVE MILESTONE MEMORY ===\n${activeText}` : '';
       const handlesSection = renderEvidenceHandles(view.evidence_handles);
       return prefix + stable(view) + activeSection + handlesSection + staticGuidance;
