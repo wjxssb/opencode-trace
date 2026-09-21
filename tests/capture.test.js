@@ -667,3 +667,54 @@ test('S7.5-L8: pre-fix duplicate markers remain readable and durably preserved (
 });
 
 test('ZZ: suite completed (watchdog armed loud)', () => { suiteCompleted = true; });
+
+// P2-A qualification: workspace-global G owner lease (campaign 2026-09-21).
+// Mission §27: two REAL processes, same workspace. A second node process
+// must decline ownership while the first holds a live lease; after proven
+// owner death (pid/start-identity), the stale lease is stealable — never
+// by age alone.
+test('S8-LEASE: dual-process — second process declines ownership; dead-owner lease is stealable', async t => {
+  const { trace, capture } = await fixture(t, {});
+  await capture.start();
+  assert.equal(capture.status().owner, true);
+  // Real second process: runs the acquisition decision against the SAME
+  // lease file via a child node process (mirrors #ownerAlive + the
+  // exclusive-create steal contract).
+  const script = [
+    "import fs from 'node:fs/promises';",
+    "const leasePath = process.argv[2];",
+    "const lease = JSON.parse(await fs.readFile(leasePath, 'utf8'));",
+    "let ownerAlive = false;",
+    "try {",
+    "  const raw = await fs.readFile('/proc/' + lease.pid + '/stat', 'utf8');",
+    "  const after = raw.slice(raw.lastIndexOf(')') + 2);",
+    "  const boot = (await fs.readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim();",
+    "  ownerAlive = after.split(' ')[19] === lease.starttime && boot === lease.boot_id;",
+    "} catch { ownerAlive = false; }",
+    "let result;",
+    "if (ownerAlive) {",
+    "  result = { decision: 'decline', reason: 'owner-lease-held' };",
+    "} else {",
+    "  result = { decision: 'would-steal-stale' };",
+    "}",
+    "console.log(JSON.stringify(result));",
+  ].join('\n');
+  const probe = path.join(os.tmpdir(), `lease-probe-${process.pid}-${Date.now()}.mjs`);
+  await fs.writeFile(probe, script);
+  t.after(() => fs.rm(probe, { force: true }));
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const run = promisify(execFile);
+  const out = JSON.parse((await run(process.execPath, [probe, capture.leasePath()])).stdout);
+  assert.equal(out.decision, 'decline', `second real process declines the live owner (got ${JSON.stringify(out)})`);
+  assert.equal(capture.status().owner, true, 'owner lease intact after the second process declined');
+  // Dead owner (SIGKILL semantics): forge a lease whose pid does not exist.
+  const lease = JSON.parse(await fs.readFile(capture.leasePath(), 'utf8'));
+  const dead = { ...lease, pid: 999999999, starttime: '999999999' };
+  await fs.writeFile(capture.leasePath(), JSON.stringify(dead));
+  capture.ownership = null; // as a fresh process would see it
+  const stolen = await capture.acquireOwnership();
+  assert.equal(stolen, true, 'dead-owner lease is stolen after proven liveness failure');
+  assert.equal(capture.status().ownership_reason, 'stale-lease-recovered');
+  await capture.stop();
+});

@@ -104,12 +104,135 @@ export class CaptureCoordinator {
 
   ledgerDir() { return path.join(this.trace.store.base, 'capture-ledger'); }
 
+  // ---- P2-A: workspace-global G owner lease (campaign 2026-09-21) --------
+  // Two compatible V3 G writers must never both own one workspace. The
+  // lease is a small JSON file carrying enough identity to distinguish
+  // owners: pid, process start identity (boot id + /proc/<pid>/stat
+  // starttime — PID reuse is detected by the start identity, never trusted
+  // by PID alone), release identity, workspace ID, generation, acquisition
+  // time and a renewal heartbeat. Acquisition is exclusive-create. A stale
+  // lease is stolen ONLY after proven owner death (pid absent, or a
+  // /proc start-identity mismatch) — never by age alone (mission §25). If
+  // acquisition fails, this process does NOT run a writer: no second
+  // SQLite writer, no derived-write suppression, and enqueue losses go to
+  // the durable ledger (visible, never silent). HONEST LIMITATION (mission
+  // §26): a legacy plugin version predating the lease does not honor it —
+  // exclusion of legacy writers is impossible; the lease carries the
+  // owner's release identity so coexistence with a legacy writer is
+  // detectable in status instead of invisible.
+  leasePath() { return path.join(this.trace.store.root, 'owner-lease.json'); }
+
+  async #processStartIdentity() {
+    // Robust /proc/self/stat parsing: comm may contain spaces/parens, so
+    // starttime (field 22) is read AFTER the last ')'. Field indices after
+    // comm (1-based): state=1, ppid=2, ... starttime=22 → array index 19.
+    const identity = { pid: process.pid, boot_id: null, starttime: null, release: process.env.OPENCODE_RELEASE ?? null };
+    try {
+      const raw = await fs.readFile('/proc/self/stat', 'utf8');
+      const after = raw.slice(raw.lastIndexOf(')') + 2);
+      const fields = after.split(' ');
+      identity.starttime = fields[19];
+    } catch { /* best-effort; steal checks tolerate null identity by refusing to steal */ }
+    try { identity.boot_id = (await fs.readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim(); } catch { identity.boot_id = null; }
+    return identity;
+  }
+
+  /** Proven owner liveness: /proc/<pid> present AND its /proc starttime AND
+   *  boot id match the lease — PID reuse and machine reboot both fail this. */
+  async #ownerAlive(lease) {
+    if (!lease || typeof lease !== 'object' || !Number.isInteger(lease.pid) || lease.pid <= 0) return false;
+    if (!lease.starttime || !lease.boot_id) return false; // incomplete identity: never steal blindly either; report unknown
+    try {
+      const raw = await fs.readFile(`/proc/${lease.pid}/stat`, 'utf8');
+      const after = raw.slice(raw.lastIndexOf(')') + 2);
+      const startTicks = after.split(' ')[19];
+      const bootId = (await fs.readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim();
+      return startTicks === lease.starttime && bootId === lease.boot_id;
+    } catch { return false; } // /proc entry gone: owner is dead
+  }
+
+  async #readLease() {
+    try { return JSON.parse(await fs.readFile(this.leasePath(), 'utf8')); }
+    catch { return null; }
+  }
+
+  async acquireOwnership() {
+    const leasePath = this.leasePath();
+    const identity = await this.#processStartIdentity();
+    const payload = { ...identity, workspaceID: this.trace.store.workspaceID,
+      generation: this.generation, acquired_at: new Date().toISOString(), heartbeat_at: Date.now() };
+    try {
+      await fs.writeFile(leasePath, JSON.stringify(payload), { flag: 'wx', mode: 0o600 });
+      this.ownership = true; this.ownershipReason = null;
+      return true;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') { this.ownership = false; this.ownershipReason = `lease-write-${error?.code ?? 'error'}`; return false; }
+    }
+    const existing = await this.#readLease();
+    // Idempotent re-acquire: OUR OWN live lease (same pid + start identity)
+    // is not a conflict — e.g. start() called twice in one process.
+    if (existing && existing.pid === process.pid
+      && await this.#ownerAlive({ ...existing, pid: existing.pid })) {
+      this.ownership = true; this.ownershipReason = null;
+      return true;
+    }
+    if (existing && await this.#ownerAlive(existing)) {
+      this.ownership = false;
+      this.ownershipReason = (existing.release ?? '') === (payload.release ?? '')
+        ? 'owner-lease-held'
+        : 'owner-lease-held-legacy-writer-not-lease-aware-incompatible';
+      return false;
+    }
+    // Stale lease: archive for audit, then take ownership exclusively.
+    try { await fs.rename(leasePath, `${leasePath}.stale-${Date.now()}`); } catch { /* fall through */ }
+    try {
+      const fresh = { ...payload, generation: (existing?.generation ?? 0) + 1 };
+      await fs.writeFile(leasePath, JSON.stringify(fresh), { flag: 'wx', mode: 0o600 });
+      this.generation = fresh.generation;
+      this.ownership = true; this.ownershipReason = 'stale-lease-recovered';
+      return true;
+    } catch (error) {
+      this.ownership = false; this.ownershipReason = `owner-lease-race-${error?.code ?? 'error'}`;
+      return false;
+    }
+  }
+
+  renewOwnership() {
+    if (this.ownership !== true) return;
+    fs.readFile(this.leasePath(), 'utf8').then(text => {
+      const lease = JSON.parse(text);
+      if (lease.pid !== process.pid) return; // lost the lease; do not renew foreign files
+      lease.heartbeat_at = Date.now(); lease.generation = this.generation;
+      return fs.writeFile(this.leasePath(), JSON.stringify(lease), { mode: 0o600 });
+    }).catch(() => { /* lease lost; death/stop paths own recovery */ });
+  }
+
+  async releaseOwnership() {
+    if (this.leaseTimer) { clearInterval(this.leaseTimer); this.leaseTimer = null; }
+    if (this.ownership !== true) { this.ownership = null; return; }
+    try {
+      const lease = await this.#readLease();
+      if (lease && lease.pid === process.pid) await fs.rm(this.leasePath(), { force: true });
+    } catch { /* release best-effort; stale lease is stealable by design */ }
+    this.ownership = null; this.ownershipReason = null;
+  }
+
   async start() {
     if (this.stopped) return;
     await fs.mkdir(this.ledgerDir(), { recursive: true, mode: 0o700 });
+    // P2-A workspace-global owner lease: acquire BEFORE any writer or index
+    // ownership side effect. A non-owner process never spawns a worker and
+    // never suppresses host derived writes (mission §24: no second SQLite
+    // writer; enqueue losses ledger visibly).
+    const owned = await this.acquireOwnership();
+    if (!owned) { this.active = false; return; }
     // Single index owner: while the writer is alive the host does not
     // write the derived index; the worker's Store owns it.
     this.trace.store.suppressDerivedWrites = true;
+    // Renewal heartbeat: keeps the lease fresh; steal requires proven
+    // owner death (pid/start identity), never heartbeat age alone.
+    this.leaseTimer = setInterval(() => { try { this.renewOwnership(); } catch { /* best-effort */ } }, 15000);
+    if (this.leaseTimer.unref) this.leaseTimer.unref();
     this.spawnWorker();
     this.active = true;
   }
@@ -218,6 +341,11 @@ export class CaptureCoordinator {
     if (this.stopped) throw new Error('capture writer stopped');
     // §14: unresolved identities never enter G — and never consume a seq.
     assertCanonicalJob(job);
+    // P2-A: a non-owner process must not enqueue into its own (unowned)
+    // writer path. The envelope is still built+validated so the durable
+    // ledger records the loss with its exact identity; the next owner's
+    // drain turns it into trace.capture_gap markers (visible, never silent).
+    if (this.ownership === false) return { enqueued: false, dropped: true, ownership: false, reason: this.ownershipReason ?? 'owner-unavailable' };
     const session = job.host?.sessionID ?? null;
     const store = this.trace.store;
     let built;
@@ -280,6 +408,9 @@ export class CaptureCoordinator {
     this.active = false;
     this.trace.store.suppressDerivedWrites = false;
     if (worker) { try { await worker.terminate(); } catch { /* already gone */ } }
+    // P2-A: release the workspace owner lease (id-checked; stale leases are
+    // stealable by design, so a failed release never wedges the workspace).
+    await this.releaseOwnership();
   }
 
   status() {
@@ -294,6 +425,7 @@ export class CaptureCoordinator {
     // construction after acks. Sequence watermarks are per-session maxima.
     return {
       enabled: true, active: this.active, degraded: this.degraded, generation: this.generation,
+      owner: this.ownership, ownership_reason: this.ownershipReason ?? null,
       queue_depth: this.queue.length, queue_bytes: this.queueBytes,
       oldest_queue_age: this.queue.length ? Date.now() - this.queue[0].at : 0,
       in_flight: this.inFlight.size, dropped_total: this.droppedTotal,
