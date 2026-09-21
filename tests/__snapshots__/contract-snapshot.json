@@ -1,7 +1,28 @@
 {
-  "traceCommit": "06aaf66",
+  "traceCommit": "a8edd4f",
   "reviewerCommit": "55804520f324d8fb9fb6121e1acbe7ef2d4cbfbf",
   "traceTools": [
+    {
+      "name": "trace_prepare_citations",
+      "description": "S5 finalization: resolve and validate this turn's evidence handles into an EPHEMERAL, turn-scoped CitationSet token (process-local, non-CAS). The final handoff note cites the token via trace_note citation_set; the gateway revalidates it fail-closed (unknown/stale generation/CONTRADICTED claim all reject) and expands to canonical refs. Canonical evt_/blob_ refs remain the only durable identity; the model copies zero SHA strings.",
+      "input": {
+        "type": "object",
+        "properties": {
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "description": "This turn's short handles (e1/b1/n1) to bind into the set; 1..16 items."
+          }
+        },
+        "required": [
+          "evidence"
+        ],
+        "additionalProperties": false
+      }
+    },
     {
       "name": "trace_note",
       "description": "Save a concise durable decision, constraint, failure cause, blocker/next action, finding, handoff or structured milestone; skip routine logs. Cite evidence and label uncertainty; empty source_refs provides no corroboration. After verified correction/resolution, supersede your old note. Host supplies identity. Top-level kind is exactly one of the six note kinds (fact, finding, decision, unresolved, handoff, correction): do not invent other kinds; a state change is kind \"finding\", or milestone.kind \"state_change\", which maps to finding. Supply kind and text (summary is a compatibility alias), or milestone.kind and milestone.summary. Evidence is cited handle-first: this turn's short handles (e1/b1/n1 from the Evidence list) via the evidence field (or the compatibility source_handles/evidence_handles/supersedes/depends_on fields) are the normal interface; handles are turn-scoped labels resolved before storage, and durable notes always keep full canonical refs. Full canonical refs (evt_<64hex> or blob_<64hex>) copied verbatim from observed Trace output are the compatibility/advanced path: never shorten, reconstruct or invent refs. Handoff notes must name a reason type (context_limit|execution_budget|planned_checkpoint|user_request|runtime_failure|other) and an evidence source (host|provider|orchestrator|user|agent_judgment); Trace recall truncation alone never establishes context or session exhaustion.",
@@ -44,6 +65,11 @@
             },
             "maxItems": 16,
             "description": "PREFERRED evidence citation (handle-first): this turn's short handles (e1/b1/n1) from the Evidence list; full canonical refs are the compatibility path. Resolved to canonical source_refs before storage; durable notes always keep full canonical refs."
+          },
+          "citation_set": {
+            "type": "string",
+            "pattern": "^cb_[0-9a-f]{24}$",
+            "description": "S5 finalization: a prepare_citations token (cb_<24hex>). Revalidated fail-closed at write time (unknown/stale/contradicted sets reject); expands to canonical source_refs; the token never persists."
           },
           "source_handles": {
             "type": "array",

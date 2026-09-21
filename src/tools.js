@@ -58,6 +58,12 @@ export function definitions(trace) {
     }
   });
   return [
+    tool('trace_prepare_citations', 'S5 finalization: resolve and validate this turn\'s evidence handles into an EPHEMERAL, turn-scoped CitationSet token (process-local, non-CAS). The final handoff note cites the token via trace_note citation_set; the gateway revalidates it fail-closed (unknown/stale generation/CONTRADICTED claim all reject) and expands to canonical refs. Canonical evt_/blob_ refs remain the only durable identity; the model copies zero SHA strings.',
+      schema({ evidence: { ...refs, description: 'This turn\'s short handles (e1/b1/n1) to bind into the set; 1..16 items.' } }, ['evidence']),
+      async (i, h) => {
+        const out = await trace.gateway.prepareCitations(h.sessionID, i.evidence, h);
+        return out;
+      }),
     tool('trace_note', 'Save a concise durable decision, constraint, failure cause, blocker/next action, finding, handoff or structured milestone; skip routine logs. Cite evidence and label uncertainty; empty source_refs provides no corroboration. After verified correction/resolution, supersede your old note. Host supplies identity. Top-level kind is exactly one of the six note kinds (fact, finding, decision, unresolved, handoff, correction): do not invent other kinds; a state change is kind "finding", or milestone.kind "state_change", which maps to finding. Supply kind and text (summary is a compatibility alias), or milestone.kind and milestone.summary. Evidence is cited handle-first: this turn\'s short handles (e1/b1/n1 from the Evidence list) via the evidence field (or the compatibility source_handles/evidence_handles/supersedes/depends_on fields) are the normal interface; handles are turn-scoped labels resolved before storage, and durable notes always keep full canonical refs. Full canonical refs (evt_<64hex> or blob_<64hex>) copied verbatim from observed Trace output are the compatibility/advanced path: never shorten, reconstruct or invent refs. Handoff notes must name a reason type (context_limit|execution_budget|planned_checkpoint|user_request|runtime_failure|other) and an evidence source (host|provider|orchestrator|user|agent_judgment); Trace recall truncation alone never establishes context or session exhaustion.',
       schema({
         kind: { enum: ['fact', 'finding', 'decision', 'unresolved', 'handoff', 'correction'], description: 'Top-level note kind; exactly these six values. Do not invent other kinds; a state change is expressed as "finding" (milestone.kind "state_change" maps to finding).' },
@@ -65,6 +71,7 @@ export function definitions(trace) {
         summary: { ...str, maxLength: 4096, description: 'Compatibility alias for text. Prefer text; if both are supplied they must match.' },
         source_refs: { ...refs, description: 'Compatibility provenance path. Full canonical refs (evt_<64hex> or blob_<64hex>) copied verbatim from observed Trace output, or this turn\'s short evidence handles (e1/b1/n1). Never shorten, reconstruct or invent; omit when the exact ref is unavailable. Prefer the evidence field.' },
         evidence: { ...refs, description: 'PREFERRED evidence citation (handle-first): this turn\'s short handles (e1/b1/n1) from the Evidence list; full canonical refs are the compatibility path. Resolved to canonical source_refs before storage; durable notes always keep full canonical refs.' },
+        citation_set: { ...str, pattern: '^cb_[0-9a-f]{24}$', description: 'S5 finalization: a prepare_citations token (cb_<24hex>). Revalidated fail-closed at write time (unknown/stale/contradicted sets reject); expands to canonical source_refs; the token never persists.' },
         source_handles: { ...refs, description: 'Compatibility alias: turn-scoped evidence handles (e1/b1/n1) from the current Evidence list; resolved to canonical refs before storage.' },
         supersedes: { ...refs, description: 'Your prior note refs, verified corrected/resolved. Hides from active recall, preserves history; never close still-open issues. Canonical refs or evidence handles.' },
         depends_on: refs,

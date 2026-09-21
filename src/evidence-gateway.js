@@ -22,7 +22,8 @@
 
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
-import { refPattern } from './util.js';
+import { randomUUID } from 'node:crypto';
+import { hash, stable, refPattern } from './util.js';
 import { assignSnapshotHandles, HANDLE_PATTERN, handleFailureMessage } from './handles.js';
 
 export class EvidenceGateway {
@@ -33,6 +34,8 @@ export class EvidenceGateway {
    */
   constructor(trace) {
     this.trace = trace;
+    // S5: process-local, host-managed CitationSets (non-CAS, never durable).
+    this.citationSets = new Map();
   }
 
   get handles() { return this.trace.handles; }
@@ -83,15 +86,7 @@ export class EvidenceGateway {
     return true;
   }
 
-  /**
-   * Claim ingress: trace_claim routes through Trace.recordClaim, which
-   * validates every riding ref via the gateway (unified S2 ingress). The
-   * gateway deliberately does NOT add a second claim entry point (S3
-   * decision: a duplicate ingress invites divergence); the claim-as-n#
-   * presentation is the write-return registration in the tool layer.
-   */
-
-  // ---- citation resolution ----
+  // ---- citation resolution (S3/S5) ----
 
   /**
    * THE single citation entry point (S3 makes this the only model-facing
@@ -237,6 +232,9 @@ export class EvidenceGateway {
       input.source_refs = [...new Set([...(input.source_refs ?? []), ...input.evidence])];
       delete input.evidence;
     }
+    // S5 finalization: a prepared CitationSet revalidates fail-closed and
+    // expands to canonical refs; the token never reaches the core API.
+    if (input.citation_set !== undefined) await this.normalizeCitationSet(input, sessionID);
     const merge = (container, handleField, canonicalField) => {
       const handles = container[handleField];
       if (handles === undefined) return;
@@ -272,6 +270,98 @@ export class EvidenceGateway {
   /** Register refs discovered by read tools this turn (delegation). */
   registerEvidence(sessionID, refs = []) {
     return this.handles.register(sessionID, refs);
+  }
+
+  // ---- CitationSet (S5, mission §14-§17) ----
+  // EPHEMERAL, turn-scoped, host-managed, non-CAS. The set resolves and
+  // validates handles ONCE (prepareCitations); the finalization write cites
+  // the token and the gateway REVALIDATES it before storage. No new durable
+  // identity: the token lives only in this process Map and dies with the
+  // turn/generation. Canonical refs remain the only durable identity.
+
+  /**
+   * Resolve+validate citation handles into an ephemeral CitationSet.
+   * Fail closed on any handle that does not resolve. No SHA copying: the
+   * input is handles only; canonical refs live inside the host-held set.
+   */
+  async prepareCitations(sessionID, tokens, host = {}) {
+    if (!Array.isArray(tokens) || !tokens.length || tokens.length > 16) throw new Error('prepare_citations: evidence must be 1..16 handles');
+    const entries = [];
+    for (const token of tokens) {
+      if (typeof token !== 'string' || !HANDLE_PATTERN.test(token.trim())) {
+        throw new Error(`prepare_citations: accepts only evidence handles like e1/n2/b3; got ${JSON.stringify(String(token).slice(0, 40))}`);
+      }
+      const resolved = await this.resolveCitation(sessionID, token.trim(), 'evidence');
+      // Claim refs must not be CONTRADICTED at prepare time (S5 staleness).
+      let claim_state = null;
+      const row = this.store.findEntriesAll({ ref: resolved.ref }, null, 1)[0];
+      if (row?.type === 'trace.claim') {
+        const payload = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
+        claim_state = payload.claim_status;
+        if (claim_state === 'CONTRADICTED') throw new Error(`prepare_citations: evidence ${resolved.ref.slice(0, 15)}… is a CONTRADICTED claim; it cannot justify a candidate`);
+      }
+      entries.push({ ref: resolved.ref, via: resolved.via, kind: resolved.kind, handle: resolved.handle, role: resolved.kind === 'note' ? 'semantic' : 'execution', ...(claim_state ? { claim_state } : {}) });
+    }
+    const generation = this.handles.active.get(sessionID);
+    if (!generation) throw new Error('prepare_citations: no live handle generation for this session');
+    const token = `cb_${hash(stable({ refs: entries.map(e => e.ref), at: Date.now(), rnd: randomUUID() })).slice(0, 24)}`;
+    const set = {
+      token, sessionID,
+      entries,
+      refs: [...new Set(entries.map(e => e.ref))],
+      coverage_snapshot: this.store.coverage.status(),
+      generation_created_at: generation.created_at,
+      created_at: Date.now(),
+      expiry: 'turn-scoped: invalidated when this session installs a new handle generation or the process ends',
+    };
+    this.citationSets.set(token, set);
+    if (this.citationSets.size > 64) {
+      const oldest = this.citationSets.keys().next().value;
+      this.citationSets.delete(oldest);
+    }
+    return { token, refs: set.refs, entries, coverage_snapshot: set.coverage_snapshot, semantics: 'ephemeral turn-scoped citation set; canonical evt_/blob_ refs remain the only durable identity' };
+  }
+
+  /**
+   * Revalidate a CitationSet at write time (fail closed on staleness):
+   * unknown token, generation replaced (new runtime frame installed),
+   * refs deleted, or a claim flipped to CONTRADICTED all reject. Never
+   * silently lets an old set justify a new durable claim.
+   */
+  async revalidateCitationSet(sessionID, token) {
+    const set = this.citationSets.get(token);
+    if (!set) throw new Error(`Unknown citation_set '${token}': prepare_citations first (sets are process-local and turn-scoped)`);
+    if (set.sessionID !== sessionID) throw new Error(`citation_set '${token}' belongs to a different session`);
+    const generation = this.handles.active.get(sessionID);
+    if (!generation || generation.created_at !== set.generation_created_at) {
+      throw new Error(`citation_set '${token}' is stale: a new runtime snapshot replaced this turn's handle generation; re-run prepare_citations`);
+    }
+    for (const entry of set.entries) {
+      const row = this.store.findEntriesAll({ ref: entry.ref }, null, 1)[0];
+      if (!row) throw new Error(`citation_set '${token}' is stale: evidence ${entry.ref.slice(0, 15)}… no longer exists`);
+      if (row.type === 'trace.claim') {
+        const payload = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
+        if (payload.claim_status === 'CONTRADICTED') {
+          throw new Error(`citation_set '${token}' is stale: claim ${entry.ref.slice(0, 15)}… was CONTRADICTED after the set was prepared`);
+        }
+      }
+    }
+    return set;
+  }
+
+  /**
+   * trace_note citation_set revalidation + expansion (S5 finalization flow):
+   * the durable note receives canonical refs only; the token never persists.
+   */
+  async normalizeCitationSet(input, sessionID) {
+    if (input.citation_set === undefined) return null;
+    if (typeof input.citation_set !== 'string' || !/^cb_[0-9a-f]{24}$/.test(input.citation_set)) {
+      throw new Error(`citation_set must be a prepare_citations token (cb_<24hex>); got ${JSON.stringify(String(input.citation_set).slice(0, 40))}`);
+    }
+    const set = await this.revalidateCitationSet(sessionID, input.citation_set);
+    input.source_refs = [...new Set([...(input.source_refs ?? []), ...set.refs])];
+    delete input.citation_set;
+    return set;
   }
 
   /** The model-visible handle projection for a finished snapshot (delegation; S3/S4 evolve this). */
