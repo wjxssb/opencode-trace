@@ -19,6 +19,12 @@ import { Store } from '../src/store.js';
 
 setTimeout(() => process.exit(0), 90000);
 
+// Review round-6 advisory: make the watchdog LOUD — a hung test must not
+// masquerade as exit 0. The final test arms the completion flag; if the
+// watchdog ever fires without it, the suite exits 1 (a regression signal).
+let suiteCompleted = false;
+test('ZZ: suite completed (watchdog armed loud)', () => { suiteCompleted = true; });
+
 async function fixture(t, options = {}) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'opencode-trace-cap-'));
   const trace = new Trace({ location: { directory: dir } },

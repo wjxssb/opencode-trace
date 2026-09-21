@@ -224,12 +224,18 @@ export class Trace {
     this.ready = this.store.init();
     if (options.captureWriter) {
       // Phase G: non-blocking capture (opt-in). Started after the store is
-      // ready (the coordinator needs the store root); failure degrades to the
-      // synchronous path with a warning — the host is never blocked by it.
+      // ready (the coordinator needs the store root); a start() failure must
+      // TRULY degrade to the synchronous path — this.ready stays resolved so
+      // host hooks and tools keep working (review round-6 advisory 4).
       this.ready = this.ready.then(async () => {
-        const { CaptureCoordinator } = await import('./capture.js');
-        this.capture = new CaptureCoordinator(this, options);
-        await this.capture.start();
+        try {
+          const { CaptureCoordinator } = await import('./capture.js');
+          this.capture = new CaptureCoordinator(this, options);
+          await this.capture.start();
+        } catch (error) {
+          this.capture = undefined;
+          this.warning('capture_start', error);
+        }
       });
     }
     this.ready.catch(error => this.warning('startup', error));

@@ -43,6 +43,10 @@ export class DerivedIndex {
     try {
       await fs.mkdir(this.dir, { recursive: true, mode: 0o700 });
       this.db = new DatabaseSync(path.join(this.dir, 'index.db'));
+      // Phase G soak advisory: the host (read-mostly) and the capture writer
+      // (single writer) share this DB; a busy timeout turns rare lock
+      // contention into a short wait instead of an immediate SQLITE_BUSY.
+      this.db.exec('PRAGMA busy_timeout = 2000');
       this.db.exec(SCHEMA);
       const version = this.db.prepare("SELECT v FROM meta WHERE k='schema_version'").get()?.v ?? null;
       this.persistedCount = Number(this.db.prepare("SELECT v FROM meta WHERE k='cas_count'").get()?.v ?? 0);
