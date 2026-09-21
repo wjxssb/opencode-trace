@@ -14,6 +14,7 @@ import * as os from 'node:os';
 import path from 'node:path';
 import { Trace } from '../src/trace.js';
 import { definitions } from '../src/tools.js';
+import { assignSnapshotHandles, renderHandlePressure } from '../src/handles.js';
 
 async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'opencode-trace-handlefirst-'));
@@ -117,4 +118,74 @@ test('S3-6: tool descriptions present handles as the normal interface, canonical
   assert.match(claim.description, /handle-first/i);
   assert.match(claim.input.properties.evidence.description, /PREFERRED/);
   assert.match(claim.input.properties.source_refs.description, /compatibility path/i);
+});
+
+// ---- S4: full handle coverage + explicit handle pressure ----
+
+test('S4-1: leak detector — every citeable canonical ref in the final view carries a handle', async t => {
+  const { trace } = await fixture(t);
+  await trace.after({ sessionID: 's1', messageID: 'm1', id: 'c1', agent: 'build',
+    tool: 'shell', input: { command: 'leak-detector-evidence' }, status: 'completed', result: { output: 'ok' } });
+  const { snapshot: s0 } = trace.recallSnapshot('s1');
+  await trace.note({ kind: 'handoff', text: 'evidence handoff', source_refs: [s0.recent.at(-1).ref],
+    milestone: { kind: 'handoff', summary: 'leak detector handoff' } }, host());
+  await trace.note({ kind: 'unresolved', text: 'open blocker: pending review debt' }, host());
+  await trace.intent({ summary: 'leak detector goal', status: 'active', paths: [], resources: [] }, host());
+  const { snapshot, assignments } = trace.recallSnapshot('s1');
+  const visible = new Set();
+  for (const row of snapshot.recent ?? []) { visible.add(row.ref); for (const o of row.outputs ?? []) visible.add(o.ref); }
+  for (const n of [...(snapshot.notes ?? []), ...(snapshot.unresolved ?? [])]) visible.add(n.ref);
+  if (snapshot.current_intent?.ref) visible.add(snapshot.current_intent.ref);
+  for (const r of snapshot.active_memory?.evidence_refs ?? []) visible.add(r);
+  if (snapshot.compact?.ref) visible.add(snapshot.compact.ref);
+  const handled = new Set((assignments ?? []).map(a => a.ref));
+  for (const ref of visible) {
+    assert.ok(handled.has(ref), `naked canonical ref without a handle in the recall view: ${ref.slice(0, 15)}…`);
+  }
+  for (const a of assignments ?? []) {
+    assert.ok(visible.has(a.ref), `handle outliving its content: ${a.handle}`);
+  }
+  assert.equal(snapshot.handles_truncated, false, 'small views never truncate');
+});
+
+test('S4-2: peer note/handoff/intent refs receive handles (no naked peer refs)', async t => {
+  const { trace } = await fixture(t);
+  await trace.after({ sessionID: 'peer', messageID: 'mp', id: 'cp', agent: 'build',
+    tool: 'shell', input: { command: 'peer evidence' }, status: 'completed', result: { output: 'ok' } });
+  await trace.note({ kind: 'handoff', text: 'peer handoff to others',
+    milestone: { kind: 'handoff', summary: 'peer handoff', to_session: 's2' } }, host('peer'));
+  await trace.intent({ summary: 'peer goal', status: 'active', paths: [], resources: [] }, host('peer'));
+  const { snapshot, assignments } = trace.recallSnapshot('s2');
+  trace.handles.newGeneration('s2', assignments ?? []);
+  const peer = (snapshot.peers ?? []).find(p => p.sessionID === 'peer');
+  assert.ok(peer, 'peer row visible');
+  const handled = new Set((assignments ?? []).map(a => a.ref));
+  for (const ref of peer.note_refs ?? []) {
+    assert.ok(handled.has(ref), `peer note ref must carry a handle: ${ref.slice(0, 15)}…`);
+  }
+  if (peer.handoff?.ref) assert.ok(handled.has(peer.handoff.ref), 'peer handoff ref must carry a handle');
+  if (peer.intent?.ref) assert.ok(handled.has(peer.intent.ref), 'peer intent ref must carry a handle');
+});
+
+test('S4-3: handle pressure is loud and structured when the cap is reached (never silent)', () => {
+  // Deterministic unit pin of the §13 contract: after SNAPSHOT_HANDLE_CAP,
+  // the flags flip and the pressure trailer renders (integration recall
+  // paths also flow these flags — see S4-1 for the small-view false case).
+  const view = { recent: [], notes: [], unresolved: [], current_intent: null, active_memory: {}, peers: [], compact: null };
+  const mk = i => `evt_${String(i).padStart(2, '0')}${'ab'.repeat(31)}`;
+  view.recent = Array.from({ length: 8 }, (_, i) => ({
+    ref: mk(i), tool: 'shell', status: 'completed',
+    outputs: Array.from({ length: 9 }, (_, k) => ({ ref: `blob_${String(i * 9 + k).padStart(2, '0')}${'cd'.repeat(31)}`, bytes: 4 })),
+  }));
+  const assignments = assignSnapshotHandles(view);
+  assert.equal(assignments.length, 64, 'assignment is capped at 64');
+  assert.equal(view.handles_truncated, true, 'cap overflow sets handles_truncated');
+  assert.equal(view.retrieve_to_cite_required, true, 'cap overflow sets retrieve_to_cite_required');
+  assert.ok(view.evidence_handles.length === 64);
+  const pressure = renderHandlePressure(view);
+  assert.match(pressure, /HANDLE CAPACITY REACHED/);
+  assert.match(pressure, /handles_truncated: true/);
+  assert.match(pressure, /retrieve_to_cite_required: true/);
+  assert.match(pressure, /trace_find \/ trace_expand/, 'the trailer directs retrieve-to-cite');
+  assert.equal(renderHandlePressure({ handles_truncated: false }), '', 'no noise when the cap is not reached');
 });

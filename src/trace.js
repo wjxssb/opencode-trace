@@ -6,7 +6,7 @@ import { atomic, bytes, stable, hash, identity, callKey, locator, mutationPaths,
 import { compactGuidance, compactions, saveCompact } from './compact.js';
 import { normalizeTraceIntentInput } from './normalization.js';
 import { validateNoteInput, isAffirmativeState, hasExplicitFailure } from './note-validation.js';
-import { HandleRegistry, assignSnapshotHandles, renderEvidenceHandles, HANDLE_PATTERN, handleFailureMessage } from './handles.js';
+import { HandleRegistry, assignSnapshotHandles, renderEvidenceHandles, renderHandlePressure, HANDLE_PATTERN, handleFailureMessage } from './handles.js';
 import { EvidenceGateway } from './evidence-gateway.js';
 import { claimFromProse, claimFromReceipt, claimStaleness } from './claims.js';
 import { TokenCounter, DEFAULT_TOKEN_BUDGET } from './tokens.js';
@@ -900,7 +900,7 @@ export class Trace {
       view.coverage.unresolved_shown = view.unresolved.length;
       const activeText = this.formatActiveMemory(view.active_memory, view);
       const activeSection = activeText ? `\n\n=== ACTIVE MILESTONE MEMORY ===\n${activeText}` : '';
-      const handlesSection = renderEvidenceHandles(view.evidence_handles);
+      const handlesSection = renderEvidenceHandles(view.evidence_handles) + renderHandlePressure(view);
       return prefix + stable(view) + activeSection + handlesSection + staticGuidance;
     };
     // Structural priorities only, no classification of shell text or semantic keywords.

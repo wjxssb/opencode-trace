@@ -59,8 +59,10 @@ export function assignSnapshotHandles(view) {
   const assignments = [];
   const seen = new Set();
   const ordinals = { e: 0, b: 0, n: 0 };
+  let truncated = 0;
   const add = (kind, ref, label) => {
-    if (assignments.length >= SNAPSHOT_HANDLE_CAP || typeof ref !== 'string' || !refPattern.test(ref) || seen.has(ref)) return;
+    if (typeof ref !== 'string' || !refPattern.test(ref) || seen.has(ref)) return;
+    if (assignments.length >= SNAPSHOT_HANDLE_CAP) { truncated += 1; return; }
     seen.add(ref);
     const prefix = kind === 'blob' ? 'b' : kind === 'note' ? 'n' : 'e';
     ordinals[prefix] += 1;
@@ -85,6 +87,21 @@ export function assignSnapshotHandles(view) {
     add('note', note.ref, `note(${note.kind ?? '?'})`);
   }
   if (view.current_intent?.ref) add('event', view.current_intent.ref, `intent(${view.current_intent.status ?? '?'})`);
+  // S4 full coverage: peer declarations and compaction refs are ordinary
+  // citeable evidence — wherever a canonical ref is model-visible, a handle
+  // must be available too (mission §10).
+  for (const peer of view.peers ?? []) {
+    for (const ref of peer.note_refs ?? []) add('event', ref, `peer note · ${peer.sessionID}`);
+    if (peer.handoff?.ref) add('event', peer.handoff.ref, `peer handoff · ${peer.sessionID}`);
+    if (peer.intent?.ref) add('event', peer.intent.ref, `peer intent · ${peer.intent.status ?? '?'}`);
+  }
+  if (view.compact?.ref) add('event', view.compact.ref, 'compaction checkpoint');
+  for (const ref of view.compact?.refs ?? []) add('event', ref, 'compaction ref');
+  // S4 §13: handle pressure is explicit, never silent. After the cap, a
+  // citeable canonical ref would appear WITHOUT a handle — that must be a
+  // loud, structured state that tells the model to retrieve before citing.
+  view.handles_truncated = truncated > 0;
+  view.retrieve_to_cite_required = truncated > 0;
   view.evidence_handles = assignments.map(a => ({
     handle: a.handle,
     kind: a.kind,
@@ -99,6 +116,12 @@ export function renderEvidenceHandles(rows) {
   if (!Array.isArray(rows) || !rows.length) return '';
   const lines = rows.map(r => `[${r.handle}] ${r.label ?? r.kind}${r.ref ? ` → ${r.ref}` : ''}`);
   return `\n\n=== EVIDENCE HANDLES (turn-scoped labels; pass them to trace tools) ===\n${lines.join('\n')}`;
+}
+
+/** S4 §13: the explicit handle-pressure trailer for the recall text. */
+export function renderHandlePressure(view) {
+  if (!view?.handles_truncated) return '';
+  return `\n\n=== HANDLE CAPACITY REACHED ===\nSome citeable evidence in this snapshot has no assigned handle (handles_truncated: true, retrieve_to_cite_required: true). Do NOT copy canonical refs for it: run trace_find / trace_expand to register a fresh handle for any evidence you need to cite.`;
 }
 
 export function handleFailureMessage(sessionID, handle, reason) {
