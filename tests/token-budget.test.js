@@ -82,7 +82,7 @@ test('E9: low-priority classes drop first (order recorded)', async t => {
   const { trace } = await fixture(t, { runtimeContextTokenBudget: 900 });
   await pressure(trace, 30);
   const { snapshot } = trace.recallSnapshot('s1');
-  const dropped = snapshot.context_budget?.dropped ?? [];
+  const dropped = snapshot.frame_budget?.dropped ?? [];
   assert.ok(dropped.length > 0, 'drop classes recorded');
   const firstHeavy = dropped.find(d => d !== 'evidence_handles');
   // The fixture has no peer sessions, so the first heavy class is `recent`;
@@ -140,14 +140,14 @@ test('E14: runtime-context stays late with marker intact; budget receipt recorde
   await pressure(trace, 12);
   const { recall, snapshot } = await trace.context({ sessionID: 's1', messages: [], agent: 'build', model: { providerID: 'local-qwen-auto', id: '27b-dense' } });
   assert.match(recall, /^OPENCODE_TRACE_RECALL_V1/);
-  assert.ok(snapshot.context_budget?.unit === 'tokens');
-  assert.ok(snapshot.context_budget?.estimated > 0);
-  assert.ok(snapshot.context_budget?.tokens_exact == null || snapshot.context_budget.tokens_exact > 0);
+  assert.ok(snapshot.frame_budget?.unit === 'tokens');
+  assert.ok(snapshot.frame_budget?.estimated > 0);
+  assert.ok(snapshot.frame_budget?.tokens_exact == null || snapshot.frame_budget.tokens_exact > 0);
   // §8.8 final-frame invariant, part 1: the receipt's estimate describes the
   // FINAL model-visible frame and must fit the configured budget whenever the
   // mandatory-frame floor (~1400 est tokens) leaves room to fit.
-  assert.ok(snapshot.context_budget.estimated <= 2000,
-    `final frame estimate ${snapshot.context_budget.estimated} exceeds configured budget 2000`);
+  assert.ok(snapshot.frame_budget.estimated <= 2000,
+    `final frame estimate ${snapshot.frame_budget.estimated} exceeds configured budget 2000`);
   // Part 2 (regression detector): the receipt must describe the DELIVERED
   // frame. An independent measurement of the returned recall text must agree
   // with the recorded estimate. This fails if budgeting regresses to
@@ -155,8 +155,24 @@ test('E14: runtime-context stays late with marker intact; budget receipt recorde
   // (the receipt would under-measure the delivered frame coherently with the
   // bug, so the <= budget assertion alone cannot catch it).
   const independent = new TokenCounter({}).estimate(recall);
-  assert.ok(Math.abs(independent - snapshot.context_budget.estimated) <= 4,
-    `receipt estimated ${snapshot.context_budget.estimated} but the delivered frame independently measures ${independent}`);
+  assert.ok(Math.abs(independent - snapshot.frame_budget.estimated) <= 4,
+    `receipt estimated ${snapshot.frame_budget.estimated} but the delivered frame independently measures ${independent}`);
+});
+
+// Production incident 2026-09-20: the receipt was named `context_budget`, the
+// model read `estimated`/`budget` as its context window (38% real usage) and
+// finalized a false "context exhausted" handoff. The receipt must carry the
+// explicit Trace-display-only semantics instead.
+test('E16: the budget receipt can never read as model-context telemetry', async t => {
+  const { trace } = await fixture(t, { runtimeContextTokenBudget: 2000 });
+  await pressure(trace, 12);
+  const { recall, snapshot } = await trace.context({ sessionID: 's1', messages: [], agent: 'build', model: { providerID: 'local-qwen-auto', id: '27b-dense' } });
+  assert.ok(!('context_budget' in snapshot), 'regression: model-hostile receipt name returned');
+  assert.ok(snapshot.frame_budget, 'frame_budget receipt present');
+  assert.equal(snapshot.frame_budget.not_model_context, true);
+  assert.equal(snapshot.frame_budget.scope, 'trace_recall_frame_display_only');
+  assert.match(snapshot.frame_budget.meaning, /not the model context window/);
+  assert.ok(!recall.includes('context_budget'), 'delivered frame must not carry the ambiguous legacy name');
 });
 
 test('E15: sub-floor budgets degrade honestly (documented §18 tolerance)', async t => {
@@ -170,7 +186,7 @@ test('E15: sub-floor budgets degrade honestly (documented §18 tolerance)', asyn
   // recall_truncated semantics are unchanged (a Trace-side display budget,
   // never session/model/execution exhaustion).
   assert.ok(snapshot.active_memory, 'critical floor preserved even below the frame floor');
-  assert.ok(snapshot.context_budget?.estimated > snapshot.context_budget?.budget,
+  assert.ok(snapshot.frame_budget?.estimated > snapshot.frame_budget?.budget,
     'sub-floor budget reported honestly (estimated > budget)');
   assert.equal(snapshot.recall_truncated, undefined, 'byte ceiling not hit; no truncation flag');
 });

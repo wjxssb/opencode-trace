@@ -947,9 +947,17 @@ export class Trace {
     const HANDLE_RESERVE = 192;
     const target = Math.max(0, tokenBudget - HANDLE_RESERVE);
     const receipt = () => {
-      view.context_budget = { unit: 'tokens', budget: tokenBudget,
+      // Model-visible name is deliberately NOT "context_budget": the frame is
+      // a bounded TRACE-side display projection, and a field named after the
+      // model context invited false "context exhausted" claims (production
+      // incident 2026-09-20: a worker read estimated/budget as its context
+      // window at 38% real usage and finalized a handoff). The receipt must
+      // read as what it is: the display budget of this recall frame only.
+      view.frame_budget = { unit: 'tokens', budget: tokenBudget,
         estimated: this.tokens.estimate(render()), mode: this.tokens.mode,
-        dropped: [...new Set(dropped)] };
+        dropped: [...new Set(dropped)],
+        scope: 'trace_recall_frame_display_only', not_model_context: true,
+        meaning: 'Display budget of THIS Trace recall frame (a Trace-side observer projection), not the model context window, session state, or execution budget. Dropped classes stay retrievable via trace_find / trace_expand; nothing implies exhaustion.' };
     };
     let guard = 0;
     while (this.tokens.estimate(render()) > target && guard++ < 400) {
@@ -1027,7 +1035,7 @@ export class Trace {
     // canonical refs; the handle -> ref mapping is process-memory only.
     this.handles.newGeneration(e.sessionID, assignments ?? []);
     // Phase E receipt: exact local-tokenizer count when the endpoint is up.
-    if (snapshot?.context_budget) snapshot.context_budget.tokens_exact = await this.tokens.count(recall).catch(() => null);
+    if (snapshot?.frame_budget) snapshot.frame_budget.tokens_exact = await this.tokens.count(recall).catch(() => null);
     const ids = (e.messages ?? []).map(messageID).filter(Boolean);
     // The exact messages are durable message.persisted events above. Avoid
     // copying the cumulative ID prefix on every turn (quadratic storage).

@@ -151,13 +151,13 @@ test('typed runtime projection matches one bounded checkpoint and keeps all stat
     return JSON.parse(checkpoint.recall.split('\n')[2]);
   }));
   // The delivered snapshot carries the post-render exact-count telemetry
-  // (context_budget.tokens_exact) that the durable rendered frame intentionally
+  // (frame_budget.tokens_exact) that the durable rendered frame intentionally
   // does not contain: adding the field to the frame would change the very
   // count it reports. Strip that documented telemetry key, then the persisted
   // checkpoint must equal the delivered projection byte for byte.
   const delivered = request => {
     const s = structuredClone(get(request));
-    if (s?.context_budget) { const { tokens_exact, ...rest } = s.context_budget; s.context_budget = rest; }
+    if (s?.frame_budget) { const { tokens_exact, ...rest } = s.frame_budget; s.frame_budget = rest; }
     return s;
   };
   assert.ok(snapshots.some(snapshot => JSON.stringify(snapshot) === JSON.stringify(delivered(first))));

@@ -271,7 +271,7 @@ test('HF-H12: Phase E pruning never leaves a citeable canonical ref without its 
   // A handoff note carrying evidence refs makes them active-memory evidence.
   await trace.note({ kind: 'handoff', text: 'parser handoff', milestone: { kind: 'handoff', summary: 'parser handoff', evidence_refs: [] } }, host());
   const { snapshot, assignments } = trace.recallSnapshot('s1');
-  assert.ok((snapshot.context_budget?.dropped ?? []).length > 0, 'pruning must actually engage');
+  assert.ok((snapshot.frame_budget?.dropped ?? []).length > 0, 'pruning must actually engage');
   const visible = new Set();
   for (const row of snapshot.recent ?? []) { visible.add(row.ref); for (const o of row.outputs ?? []) visible.add(o.ref); }
   for (const n of [...(snapshot.notes ?? []), ...(snapshot.unresolved ?? [])]) visible.add(n.ref);
