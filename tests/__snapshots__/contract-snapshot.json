@@ -1,5 +1,5 @@
 {
-  "traceCommit": "a8edd4f",
+  "traceCommit": "eb6196e",
   "reviewerCommit": "55804520f324d8fb9fb6121e1acbe7ef2d4cbfbf",
   "traceTools": [
     {
@@ -8,7 +8,7 @@
       "input": {
         "type": "object",
         "properties": {
-          "evidence": {
+          "handles": {
             "type": "array",
             "items": {
               "type": "string"
@@ -18,7 +18,7 @@
           }
         },
         "required": [
-          "evidence"
+          "handles"
         ],
         "additionalProperties": false
       }

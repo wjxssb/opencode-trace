@@ -310,6 +310,10 @@ export class EvidenceGateway {
       entries,
       refs: [...new Set(entries.map(e => e.ref))],
       coverage_snapshot: this.store.coverage.status(),
+      // Staleness is generation-OBJECT identity, not timestamp equality:
+      // two rotations can land in the same millisecond. A replaced turn
+      // always installs a fresh generation object.
+      generation,
       generation_created_at: generation.created_at,
       created_at: Date.now(),
       expiry: 'turn-scoped: invalidated when this session installs a new handle generation or the process ends',
@@ -333,7 +337,7 @@ export class EvidenceGateway {
     if (!set) throw new Error(`Unknown citation_set '${token}': prepare_citations first (sets are process-local and turn-scoped)`);
     if (set.sessionID !== sessionID) throw new Error(`citation_set '${token}' belongs to a different session`);
     const generation = this.handles.active.get(sessionID);
-    if (!generation || generation.created_at !== set.generation_created_at) {
+    if (!generation || generation !== set.generation) {
       throw new Error(`citation_set '${token}' is stale: a new runtime snapshot replaced this turn's handle generation; re-run prepare_citations`);
     }
     for (const entry of set.entries) {

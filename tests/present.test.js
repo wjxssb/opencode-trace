@@ -170,7 +170,7 @@ test('boundedRaw: omits oversized raw with an explicit marker, keeps small raw v
 });
 
 test('tools: definitions wire the presentation layer end-to-end', async () => {
-  const [noteTool] = definitions(fakeTrace);
+  const noteTool = definitions(fakeTrace).find(d => d.name === 'trace_note');
   assert.equal(noteTool.name, 'trace_note');
   const res = await noteTool.execute({ kind: 'finding', text: 'wired', source_refs: [] }, { sessionID: 'ses_t', id: 'call_1' });
   assert.equal(res.metadata.opencode_trace, true);
