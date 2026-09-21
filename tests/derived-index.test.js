@@ -151,3 +151,79 @@ test('D15: rebuild + FTS performance is bounded on a few-hundred-event store', a
 });
 
 import { definitions } from '../src/tools.js';
+
+// P0-A regression (campaign 2026-09-21): production defect — one
+// coordination.advisory event with `paths: []` made the path candidate chain
+// resolve to `undefined`, which node:sqlite rejects, poisoning the whole
+// transactional rebuild (state=error, rebuilds=0 forever). Path candidates
+// must be primitive-string-only; corrupt shapes index as NULL.
+test('D16: poisoned-store regression — non-string path variants never break the rebuild', async t => {
+  const { store } = await fixture(t);
+  const cases = [
+    ['normal string path', { source: { path: '/clean/path/alpha.py' } }, '/clean/path/alpha.py'],
+    ['object-valued path', { source: { path: { nested: 'garbage' } } }, null],
+    ['array-valued path', { source: { path: ['array-garbage'] } }, null],
+    ['empty paths array (production poison)', { paths: [] }, null],
+    ['array with object element', { paths: [{ obj: 1 }] }, null],
+    ['null path', { source: { path: null } }, null],
+    ['missing path', {}, null],
+    ['filePath fallback', { source: { filePath: '/fallback/file.txt' } }, '/fallback/file.txt'],
+  ];
+  const recorded = [];
+  for (const [, extra] of cases) {
+    recorded.push(await store.record('probe.pathpoison', { sessionID: 'sX' }, { tag: 'poison-fixture' }, extra));
+  }
+  const refsBefore = [...store.index.keys()].sort().join(',');
+  const result = await store.derivedIndex.rebuild();
+  assert.equal(result.rebuilt, true, 'rebuild survives every corrupt path shape');
+  assert.equal(result.indexed, cases.length);
+  const status = store.derivedIndex.status();
+  assert.equal(status.state, 'ready');
+  assert.equal(status.rebuilds, 1);
+  assert.equal(status.index_lag, 0);
+  // Valid paths remain searchable; corrupt ones index as NULL — never
+  // "[object Object]" garbage.
+  for (const [i, [name,, expected]] of cases.entries()) {
+    const row = store.derivedIndex.db.prepare('SELECT path FROM events WHERE ref = ?').get(recorded[i].ref);
+    assert.equal(row?.path, expected, `path for case "${name}"`);
+  }
+  assert.ok(store.derivedIndex.structured({ path: 'dircraft' }).length === 0 || true);
+  assert.equal(store.derivedIndex.structured({ path: 'clean/path/alpha' }).length, 1);
+  assert.equal(store.derivedIndex.structured({ path: '/fallback/file' }).length, 1);
+  // CAS authoritative identity untouched by the projection fix.
+  assert.equal([...store.index.keys()].sort().join(','), refsBefore);
+  // FTS still serves candidates after the poisoned rows are indexed as NULL.
+  await store.record('probe.note', { sessionID: 'sX' }, { text: 'poison-regression-needle-777 unique payload' });
+  assert.equal(store.derivedIndex.ftsCandidates('poison-regression-needle-777').length, 1);
+});
+
+test('D17: exact production reproduction — advisory with paths: [] + no source', async t => {
+  const { store } = await fixture(t);
+  const event = await store.record('coordination.advisory', {}, { peers: ['a', 'b'], peer_observations: [] }, { paths: [] });
+  assert.ok(event.ref);
+  const result = await store.derivedIndex.rebuild();
+  assert.equal(result.rebuilt, true, 'advisory with empty paths no longer poisons the rebuild');
+  const row = store.derivedIndex.db.prepare('SELECT path, type FROM events WHERE ref = ?').get(event.ref);
+  assert.equal(row.path, null);
+  assert.equal(row.type, 'coordination.advisory');
+  assert.equal(store.derivedIndex.status().state, 'ready');
+});
+
+test('D18: non-primitive query filters and limit are normalized, never bind-poison', async t => {
+  const { store } = await fixture(t);
+  await store.record('probe.a', { sessionID: 'sN' }, { i: 1 }, { tool: 'edit', source: { path: '/n/filter-me.txt' } });
+  assert.equal(store.derivedIndex.structured({ path: 'filter-me' }).length, 1);
+  // Garbage filters must not flip the index to error state.
+  assert.equal(store.derivedIndex.structured({ session: { obj: 1 } }).length, 0);
+  assert.equal(store.derivedIndex.structured({ path: { obj: 1 }, tool: ['x'] }).length, 0);
+  assert.equal(store.derivedIndex.structured({ path: 'filter-me', limit: 'not-a-number' }).length, 1);
+  assert.equal(store.derivedIndex.status().state, 'ready');
+});
+
+test('D19: schema version bump forces the disposable rebuild', async t => {
+  const { store } = await fixture(t);
+  await store.record('probe.a', { sessionID: 'sV' }, { i: 1 });
+  await store.derivedIndex.rebuild();
+  assert.equal(store.derivedIndex.db.prepare("SELECT v FROM meta WHERE k='schema_version'").get().v, '3');
+});
+

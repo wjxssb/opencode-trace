@@ -1014,6 +1014,12 @@ export class Trace {
       // read as what it is: the display budget of this recall frame only.
       view.frame_budget = { unit: 'tokens', budget: tokenBudget,
         estimated: this.tokens.estimate(render()), mode: this.tokens.mode,
+        // P0-B campaign 2026-09-21: the receipt must never claim exactness the
+        // estimator did not measure. tokens_exact is populated later (context)
+        // ONLY when the local tokenizer actually produced the count; in
+        // estimator mode the field stays absent and the availability flag is
+        // false — "no exact count produced" is explicit, never disguised.
+        exact_tokens_available: this.tokens.mode === 'local_tokenizer',
         dropped: [...new Set(dropped)],
         scope: 'trace_recall_frame_display_only', not_model_context: true,
         meaning: 'Display budget of THIS Trace recall frame (a Trace-side observer projection), not the model context window, session state, or execution budget. Dropped classes stay retrievable via trace_find / trace_expand; nothing implies exhaustion.' };
@@ -1094,7 +1100,15 @@ export class Trace {
     // canonical refs; the handle -> ref mapping is process-memory only.
     this.handles.newGeneration(e.sessionID, assignments ?? []);
     // Phase E receipt: exact local-tokenizer count when the endpoint is up.
-    if (snapshot?.frame_budget) snapshot.frame_budget.tokens_exact = await this.tokens.count(recall).catch(() => null);
+    // P0-B: populate the exact-count telemetry ONLY from a real tokenizer.
+    // The local tokenizer endpoint is the only source that can make
+    // tokens_exact true; a failed/unconfigured endpoint leaves the field
+    // absent (JSON drops undefined) with exact_tokens_available=false.
+    if (snapshot?.frame_budget) {
+      const exact = await this.tokens.count(recall).catch(() => null);
+      snapshot.frame_budget.exact_tokens_available = exact != null && this.tokens.mode === 'local_tokenizer';
+      if (snapshot.frame_budget.exact_tokens_available) snapshot.frame_budget.tokens_exact = exact;
+    }
     const ids = (e.messages ?? []).map(messageID).filter(Boolean);
     // The exact messages are durable message.persisted events above. Avoid
     // copying the cumulative ID prefix on every turn (quadratic storage).

@@ -13,7 +13,43 @@ import { DatabaseSync } from 'node:sqlite';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
 
-const SCHEMA_VERSION = 2; // bump when the projection (columns/FTS shape) changes -> rebuild
+const SCHEMA_VERSION = 3; // bump when the projection (columns/FTS shape) changes -> rebuild
+
+// node:sqlite bind contract: a bindable value is exactly null, string, number,
+// bigint or Buffer. `undefined` and any object/array are REJECTED and — inside
+// a transactional rebuild — reject one row poisons the whole rebuild. Every
+// column therefore passes through a narrow normalizer; nothing unvalidated
+// reaches StatementSync.run/.get/.all.
+const bindText = value => (typeof value === 'string' ? value : null);
+const bindInteger = value => (typeof value === 'number' && Number.isFinite(value) ? Math.trunc(value) : null);
+
+// path column semantics: accept ONLY a primitive string. The first candidate
+// that IS a string wins; otherwise NULL. Never String(object) — "[object
+// Object]" would create garbage searchable paths. (Production defect
+// 2026-09-21: an event with paths: [] made `paths[0]` undefined, and the
+// `??` chain handed `undefined` — not null — to the bind.)
+const firstStringPath = entry => {
+  const candidates = [entry.source?.path, entry.source?.filePath, Array.isArray(entry.paths) ? entry.paths[0] : null];
+  return candidates.find(value => typeof value === 'string') ?? null;
+};
+
+// One canonical row mapper for every events-table write (upsert + rebuild).
+const indexRow = entry => ({
+  ref: bindText(entry.ref),
+  session: bindText(entry.sessionID),
+  seq: bindInteger(entry.seq),
+  at: bindInteger(entry.at),
+  type: bindText(entry.type),
+  tool: bindText(entry.tool),
+  status: bindText(entry.status),
+  path: firstStringPath(entry),
+  caused_by: bindText(entry.causedBy),
+  previous: bindText(entry.previous),
+  parent: bindText(entry.parent),
+  payload_ref: bindText(entry.payloadRef),
+  json: JSON.stringify({ ...entry, hints: entry.hints ?? [] }),
+});
+const searchableText = entry => [entry.type ?? '', entry.tool ?? '', entry.status ?? '', ...(entry.hints ?? [])].join(' ').slice(0, 4000);
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS events (
@@ -66,15 +102,15 @@ export class DerivedIndex {
   upsert(entry) {
     if (!this.db || this.state === 'error') return;
     try {
-      const text = [entry.type, entry.tool ?? '', entry.status ?? '', ...(entry.hints ?? [])].join(' ').slice(0, 4000);
-      const known = this.db.prepare('SELECT 1 FROM events WHERE ref = ?').get(entry.ref);
+      const row = indexRow(entry);
+      if (row.ref == null) return; // refless entry cannot be indexed
+      const text = searchableText(entry);
+      const known = this.db.prepare('SELECT 1 FROM events WHERE ref = ?').get(row.ref);
       this.db.prepare('INSERT OR REPLACE INTO events (ref, session, seq, at, type, tool, status, path, caused_by, previous, parent, payload_ref, json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
-        .run(entry.ref, entry.sessionID, entry.seq, entry.at, entry.type, entry.tool ?? null, entry.status ?? null,
-          entry.source?.path ?? entry.source?.filePath ?? (Array.isArray(entry.paths) ? entry.paths[0] : null),
-          entry.causedBy ?? null, entry.previous ?? null, entry.parent ?? null, entry.payloadRef,
-          JSON.stringify({ ...entry, hints: entry.hints ?? [] }));
-      this.db.prepare('DELETE FROM events_fts WHERE ref = ?').run(entry.ref);
-      this.db.prepare('INSERT INTO events_fts (ref, text) VALUES (?,?)').run(entry.ref, text);
+        .run(row.ref, row.session, row.seq, row.at, row.type, row.tool, row.status, row.path,
+          row.caused_by, row.previous, row.parent, row.payload_ref, row.json);
+      this.db.prepare('DELETE FROM events_fts WHERE ref = ?').run(row.ref);
+      this.db.prepare('INSERT INTO events_fts (ref, text) VALUES (?,?)').run(row.ref, text);
       if (!known) this.persistedCount++; // unique indexed refs, never upsert-call count
       this.db.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('cas_count', ?)").run(String(this.persistedCount));
     } catch (error) {
@@ -96,12 +132,12 @@ export class DerivedIndex {
       try {
         let n = 0;
         for (const entry of this.store.index.values()) {
-          const text = [entry.type, entry.tool ?? '', entry.status ?? '', ...(entry.hints ?? [])].join(' ').slice(0, 4000);
-          insert.run(entry.ref, entry.sessionID, entry.seq, entry.at, entry.type, entry.tool ?? null, entry.status ?? null,
-            entry.source?.path ?? entry.source?.filePath ?? (Array.isArray(entry.paths) ? entry.paths[0] : null),
-            entry.causedBy ?? null, entry.previous ?? null, entry.parent ?? null, entry.payloadRef,
-            JSON.stringify({ ...entry, hints: entry.hints ?? [] }));
-          fts.run(entry.ref, text);
+          const row = indexRow(entry);
+          if (row.ref == null) continue; // refless entry: skip, never poison the rebuild
+          const text = searchableText(entry);
+          insert.run(row.ref, row.session, row.seq, row.at, row.type, row.tool, row.status, row.path,
+            row.caused_by, row.previous, row.parent, row.payload_ref, row.json);
+          fts.run(row.ref, text);
           n++;
         }
         this.db.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('cas_count', ?)").run(String(n));
@@ -135,13 +171,19 @@ export class DerivedIndex {
   structured(filters = {}, limit = 50) {
     if (!this.db || this.state !== 'ready') return [];
     const where = [], args = [];
+    // Query filters are never persisted data: normalize to SQLite-bindable
+    // primitives (string/number) and ignore anything else rather than letting
+    // an object/array reach a bind and flip the whole index to error.
+    const bindable = value => (typeof value === 'string' || typeof value === 'number' ? value : null);
     for (const [col, value] of [['session', filters.session], ['type', filters.type], ['tool', filters.tool], ['status', filters.status], ['caused_by', filters.caused_by], ['previous', filters.previous], ['parent', filters.parent]]) {
-      if (value != null) { where.push(`${col} = ?`); args.push(value); }
+      const bound = bindable(value);
+      if (bound != null) { where.push(`${col} = ?`); args.push(bound); }
     }
-    if (filters.path) { where.push('path LIKE ?'); args.push(`%${filters.path}%`); }
+    if (typeof filters.path === 'string' && filters.path) { where.push('path LIKE ?'); args.push(`%${filters.path}%`); }
     if (!where.length) return [];
+    const max = bindInteger(limit) ?? 50;
     try {
-      return this.db.prepare(`SELECT ref FROM events WHERE ${where.join(' AND ')} LIMIT ?`).all(...args, limit).map(r => r.ref);
+      return this.db.prepare(`SELECT ref FROM events WHERE ${where.join(' AND ')} LIMIT ?`).all(...args, max).map(r => r.ref);
     } catch { return []; }
   }
 
