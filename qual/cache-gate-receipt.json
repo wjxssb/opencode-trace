@@ -1,0 +1,59 @@
+{
+  "gate": "cache-qualification",
+  "structural": {
+    "gate": "structural",
+    "pass": true,
+    "failures": [],
+    "segments": [
+      {
+        "turn": 1,
+        "system_hash": "f4c52999e7397df10bf50ce2bdaf5c3d65655a822ace3cc21b81262eb337be20",
+        "agent_hash": "ff4b6058dced724dace0bcda24cb8e96aba499c29014e260a18a72f4171277ed",
+        "tool_schema_hash": "89fc83a3755a1b5754c2bae3d10af0925fda5171e1c23c901f3d995c4d4d7241",
+        "late_hash": "681e1fefe49da33b76d84bc0470c27d923795e73a3a9819af5f4500448304819"
+      },
+      {
+        "turn": 2,
+        "system_hash": "f4c52999e7397df10bf50ce2bdaf5c3d65655a822ace3cc21b81262eb337be20",
+        "agent_hash": "ff4b6058dced724dace0bcda24cb8e96aba499c29014e260a18a72f4171277ed",
+        "tool_schema_hash": "89fc83a3755a1b5754c2bae3d10af0925fda5171e1c23c901f3d995c4d4d7241",
+        "late_hash": "b558268f84a30e6061535194f9279cc22ec5a1731db1f8067297968ab6fb794a"
+      },
+      {
+        "turn": 3,
+        "system_hash": "f4c52999e7397df10bf50ce2bdaf5c3d65655a822ace3cc21b81262eb337be20",
+        "agent_hash": "ff4b6058dced724dace0bcda24cb8e96aba499c29014e260a18a72f4171277ed",
+        "tool_schema_hash": "89fc83a3755a1b5754c2bae3d10af0925fda5171e1c23c901f3d995c4d4d7241",
+        "late_hash": "16932d38e2e4a4a0aaffcc33dd025edc07a7e1d82bea57305846ac604fb275f2"
+      }
+    ],
+    "invariant": "early stable hashes identical; late block varies",
+    "checked_at": "2026-09-21T23:13:01.019Z"
+  },
+  "live": {
+    "A": {
+      "tag": "A_stable_prefix_volatile_late",
+      "queried": 21606,
+      "hit": 8544,
+      "reuse": 0.3954457095251319,
+      "ttfts": [
+        1209,
+        1213,
+        1216
+      ],
+      "attribution": "approximate",
+      "note": "metrics deltas over the observation window; concurrent requests overlap so per-request attribution is approximate"
+    },
+    "B": {
+      "tag": "B_volatile_early_CONTROL",
+      "queried": 7186,
+      "hit": 0,
+      "reuse": 0,
+      "ttfts": [
+        1918
+      ]
+    },
+    "invariant": "A reuse > 0 on the stable prefix; B reuse ~0"
+  },
+  "checked_at": "2026-09-21T23:13:07.833Z"
+}
