@@ -7,6 +7,7 @@ import { compactGuidance, compactions, saveCompact } from './compact.js';
 import { normalizeTraceIntentInput } from './normalization.js';
 import { validateNoteInput, isAffirmativeState, hasExplicitFailure } from './note-validation.js';
 import { HandleRegistry, assignSnapshotHandles, renderEvidenceHandles, HANDLE_PATTERN, handleFailureMessage } from './handles.js';
+import { EvidenceGateway } from './evidence-gateway.js';
 import { claimFromProse, claimFromReceipt, claimStaleness } from './claims.js';
 import { TokenCounter, DEFAULT_TOKEN_BUDGET } from './tokens.js';
 
@@ -212,6 +213,10 @@ export class Trace {
     this.ctx = ctx; this.options = options; this.errors = 0; this.hydrated = new Set(); this.hydrating = new Map(); this.messageSeen = new Set(); this.compactSeen = new Set();
     this.contextBindings = new Map();
     this.handles = new HandleRegistry();
+    // V3 S1: the single model-facing evidence ingress authority. All handle
+    // resolution and canonical-ref validation routes through it; the store
+    // remains the sole CAS/durable-identity authority.
+    this.gateway = new EvidenceGateway(this);
     this.tokens = new TokenCounter(this.options); // Phase E: local tokenizer/estimator
     this.intentFailures = new Map();
     this.observerJobs = new Set(); this.maxObserverJobs = 8; this.droppedObservations = 0;
@@ -384,42 +389,7 @@ export class Trace {
     return event;
   }
   async refs(refs = [], field = 'source_refs') {
-    if (!Array.isArray(refs) || refs.length > 16) throw new Error(`Expected ${field} as up to 16 refs`);
-    for (let i = 0; i < refs.length; i++) {
-      const ref = refs[i];
-      if (typeof ref !== 'string') throw new Error(`Invalid ${field}[${i}]: expected a ref string`);
-      try {
-        await this.store.exists(ref);
-      } catch (error) {
-        const shown = String(ref).slice(0, 80);
-        if (error?.code === 'ENOENT') throw new Error(`Unknown ${field}[${i}] ${shown}: not found in this workspace; use trace_find then trace_expand for a valid ref`);
-        const detail = String(error?.message ?? error?.code ?? 'invalid ref');
-        const core = detail.replace(/^Invalid (source|event|blob) ref \S+:?\s*/, '');
-        throw new Error(`Invalid ${field}[${i}] ${shown}: ${core}${await this.closestRefHint(ref)}`);
-      }
-    }
-    return [...new Set(refs)];
-  }
-  // Deterministic, display-only hint for a malformed ref: if exactly one stored
-  // event ref shares a >=16 hex char prefix with the malformed value, point at
-  // the full canonical ref so the model can copy it verbatim. The malformed
-  // ref is still rejected; validation never loosens and the hint never accepts.
-  async closestRefHint(ref) {
-    const prefix = ref.startsWith('blob_') ? 'blob_' : ref.startsWith('evt_') ? 'evt_' : '';
-    if (!prefix) return '';
-    let names;
-    try { names = await fs.readdir(path.join(this.store.root, 'events')); } catch { return ''; }
-    let best = null;
-    for (const name of names) {
-      if (!name.endsWith('.json')) continue;
-      const stored = name.slice(0, -5);
-      let shared = 0;
-      while (shared < ref.length && shared < stored.length && ref[shared] === stored[shared]) shared++;
-      if (shared - prefix.length < 16) continue;
-      if (best === null) best = { ref: stored, shared };
-      else if (best.shared === shared || best.ref !== stored) return '';
-    }
-    return best ? ` Closest stored ref: ${best.ref} (copy it verbatim or omit this field; shortened or invented refs are rejected).` : '';
+    return this.gateway.refs(refs, field);
   }
   async isVerifiedEvidence(ref) {
     if (!ref || typeof ref !== 'string') return false;
@@ -452,21 +422,17 @@ export class Trace {
     }
     return false;
   }
-  /** Phase II handle-first: fail-closed invalid-ref error plus a diagnostic
-   * hint pointing at the current turn's live handles. Never auto-corrects,
-   * never fuzzy-matches — the malformed ref is still rejected outright. */
+  /** Fail-closed invalid-ref error plus a diagnostic hint pointing at the
+   * current turn's live handles (S1: routed through the EvidenceGateway).
+   * Never auto-corrects, never fuzzy-matches — the malformed ref is still
+   * rejected outright. */
   async refsOrHint(refs, field, host) {
-    try { return await this.refs(refs, field); }
-    catch (error) {
-      if (String(error.message).includes('not found in this workspace') && host?.sessionID) {
-        const handles = this.handles.listSession(host.sessionID, 12);
-        if (handles.length) {
-          const hint = handles.map(h => h.handle).join(' ');
-          throw new Error(`${error.message} Current turn evidence handles: ${hint} — pass one as source_handles/evidence_handles, or run trace_find/trace_expand to re-register historical evidence.`);
-        }
-      }
-      throw error;
-    }
+    return this.gateway.refsOrHint(refs, field, host);
+  }
+  /** S1: the display-only closest-ref diagnostic lives in the gateway; kept
+   * here as a delegation so existing callers see identical behavior. */
+  async closestRefHint(ref) {
+    return this.gateway.closestRefHint(ref);
   }
   async note(input, host) {
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('trace_note: input must be an object');
@@ -495,9 +461,9 @@ export class Trace {
     if (typeof input.text !== 'string' || !input.text.trim()) throw new Error('trace_note: text must be a non-empty string; use {kind, text}, {kind, summary}, or {milestone: {kind, summary}}');
     if (bytes(input.text) > 4096) throw new Error('trace_note: text exceeds 4096 UTF-8 bytes; shorten or split the note');
     if (bytes(input) > 16000) throw new Error('trace_note: normalized input exceeds 16000 UTF-8 bytes');
-    const source_refs = await this.refsOrHint(input.source_refs, 'source_refs', host);
-    const supersedes = await this.refs(input.supersedes, 'supersedes');
-    const depends_on = await this.refs(input.depends_on, 'depends_on');
+    // S1: note evidence fields resolve through the EvidenceGateway — the
+    // single model-facing evidence ingress authority (externally equivalent).
+    const { source_refs, supersedes, depends_on } = await this.gateway.normalizeHandoff(input, host);
 
     let milestone = null;
     if (input.milestone) {
