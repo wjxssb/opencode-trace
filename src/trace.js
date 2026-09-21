@@ -542,17 +542,23 @@ export class Trace {
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('trace_claim: input must be an object');
     if (typeof input.subject !== 'string' || !input.subject.trim()) throw new Error('trace_claim: subject is required');
     if (bytes(input.subject) > 512) throw new Error('trace_claim: subject exceeds 512 UTF-8 bytes');
-    const supersedes = (Array.isArray(input.supersedes) ? input.supersedes : [])
-      .filter(r => typeof r === 'string' && refPattern.test(r));
+    // S2 unified ingress: claim refs resolve through the EvidenceGateway like
+    // every other citation — fail closed (the former silent filter-drop of
+    // invalid supersedes entries is removed), never fuzzy-repaired.
+    const supersedes = input.supersedes != null ? await this.refs(input.supersedes, 'supersedes') : [];
+    const refs = input.refs != null ? await this.refs(input.refs, 'source_refs') : [];
     const claim = input.receipt != null
       ? claimFromReceipt({ subject: input.subject, scope: input.scope, receipt: input.receipt, supersedes })
-      : claimFromProse({ subject: input.subject, text: input.text, refs: input.refs, supersedes });
+      : claimFromProse({ subject: input.subject, text: input.text, refs, supersedes });
     // Content-level cross-check (F7 hardening): when the receipt cites the
     // canonical CAS blob holding the raw command output, verify the stored
     // bytes actually hash to receipt.output.sha256. A receipt citing a blob
     // it does not match is rejected outright; omitting output.ref remains
     // possible (authenticity is auditable, never established, by this path).
     if (input.receipt?.output?.ref != null) {
+      // S2: identity resolves through the gateway first (actionable
+      // diagnostic for a missing blob), then the byte-level hash check.
+      await this.refs([input.receipt.output.ref], 'receipt.output.ref');
       const data = await this.store.readBlob(input.receipt.output.ref);
       const digest = hash(data);
       if (digest !== input.receipt.output.sha256) {
@@ -1055,11 +1061,15 @@ export class Trace {
     f.plan = refOf(input.plan, 80); f.step = refOf(input.step, 80);
     f.worker = refOf(input.worker, 128); f.attempt = refOf(input.attempt_id, 80);
     f.recipient = refOf(input.recipient, 128); f.reply_to = refOf(input.reply_to, 80); f.proposal = refOf(input.proposal, 80);
-    for (const r of [f.ref, f.related]) if (r !== undefined && !refPattern.test(r)) throw new Error('Invalid ref filter');
     // A related-ref query on a recorded mail also reaches its replies and
     // proposal bindings through the message-id relation.
     if (f.related) f.relatedMail = this.store.index.get(f.related)?.mailID ?? null;
     f.path = refOf(input.path, 512); f.text = refOf(input.text, 256);
+    // S2: filter refs validate through the gateway (filters are not citations
+    // — existence is not required — but identity must be structurally valid,
+    // fail closed, no fuzzy repair).
+    f.ref = this.gateway.validateFilterRef(f.ref, 'ref filter');
+    f.related = this.gateway.validateFilterRef(f.related, 'ref filter');
     f.after = input.after == null ? undefined : Number(input.after);
     f.before = input.before == null ? undefined : Number(input.before);
     if (f.after != null && (!Number.isFinite(f.after) || f.after < 0)) throw new Error('Invalid after');

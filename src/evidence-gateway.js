@@ -137,6 +137,16 @@ export class EvidenceGateway {
 
   // ---- canonical ref validation (moved verbatim from Trace.refs) ----
 
+  /**
+   * Query-filter ref validation (find). Filters are NOT citations: a filter
+   * naming a ref that is not (yet) ingested here legitimately matches
+   * nothing, so existence is not required — but the token must still be a
+   * structurally valid canonical ref (fail closed, no fuzzy repair).
+   */
+  validateFilterRef(ref, field = 'ref filter') {
+    if (ref !== undefined && !refPattern.test(ref)) throw new Error(`Invalid ${field}`);
+    return ref;
+  }
   async refs(refs = [], field = 'source_refs') {
     if (!Array.isArray(refs) || refs.length > 16) throw new Error(`Expected ${field} as up to 16 refs`);
     for (let i = 0; i < refs.length; i++) {
