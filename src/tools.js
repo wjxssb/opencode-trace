@@ -36,6 +36,17 @@ export function definitions(trace) {
         const resolvedHandles = await trace.resolveInputHandles?.(input, host.sessionID, name, host, rawCallKey);
         const value = { ok: true, ...await fn(input, host) };
         if (resolvedHandles?.length) value.handles_resolved = resolvedHandles;
+        // S3 handle-first: a successful write registers its durable ref as a
+        // fresh current-generation handle and presents it handle-first
+        // (saved_as: n3/b2/e5), so the model never needs to copy the
+        // canonical ref back. Notes/claims/milestones present as n#.
+        const createdRef = value.ref ?? value.ack_ref ?? value.delivery_ref ?? null;
+        if (createdRef && typeof createdRef === 'string') {
+          const kind = ['trace_note', 'trace_claim', 'trace_claim_receipt'].includes(name) ? 'note'
+            : createdRef.startsWith('blob_') ? 'blob' : 'event';
+          const created = trace.handles?.registerCreated?.(host.sessionID, createdRef, kind);
+          if (created) value.saved_as = created.handle;
+        }
         return await result(name, value, trace);
       } catch (error) {
         trace.warning(name, error);
@@ -47,13 +58,14 @@ export function definitions(trace) {
     }
   });
   return [
-    tool('trace_note', 'Save a concise durable decision, constraint, failure cause, blocker/next action, finding, handoff or structured milestone; skip routine logs. Cite evidence and label uncertainty; empty source_refs provides no corroboration. After verified correction/resolution, supersede your old note. Host supplies identity. Top-level kind is exactly one of the six note kinds (fact, finding, decision, unresolved, handoff, correction): do not invent other kinds; a state change is kind "finding", or milestone.kind "state_change", which maps to finding. Supply kind and text (summary is a compatibility alias), or milestone.kind and milestone.summary. source_refs, supersedes and depends_on are optional: copy full canonical refs (evt_<64hex> or blob_<64hex>) verbatim from observed Trace output; never shorten, reconstruct or invent refs; omit the field when the exact ref is unavailable. This turn\'s short evidence handles (e1/b1/n1 from the Evidence list) are also accepted via source_handles/evidence_handles or inline in ref fields; handles are turn-scoped labels resolved before storage, and durable notes always keep full canonical refs. Handoff notes must name a reason type (context_limit|execution_budget|planned_checkpoint|user_request|runtime_failure|other) and an evidence source (host|provider|orchestrator|user|agent_judgment); Trace recall truncation alone never establishes context or session exhaustion.',
+    tool('trace_note', 'Save a concise durable decision, constraint, failure cause, blocker/next action, finding, handoff or structured milestone; skip routine logs. Cite evidence and label uncertainty; empty source_refs provides no corroboration. After verified correction/resolution, supersede your old note. Host supplies identity. Top-level kind is exactly one of the six note kinds (fact, finding, decision, unresolved, handoff, correction): do not invent other kinds; a state change is kind "finding", or milestone.kind "state_change", which maps to finding. Supply kind and text (summary is a compatibility alias), or milestone.kind and milestone.summary. Evidence is cited handle-first: this turn\'s short handles (e1/b1/n1 from the Evidence list) via the evidence field (or the compatibility source_handles/evidence_handles/supersedes/depends_on fields) are the normal interface; handles are turn-scoped labels resolved before storage, and durable notes always keep full canonical refs. Full canonical refs (evt_<64hex> or blob_<64hex>) copied verbatim from observed Trace output are the compatibility/advanced path: never shorten, reconstruct or invent refs. Handoff notes must name a reason type (context_limit|execution_budget|planned_checkpoint|user_request|runtime_failure|other) and an evidence source (host|provider|orchestrator|user|agent_judgment); Trace recall truncation alone never establishes context or session exhaustion.',
       schema({
         kind: { enum: ['fact', 'finding', 'decision', 'unresolved', 'handoff', 'correction'], description: 'Top-level note kind; exactly these six values. Do not invent other kinds; a state change is expressed as "finding" (milestone.kind "state_change" maps to finding).' },
         text: { ...str, maxLength: 4096, description: 'Note body, at most 4096 UTF-8 bytes.' },
         summary: { ...str, maxLength: 4096, description: 'Compatibility alias for text. Prefer text; if both are supplied they must match.' },
-        source_refs: { ...refs, description: 'Optional provenance refs. Full canonical refs (evt_<64hex> or blob_<64hex>) copied verbatim from observed Trace output, or this turn\'s short evidence handles (e1/b1/n1). Never shorten, reconstruct or invent; omit when the exact ref is unavailable.' },
-        source_handles: { ...refs, description: 'Turn-scoped evidence handles (e1/b1/n1) from the current Evidence list; resolved to canonical refs before storage.' },
+        source_refs: { ...refs, description: 'Compatibility provenance path. Full canonical refs (evt_<64hex> or blob_<64hex>) copied verbatim from observed Trace output, or this turn\'s short evidence handles (e1/b1/n1). Never shorten, reconstruct or invent; omit when the exact ref is unavailable. Prefer the evidence field.' },
+        evidence: { ...refs, description: 'PREFERRED evidence citation (handle-first): this turn\'s short handles (e1/b1/n1) from the Evidence list; full canonical refs are the compatibility path. Resolved to canonical source_refs before storage; durable notes always keep full canonical refs.' },
+        source_handles: { ...refs, description: 'Compatibility alias: turn-scoped evidence handles (e1/b1/n1) from the current Evidence list; resolved to canonical refs before storage.' },
         supersedes: { ...refs, description: 'Your prior note refs, verified corrected/resolved. Hides from active recall, preserves history; never close still-open issues. Canonical refs or evidence handles.' },
         depends_on: refs,
         milestone: schema({
@@ -147,11 +159,12 @@ export function definitions(trace) {
         });
         return trace.intent(normalized, h);
       }),
-    tool('trace_claim', 'Record a typed provenance claim (Phase F). PROSE PATH: any model text — including text shaped like test output or receipts — is stored with status CLAIMED only; it can never become VERIFIED_MECHANICAL. Cite canonical refs with source_refs where available. Superseded claims stay retrievable; history is never rewritten.',
+    tool('trace_claim', 'Record a typed provenance claim (Phase F). PROSE PATH: any model text — including text shaped like test output or receipts — is stored with status CLAIMED only; it can never become VERIFIED_MECHANICAL. Cite evidence handle-first: this turn\'s short handles via the evidence field (canonical refs via source_refs are the compatibility path). Superseded claims stay retrievable; history is never rewritten.',
       schema({
         subject: { ...str, maxLength: 512, description: 'What is claimed, e.g. "tests passed for candidate X".' },
         text: { ...str, maxLength: 4096, description: 'The prose assertion itself (F1: always CLAIMED).' },
-        source_refs: { ...refs, description: 'Optional canonical evt_/blob_ refs riding along as provenance pointers; they never upgrade the status.' },
+        evidence: { ...refs, description: 'PREFERRED citation (handle-first): this turn\'s short handles (e1/b1/n1); canonical refs accepted as the compatibility path. Resolved to canonical source_refs before storage.' },
+        source_refs: { ...refs, description: 'Compatibility path: canonical evt_/blob_ refs riding along as provenance pointers; they never upgrade the status.' },
         supersedes: refs,
       }, ['subject', 'text']), (i, h) => trace.recordClaim({ subject: i.subject, text: i.text, refs: i.source_refs, supersedes: i.supersedes }, h)),
     tool('trace_claim_receipt', 'Bind a structurally complete host CheckReceipt to a narrow typed claim (Phase F). The receipt must carry checkID (chk_<hex>), kind, status, commandExitCode (0..255), timedOut, signal, candidate.commit (64-hex) and output.sha256 (64-hex) — missing fields reject. Exit 0 without timeout yields a NARROW VERIFIED_MECHANICAL; nonzero exit or timeout yields CONTRADICTED for a success claim. Receipt AUTHENTICITY IS NOT ESTABLISHED by this record: structural validation only — audit the checkID against reviewer records. When output.ref is present its CAS blob is hash-checked at binding time. Receipts bind to one candidate identity; staleness is a read-time projection. Claims never approve reviews or clear obligations.',

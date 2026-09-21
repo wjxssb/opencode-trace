@@ -84,16 +84,12 @@ export class EvidenceGateway {
   }
 
   /**
-   * bindClaim: the single ingress point for typed provenance binding (S2
-   * routes trace_claim through it). Receipt grammar and trust boundaries
-   * stay in claims.js/trace.recordClaim — the gateway only guarantees that
-   * any refs riding along are canonical and validated first.
+   * Claim ingress: trace_claim routes through Trace.recordClaim, which
+   * validates every riding ref via the gateway (unified S2 ingress). The
+   * gateway deliberately does NOT add a second claim entry point (S3
+   * decision: a duplicate ingress invites divergence); the claim-as-n#
+   * presentation is the write-return registration in the tool layer.
    */
-  async bindClaim(input, host) {
-    if (Array.isArray(input?.refs)) await this.refs(input.refs, 'source_refs');
-    if (Array.isArray(input?.supersedes)) await this.refs(input.supersedes, 'supersedes');
-    return this.trace.recordClaim(input, host);
-  }
 
   // ---- citation resolution ----
 
@@ -231,6 +227,15 @@ export class EvidenceGateway {
     }
     if (input.milestone && Array.isArray(input.milestone.evidence_refs)) {
       input.milestone.evidence_refs = input.milestone.evidence_refs.map(resolveOne);
+    }
+    // S3 handle-first: `evidence` is the normal citation field. Entries are
+    // this turn's handles (resolved here) or full canonical refs (the
+    // compatibility/advanced path); they merge into the tool's canonical
+    // source_refs field and the evidence key never reaches the core API.
+    if (Array.isArray(input.evidence)) {
+      input.evidence = input.evidence.map(resolveOne);
+      input.source_refs = [...new Set([...(input.source_refs ?? []), ...input.evidence])];
+      delete input.evidence;
     }
     const merge = (container, handleField, canonicalField) => {
       const handles = container[handleField];

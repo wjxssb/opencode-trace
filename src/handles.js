@@ -181,6 +181,25 @@ export class HandleRegistry {
   }
 
   /**
+   * Register a freshly created durable ref from a write tool call (S3):
+   * the model's own write returns carry a current-generation handle, so the
+   * model never needs to copy the canonical ref back. Notes, claims,
+   * milestones and handoffs present as n#; blobs as b#; other events as e#.
+   */
+  registerCreated(sessionID, ref, kind = 'event') {
+    const generation = this.active.get(sessionID);
+    if (!generation || typeof ref !== 'string' || !refPattern.test(ref)) return null;
+    if (generation.byRef.has(ref)) return { handle: generation.byRef.get(ref), ref, existing: true };
+    if (generation.byHandle.size >= GENERATION_CAP) return null;
+    const prefix = kind === 'blob' ? 'b' : kind === 'note' ? 'n' : 'e';
+    generation.next[prefix] = (generation.next[prefix] ?? 0) + 1;
+    const handle = `${prefix}${generation.next[prefix]}`;
+    generation.byHandle.set(handle, { ref, kind: prefix === 'b' ? 'blob' : prefix === 'n' ? 'note' : 'event', label: 'created this turn' });
+    generation.byRef.set(ref, handle);
+    return { handle, ref };
+  }
+
+  /**
    * Discovery handles for refs returned by tools during the current turn
    * (trace_find results, trace_expand related refs). Refs already mapped in
    * this generation keep their existing handle; ordinals continue after the

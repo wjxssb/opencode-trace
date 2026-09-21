@@ -213,14 +213,7 @@ test('G-S2: anti-bypass — the tool middleware routes through the gateway (sing
   assert.equal(out.metadata.raw.ok, true, 'with the gateway restored the note resolves normally');
 });
 
-test('G-S2: bindClaim validates refs then delegates to recordClaim', async t => {
-  const { trace } = await fixture(t);
-  await trace.after({ sessionID: 's1', messageID: 'm1', id: 'c1', agent: 'build',
-    tool: 'shell', input: { command: 'bind-check' }, status: 'completed', result: { output: 'ok' } });
-  const { snapshot } = trace.recallSnapshot('s1');
-  const canonical = snapshot.recent.at(-1).ref;
-  const out = await trace.gateway.bindClaim({ subject: 'bound', text: 'via gateway', refs: [canonical] }, host());
-  assert.equal(out.claim.status, 'CLAIMED');
-  await assert.rejects(() => trace.gateway.bindClaim({ subject: 'x', text: 'x', refs: ['garbage'] }, host()),
-    /Invalid source_refs\[0\]/);
-});
+// S3: bindClaim was deleted — the claim ingress is Trace.recordClaim, which
+// validates every riding ref through the gateway (unified S2 ingress); a
+// second claim entry point would only invite divergence. Claim-as-n#
+// presentation is the write-return registration in the tool layer.

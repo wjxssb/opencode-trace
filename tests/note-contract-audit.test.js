@@ -60,17 +60,22 @@ test('KIND-2: milestone.kind state_change is accepted and maps to finding', asyn
   assert.equal(note.milestone.kind, 'state_change');
 });
 
-test('KIND-3: tool description explains the kind mapping and the ref discipline', () => {
+test('KIND-3: tool description explains the kind mapping and the S3 handle-first ref discipline', () => {
   const note = definitions(null).find(d => d.name === 'trace_note');
   assert.match(note.description, /do not invent other kinds/i);
   assert.match(note.description, /state_change/);
   assert.match(note.description, /maps to finding/i);
-  assert.match(note.description, /optional/i);
-  assert.match(note.description, /verbatim/);
+  // S3: handles are the normal interface; canonical refs are the
+  // compatibility/advanced path; copying verbatim is still the only
+  // acceptable canonical-citation discipline.
+  assert.match(note.description, /handle-first/i);
+  assert.match(note.description, /normal interface/i);
+  assert.match(note.description, /compatibility\/advanced path/i);
   assert.match(note.input.properties.kind.description, /state_change/);
   assert.match(note.input.properties.kind.description, /finding/);
   assert.match(note.input.properties.source_refs.description, /verbatim/);
   assert.match(note.input.properties.source_refs.description, /omit/);
+  assert.match(note.input.properties.evidence.description, /PREFERRED/);
 });
 
 test('REF-1: full evt ref survives storage -> projection -> render -> tool roundtrip', async t => {
