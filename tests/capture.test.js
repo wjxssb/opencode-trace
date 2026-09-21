@@ -20,10 +20,11 @@ import { Store } from '../src/store.js';
 setTimeout(() => process.exit(suiteCompleted ? 0 : 1), 90000);
 
 // Review round-6 advisory: make the watchdog LOUD — a hung test must not
-// masquerade as exit 0. The final test arms the completion flag; if the
-// watchdog ever fires without it, the suite exits 1 (a regression signal).
+// masquerade as exit 0. The completion flag is armed by the final ZZ test
+// declared after G10 (round-7: declaration order must match execution
+// order); if the watchdog ever fires without it, the suite exits 1 (a
+// regression signal).
 let suiteCompleted = false;
-test('ZZ: suite completed (watchdog armed loud)', () => { suiteCompleted = true; });
 
 async function fixture(t, options = {}) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'opencode-trace-cap-'));
@@ -245,6 +246,11 @@ test('G10: the host discovers writer-persisted events through its own watcher', 
   assert.ok(seen.length >= 1, 'host watcher imported the writer-persisted capture event');
   assert.equal(trace.store.coverage.statusFor('s1').session_coverage.status, 'complete', 'coverage continuity holds for persisted captures');
 });
+
+// Armed LAST (review round-7: declaration order is execution order in
+// node:test — the completion flag may only arm after every G test ran; a
+// hung G test must leave the flag down so the watchdog exits 1, loudly).
+test('ZZ: suite completed (watchdog armed loud)', () => { suiteCompleted = true; });
 
 async function pathDir(trace) {
   // events root: <base>/workspaces/<hash> — recovery helper wants the base.
