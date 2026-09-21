@@ -90,9 +90,9 @@ export class EvidenceGateway {
    * any refs riding along are canonical and validated first.
    */
   async bindClaim(input, host) {
-    if (Array.isArray(input?.refs)) await this.validateRefs(input.refs, 'source_refs', null);
+    if (Array.isArray(input?.refs)) await this.refs(input.refs, 'source_refs');
     if (Array.isArray(input?.supersedes)) await this.refs(input.supersedes, 'supersedes');
-    return this.trace.recordClaim(input, this.trace.identityOf ? undefined : input.host);
+    return this.trace.recordClaim(input, host);
   }
 
   // ---- citation resolution ----

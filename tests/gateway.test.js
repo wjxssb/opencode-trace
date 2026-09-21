@@ -139,3 +139,88 @@ test('G-S1: registerEvidence and prepareModelView delegate with the same contrac
   assert.ok(assigned.some(a => a.ref === snapshot.recent.at(-1).ref));
   assert.ok(Array.isArray(assignments) && typeof text === 'string');
 });
+
+// ---- S2 pinning: unified-ingress fail-closed policy (round-12 findings) ----
+
+test('G-S2: invalid claim supersedes fail closed — the silent filter-drop is gone', async t => {
+  const { trace } = await fixture(t);
+  await trace.after({ sessionID: 's1', messageID: 'm1', id: 'c1', agent: 'build',
+    tool: 'shell', input: { command: 'claim-supersedes-check' }, status: 'completed', result: { output: 'ok' } });
+  await assert.rejects(() => trace.recordClaim({ subject: 'x', text: 'x', supersedes: ['garbage'] }, host()),
+    /Invalid supersedes\[0\]/, 'structurally invalid supersedes must throw, not be silently dropped');
+  await assert.rejects(() => trace.recordClaim({ subject: 'x', text: 'x', supersedes: [`evt_${'9f'.repeat(32)}`] }, host()),
+    /Unknown supersedes\[0\].*not found in this workspace/, 'well-formed but nonexistent supersedes also fail closed');
+  assert.equal(trace.store.findEntriesAll({ type: 'trace.claim' }).length, 0, 'nothing persisted by rejected claim paths');
+  const first = await trace.recordClaim({ subject: 'first', text: 'first' }, host());
+  const second = await trace.recordClaim({ subject: 'second', text: 'second', supersedes: [first.ref] }, host());
+  assert.deepEqual(second.claim.supersedes, [first.ref], 'valid canonical supersedes still accepted');
+  assert.equal(trace.store.findEntriesAll({ type: 'trace.claim' }).length, 2);
+});
+
+test('G-S2: invalid prose refs fail closed', async t => {
+  const { trace } = await fixture(t);
+  await assert.rejects(() => trace.recordClaim({ subject: 'x', text: 'x', refs: ['not-a-ref'] }, host()),
+    /Invalid source_refs\[0\]/);
+  assert.equal(trace.store.findEntriesAll({ type: 'trace.claim' }).length, 0);
+});
+
+test('G-S2: receipt.output.ref resolves through the gateway with an actionable diagnostic', async t => {
+  const { trace } = await fixture(t);
+  const receipt = { checkID: `chk_${'1'.repeat(32)}`, kind: 'test', status: 'passed', commandExitCode: 0,
+    timedOut: false, signal: 'none', candidate: { commit: 'a'.repeat(64) },
+    output: { sha256: 'c'.repeat(64), ref: `blob_${'e'.repeat(64)}` } };
+  await assert.rejects(() => trace.recordClaim({ subject: 'x', receipt }, host()),
+    /Unknown receipt\.output\.ref.*not found in this workspace/, 'no raw ENOENT — gateway diagnostic');
+  assert.equal(trace.store.findEntriesAll({ type: 'trace.claim' }).length, 0);
+});
+
+test('G-S2: find ref filters validate structurally without requiring existence', async t => {
+  const { trace } = await fixture(t);
+  await assert.rejects(() => trace.find({ ref: 'garbage' }, host()), /Invalid ref filter/);
+  await assert.rejects(() => trace.find({ related: 'garbage' }, host()), /Invalid ref filter/);
+  const out = await trace.find({ ref: `evt_${'9f'.repeat(32)}` }, host());
+  assert.deepEqual(out.results ?? [], [], 'filters are not citations: a valid-but-unseen ref matches nothing, no throw');
+});
+
+test('G-S2: anti-bypass — the tool middleware routes through the gateway (single ingress)', async t => {
+  const { trace } = await fixture(t);
+  await trace.after({ sessionID: 's1', messageID: 'm1', id: 'c1', agent: 'build',
+    tool: 'shell', input: { command: 'topology-check' }, status: 'completed', result: { output: 'ok' } });
+  const { assignments } = trace.recallSnapshot('s1');
+  trace.handles.newGeneration('s1', assignments);
+  const original = trace.gateway.normalizeEvidence.bind(trace.gateway);
+  trace.gateway.normalizeEvidence = async () => { throw new Error('GATEWAY_BYPASS_DETECTED'); };
+  try {
+    // The tool surface reports tool-layer failures as degraded outputs
+    // (ok:false + error text) rather than rejections; accept both shapes.
+    let sawFailure = false, sawMessage = '';
+    try {
+      const out = await definitions(trace).find(d => d.name === 'trace_note').execute(
+        { kind: 'fact', text: 'must route through the gateway', source_handles: ['e1'] }, host());
+      sawMessage = String(out?.metadata?.raw?.error ?? out?.content ?? '');
+      sawFailure = out?.metadata?.raw?.ok === false || /GATEWAY_BYPASS_DETECTED/.test(sawMessage);
+    } catch (error) {
+      sawFailure = true;
+      sawMessage = String(error?.message ?? error);
+    }
+    assert.ok(sawFailure && /GATEWAY_BYPASS_DETECTED/.test(sawMessage),
+      `handle fields must resolve through the gateway, not a bypass copy (got: ${sawMessage.slice(0, 120)})`);
+  } finally {
+    trace.gateway.normalizeEvidence = original;
+  }
+  const out = await definitions(trace).find(d => d.name === 'trace_note').execute(
+    { kind: 'fact', text: 'routes through gateway', source_handles: ['e1'] }, host());
+  assert.equal(out.metadata.raw.ok, true, 'with the gateway restored the note resolves normally');
+});
+
+test('G-S2: bindClaim validates refs then delegates to recordClaim', async t => {
+  const { trace } = await fixture(t);
+  await trace.after({ sessionID: 's1', messageID: 'm1', id: 'c1', agent: 'build',
+    tool: 'shell', input: { command: 'bind-check' }, status: 'completed', result: { output: 'ok' } });
+  const { snapshot } = trace.recallSnapshot('s1');
+  const canonical = snapshot.recent.at(-1).ref;
+  const out = await trace.gateway.bindClaim({ subject: 'bound', text: 'via gateway', refs: [canonical] }, host());
+  assert.equal(out.claim.status, 'CLAIMED');
+  await assert.rejects(() => trace.gateway.bindClaim({ subject: 'x', text: 'x', refs: ['garbage'] }, host()),
+    /Invalid source_refs\[0\]/);
+});

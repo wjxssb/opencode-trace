@@ -1220,63 +1220,13 @@ export class Trace {
     return registered;
   }
 
-  // Resolve ephemeral evidence handles to canonical refs BEFORE any store
-  // validation sees the input. Canonical refs pass through untouched; strings
-  // that are neither canonical refs nor handles are left for downstream
-  // validation to reject with its existing precise errors. Handles are never
-  // persisted as identity: the raw input remains the durable audit record,
-  // and a best-effort `trace.handle_resolution` event records the handle ->
-  // canonical correspondence for this call (additive event type, no schema
-  // change to existing events). Returns the resolutions (possibly empty).
+  // S1: ALL handle resolution routes through the EvidenceGateway — the
+  // single model-facing evidence ingress authority. The former inline
+  // implementation now lives (verbatim) in gateway.normalizeEvidence; this
+  // delegation keeps the tool-middleware call sites unchanged while making
+  // the gateway the one live path (no duplicated implementations).
   async resolveInputHandles(input, sessionID, toolName = null, host = {}, rawCallKey = null) {
-    const resolutions = [];
-    if (!input || typeof input !== 'object') return resolutions;
-    const resolveOne = value => {
-      if (typeof value !== 'string') return value;
-      const v = value.trim();
-      if (refPattern.test(v) || !HANDLE_PATTERN.test(v)) return value;
-      const resolved = this.handles.resolve(sessionID, v);
-      if (!resolved.ok) throw new Error(handleFailureMessage(sessionID, v, resolved.reason));
-      resolutions.push({ handle: v, ref: resolved.ref });
-      return resolved.ref;
-    };
-    if (typeof input.ref === 'string') input.ref = resolveOne(input.ref);
-    for (const field of ['source_refs', 'supersedes', 'depends_on', 'related_refs']) {
-      if (Array.isArray(input[field])) input[field] = input[field].map(resolveOne);
-    }
-    if (input.milestone && Array.isArray(input.milestone.evidence_refs)) {
-      input.milestone.evidence_refs = input.milestone.evidence_refs.map(resolveOne);
-    }
-    const merge = (container, handleField, canonicalField) => {
-      const handles = container[handleField];
-      if (handles === undefined) return;
-      if (!Array.isArray(handles)) throw new Error(`${handleField} must be an array of evidence handles (e1/b1/n1)`);
-      const resolved = handles.map(value => {
-        if (typeof value !== 'string' || !HANDLE_PATTERN.test(value.trim())) {
-          throw new Error(`${handleField} accepts only evidence handles like e1/b1/n1; got ${JSON.stringify(String(value).slice(0, 40))}`);
-        }
-        const r = this.handles.resolve(sessionID, value.trim());
-        if (!r.ok) throw new Error(handleFailureMessage(sessionID, value.trim(), r.reason));
-        resolutions.push({ handle: value.trim(), ref: r.ref });
-        return r.ref;
-      });
-      container[canonicalField] = [...new Set([...(container[canonicalField] ?? []), ...resolved])];
-      delete container[handleField];
-    };
-    merge(input, 'source_handles', 'source_refs');
-    merge(input, 'supersedes_handles', 'supersedes');
-    merge(input, 'depends_on_handles', 'depends_on');
-    merge(input, 'related_handles', 'related_refs');
-    if (input.milestone) merge(input.milestone, 'evidence_handles', 'evidence_refs');
-    if (resolutions.length) {
-      try {
-        await this.store.record('trace.handle_resolution', { sessionID }, {
-          tool: toolName ?? null, resolutions, raw_call_key: rawCallKey ?? null,
-          semantics: 'correspondence metadata only: raw input may cite ephemeral handles; canonical evt_/blob_ refs remain the only durable identity',
-        }, { callKey: rawCallKey ?? null });
-      } catch { /* best-effort metadata; the raw input echo remains the audit record */ }
-    }
-    return resolutions;
+    return this.gateway.normalizeEvidence(input, sessionID, toolName, host, rawCallKey);
   }
 
   formatEntry(e, text) {
