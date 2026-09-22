@@ -1,6 +1,7 @@
 import path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { readFileSync as readFileSyncSync } from 'node:fs';
+import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { Store } from './store.js';
 import { atomic, bytes, stable, hash, identity, callKey, locator, mutationPaths, canonical, overlaps, messageID, messageRole, messageContentFingerprint, textFromMessage, refPattern, unwrap } from './util.js';
