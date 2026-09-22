@@ -499,6 +499,17 @@ export class Trace {
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('trace_note: input must be an object');
     validateNoteInput(input);
     input = { ...input };
+    // P4-C: one canonical milestone contract. A redundant top-level
+    // kind "milestone" alongside a valid milestone object normalizes to the
+    // documented {milestone} form (identical durable output as the canonical
+    // call); a bare kind "milestone" without a milestone object is a contract
+    // error, named precisely instead of pointing at the generic kind list.
+    if (input.kind === 'milestone') {
+      if (!Object.hasOwn(input, 'milestone')) {
+        throw new Error('trace_note: top-level kind "milestone" is not a note kind; provide {milestone: {kind: ...}} for a milestone note');
+      }
+      delete input.kind;
+    }
     if (Object.hasOwn(input, 'summary')) {
       if (typeof input.summary !== 'string' || !input.summary.trim()) throw new Error('trace_note: summary must be a non-empty string');
       if (input.text !== undefined && input.text !== input.summary) throw new Error('trace_note: text and summary conflict; supply text only or identical values');
@@ -518,7 +529,7 @@ export class Trace {
       if (!input.supersedes && ms.supersedes) input.supersedes = ms.supersedes;
       if (!input.depends_on && ms.depends_on) input.depends_on = ms.depends_on;
     }
-    if (!NOTE_KINDS.includes(input.kind)) throw new Error(`trace_note: kind must be one of ${NOTE_KINDS.join(', ')} (or provide milestone.kind)`);
+    if (!NOTE_KINDS.includes(input.kind)) throw new Error(`trace_note: kind must be one of ${NOTE_KINDS.join(', ')}${input.kind === undefined ? '' : ` (got ${JSON.stringify(input.kind)})`}; for a milestone note, omit top-level kind and provide {milestone: {kind: ...}}`);
     if (typeof input.text !== 'string' || !input.text.trim()) throw new Error('trace_note: text must be a non-empty string; use {kind, text}, {kind, summary}, or {milestone: {kind, summary}}');
     if (bytes(input.text) > 4096) throw new Error('trace_note: text exceeds 4096 UTF-8 bytes; shorten or split the note');
     if (bytes(input) > 16000) throw new Error('trace_note: normalized input exceeds 16000 UTF-8 bytes');
