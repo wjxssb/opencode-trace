@@ -1353,7 +1353,7 @@ export class Trace {
     try {
       const xdg = process.env.XDG_DATA_HOME ?? path.join(os.homedir(), '.local', 'share');
       const file = path.join(xdg, 'opencode', 'inline-reviewer', 'sessions', `${session}.json`);
-      const data = JSON.parse(fssync.readFileSync(file, 'utf8'));
+      const data = JSON.parse(readFileSyncSync(file, 'utf8'));
       const lastRound = Array.isArray(data.rounds) && data.rounds.length ? data.rounds[data.rounds.length - 1] : null;
       return { state: 'available', source: 'reviewer_durable_state', read_only: true,
         currentRound: data.currentRound ?? null,
