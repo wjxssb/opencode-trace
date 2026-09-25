@@ -13,7 +13,7 @@ import { DatabaseSync } from 'node:sqlite';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
 
-const SCHEMA_VERSION = 3; // bump when the projection (columns/FTS shape) changes -> rebuild
+const SCHEMA_VERSION = 4; // bump when the projection (columns/FTS shape) changes -> rebuild (4: CJK bigram expansion)
 
 // node:sqlite bind contract: a bindable value is exactly null, string, number,
 // bigint or Buffer. `undefined` and any object/array are REJECTED and — inside
@@ -49,7 +49,45 @@ const indexRow = entry => ({
   payload_ref: bindText(entry.payloadRef),
   json: JSON.stringify({ ...entry, hints: entry.hints ?? [] }),
 });
-const searchableText = entry => [entry.type ?? '', entry.tool ?? '', entry.status ?? '', ...(entry.hints ?? [])].join(' ').slice(0, 4000);
+const searchableText = entry => expandCjk([entry.type ?? '', entry.tool ?? '', entry.status ?? '', ...(entry.hints ?? [])].join(' ').slice(0, 4000));
+
+// CJK recall (schema 4). FTS5's default unicode61 tokenizer keeps a run of
+// CJK characters as ONE token, so a two-character word inside a longer run
+// ("退磁" in "交流退磁方法") never matches; the trigram tokenizer needs >= 3
+// characters and most Chinese words have 2. Measured on the production
+// index (103,492 events): see docs/CJK-SEARCH.md. The indexed text keeps
+// the original (Latin tokens unchanged) and appends each CJK run's character
+// bigrams; queries turn each CJK run into the adjacent bigram phrase.
+const CJK_RUN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu;
+const cjkBigrams = run => {
+  const chars = [...run];
+  const out = [];
+  for (let i = 0; i + 1 < chars.length; i++) out.push(chars[i] + chars[i + 1]);
+  return out;
+};
+export const expandCjk = text => {
+  const extra = [];
+  for (const m of text.matchAll(CJK_RUN)) if ([...m[0]].length >= 2) extra.push(cjkBigrams(m[0]).join(' '));
+  return extra.length ? `${text}\n${extra.join(' ')}` : text;
+};
+const quote = s => `"${s.replace(/"/g, '""')}"`;
+/** Free text -> FTS5 query: every whitespace word must match (implicit AND);
+ *  CJK parts become adjacent-bigram phrases, other parts plain phrases. */
+export const ftsQuery = text => {
+  const words = [];
+  for (const word of String(text).split(/\s+/).filter(Boolean)) {
+    let rest = word;
+    const parts = [];
+    for (const m of word.matchAll(CJK_RUN)) {
+      const chars = [...m[0]];
+      parts.push(chars.length >= 2 ? quote(cjkBigrams(m[0]).join(' ')) : quote(m[0]));
+      rest = rest.replace(m[0], ' ');
+    }
+    for (const piece of rest.split(/\s+/)) if (/[\p{L}\p{N}]/u.test(piece)) parts.push(quote(piece));
+    if (parts.length) words.push(parts.join(' '));
+  }
+  return words.join(' ');
+};
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS events (
@@ -176,9 +214,11 @@ export class DerivedIndex {
   ftsCandidates(text, limit = 50) {
     if (!this.db || this.state !== 'ready' || !text) return [];
     try {
-      const query = String(text).split(/\s+/).filter(Boolean).map(w => `"${w.replace(/"/g, '""')}"`).join(' ');
+      const query = ftsQuery(text);
       if (!query) return [];
-      return this.db.prepare('SELECT DISTINCT ref FROM events_fts WHERE events_fts MATCH ? LIMIT ?').all(query, limit).map(r => r.ref);
+      // bm25-ranked (FTS5 `rank`); one row per ref is maintained by upsert/rebuild
+      const refs = this.db.prepare('SELECT ref FROM events_fts WHERE events_fts MATCH ? ORDER BY rank LIMIT ?').all(query, limit).map(r => r.ref);
+      return [...new Set(refs)];
     } catch { return []; }
   }
 

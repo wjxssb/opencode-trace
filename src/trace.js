@@ -1342,10 +1342,16 @@ export class Trace {
       // (multi-token matching over the persisted mirror). Candidates are
       // discovery only; verified bytes always come from trace_expand.
       if (f.text && results.length < limit) {
+        // The FTS match IS the text criterion for these candidates: re-applying
+        // the whole-query hint substring test (matchesFilters' text filter)
+        // rejected every candidate the hint path had missed, so the fallback
+        // could never add a result (multi-word / CJK queries). All other
+        // filters still apply.
+        const { text: _text, ...nonText } = f;
         for (const ref of this.store.derivedIndex?.ftsCandidates?.(f.text, 100) ?? []) {
           if (results.length >= limit || results.some(r => r.ref === ref)) continue;
           const entry = this.store.index.get(ref);
-          if (entry && this.store.matchesFilters(entry, f)) results.push(this.formatEntry(entry, f.text));
+          if (entry && this.store.matchesFilters(entry, nonText)) results.push(this.formatEntry(entry, f.text));
         }
       }
       const registered = this.attachDiscoveryHandles(host, results);
@@ -1478,12 +1484,15 @@ export class Trace {
   formatEntry(e, text) {
     let hit;
     if (text) {
-      const needle = text.toLowerCase();
-      const field = e.hints.find(h => h.toLowerCase().includes(needle));
-      if (field) {
+      // whole query first; FTS (multi-word) hits anchor on their longest word
+      const needles = [text, ...text.split(/\s+/).filter(Boolean).sort((a, b) => b.length - a.length)].map(n => n.toLowerCase());
+      for (const needle of needles) {
+        const field = e.hints.find(h => h.toLowerCase().includes(needle));
+        if (!field) continue;
         const at = field.toLowerCase().indexOf(needle);
         const start = Math.max(0, at - 40);
-        hit = { field: 'hint', snippet: `${start > 0 ? '…' : ''}${field.slice(start, Math.min(field.length, at + text.length + 80))}${at + text.length + 80 < field.length ? '…' : ''}` };
+        hit = { field: 'hint', snippet: `${start > 0 ? '…' : ''}${field.slice(start, Math.min(field.length, at + needle.length + 80))}${at + needle.length + 80 < field.length ? '…' : ''}` };
+        break;
       }
     }
     return { ref: e.ref, type: e.type, at: e.at, sessionID: e.sessionID, agent: e.agent, tool: e.tool, status: e.status,
