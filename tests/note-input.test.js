@@ -41,7 +41,7 @@ test('bad inputs fail clearly without saving a note; UTF-8 byte limit is enforce
     [{ kind: 'nope', text: 'body' }, /kind must be/],
     [{ kind: 'finding', summary: 42 }, /summary must be/],
     [{ kind: 'finding', summary: ' ' }, /summary must be/],
-    [{ kind: 'finding', text: 'a', summary: 'b' }, /conflict/],
+    [{ kind: 'finding', text: 'body', summary: 'x'.repeat(2049) }, /summary exceeds 2048/],
     [{ kind: 'finding', summary: '中'.repeat(1366) }, /4096 UTF-8 bytes/],
     [{ kind: 'finding', text: 'ok', source_refs: ['a'.repeat(16000)] }, /16000 UTF-8 bytes/],
   ]) {
@@ -51,6 +51,9 @@ test('bad inputs fail clearly without saving a note; UTF-8 byte limit is enforce
   }
   assert.equal(trace.store.session(host.sessionID).notes.length, 0);
   assert.equal((await tool.execute({ kind: 'fact', summary: 'a'.repeat(4096) }, host)).metadata.raw.ok, true);
+  // A differing short summary beside text is kept, not rejected.
+  const both = (await tool.execute({ kind: 'finding', text: 'a', summary: 'b' }, host)).metadata.raw;
+  assert.equal(both.ok, true);
 });
 
 test('invalid structured notes are rejected rather than coerced, dropped or truncated', async t => {

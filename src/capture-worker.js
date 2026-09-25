@@ -13,6 +13,7 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { Store } from './store.js';
 import { assertCanonicalEnvelope } from './canonical-envelope.js';
+import { storageTiming } from './util.js';
 
 const post = message => parentPort.postMessage(message);
 
@@ -33,7 +34,14 @@ try {
     post({ type: 'ledger-error', error: String(error?.message ?? error) });
   }
 
-  parentPort.on('message', async message => {
+  let writes = Promise.resolve();
+  const handle = async message => {
+    if (message.type === 'shutdown') {
+      await store.close();
+      post({ type: 'stopped', generation: workerData.generation });
+      parentPort.close();
+      return;
+    }
     if (message.type === 'ping') { post({ type: 'pong', generation: workerData.generation }); return; }
     if (message.type === 'drain-ledgers') {
       try {
@@ -71,6 +79,13 @@ try {
       latencyMs: Date.now() - started,
       lastRef,
       generation: workerData.generation,
+      storageTiming: storageTiming(),
+      indexState: store.derivedIndex?.status() ?? null,
+    });
+  };
+  parentPort.on('message', message => {
+    writes = writes.then(() => handle(message)).catch(error => {
+      post({ type: 'fatal', error: String(error?.message ?? error) });
     });
   });
 } catch (error) {

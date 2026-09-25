@@ -25,6 +25,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { hash, stable, refPattern } from './util.js';
 import { assignSnapshotHandles, HANDLE_PATTERN, handleFailureMessage } from './handles.js';
+import { effectiveClaimStatus, reportedReceiptFailure } from './claims.js';
 
 export class EvidenceGateway {
   /**
@@ -297,7 +298,8 @@ export class EvidenceGateway {
       const row = this.store.findEntriesAll({ ref: resolved.ref }, null, 1)[0];
       if (row?.type === 'trace.claim') {
         const payload = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
-        claim_state = payload.claim_status;
+        claim_state = effectiveClaimStatus(payload);
+        if (reportedReceiptFailure(payload)) throw new Error('prepare_citations: receipt reports failure (unverified); it cannot justify candidate success');
         if (claim_state === 'CONTRADICTED') throw new Error(`prepare_citations: evidence ${resolved.ref.slice(0, 15)}… is a CONTRADICTED claim; it cannot justify a candidate`);
       }
       entries.push({ ref: resolved.ref, via: resolved.via, kind: resolved.kind, handle: resolved.handle, role: resolved.kind === 'note' ? 'semantic' : 'execution', ...(claim_state ? { claim_state } : {}) });
@@ -345,7 +347,8 @@ export class EvidenceGateway {
       if (!row) throw new Error(`citation_set '${token}' is stale: evidence ${entry.ref.slice(0, 15)}… no longer exists`);
       if (row.type === 'trace.claim') {
         const payload = JSON.parse((await this.store.readBlob(row.payloadRef)).toString());
-        if (payload.claim_status === 'CONTRADICTED') {
+        if (reportedReceiptFailure(payload)) throw new Error('citation_set: receipt reports failure (unverified); it cannot justify candidate success');
+        if (effectiveClaimStatus(payload) === 'CONTRADICTED') {
           throw new Error(`citation_set '${token}' is stale: claim ${entry.ref.slice(0, 15)}… was CONTRADICTED after the set was prepared`);
         }
       }

@@ -25,7 +25,7 @@ import { Trace } from '../src/trace.js';
 import { Store } from '../src/store.js';
 import { buildCanonicalEnvelope, assertCanonicalEnvelope } from '../src/canonical-envelope.js';
 
-setTimeout(() => process.exit(suiteCompleted ? 0 : 1), 90000);
+setTimeout(() => { console.error('capture test process still alive after bounded deadline'); process.exit(1); }, 90000).unref();
 let suiteCompleted = false;
 
 async function fixture(t, options = {}) {
@@ -72,7 +72,7 @@ test('G0: capture/store/coverage/sequence/derived-index never import handles or 
 
 // ---- G1/§11+§20: canonical envelope valid; cross-path ref identity ----
 
-test('G1: CanonicalCaptureEnvelopeV1 builds + validates; event ref identical across sync/capture paths', async t => {
+test('G1: CanonicalCaptureEnvelopeV1 builds + validates; identical causal inputs derive the same event ref', async t => {
   const { trace, store } = await fixture(t);
   const data = { id: 'c-x', tool: 'shell', input: { command: 'envelope-identity' }, status: 'completed', result: { output: 'ok' } };
   const extra = { tool: 'shell', callID: 'c-x', status: 'completed' };
@@ -181,34 +181,23 @@ test('G6b: writer death never blocks the host; losses are ledgered and coverage 
   if (lost > 0) assert.equal(scoped.session_coverage.status, 'incomplete', 'coverage reports the loss honestly');
 });
 
-test('G7: queue overflow records exact-range durable evidence outside the queue (M8)', async t => {
+test('G7: memory overflow spills durable admitted envelopes without losing observations', async t => {
   const { dir, trace, capture } = await fixture(t, { captureQueueCap: 2 });
   capture.paused = true;
   for (let i = 1; i <= 5; i++) {
     await trace.after({ sessionID: 's1', messageID: `m${i}`, id: `c${i}`, agent: 'build', tool: 'shell', input: { command: `g3-${i}` }, status: 'completed', result: { output: 'x' } });
   }
-  assert.equal(capture.status().dropped_total, 3, 'three envelopes dropped on overflow');
-  assert.equal(capture.status().queue_depth, 2, 'queue bounded at cap');
-  const ledgerText = await fs.readFile(path.join(capture.ledgerPath()), 'utf8');
-  const entries = ledgerText.trim().split('\n').map(JSON.parse);
-  assert.equal(entries.length, 3);
-  for (const entry of entries) {
-    assert.equal(entry.session, 's1');
-    assert.ok(Number.isInteger(entry.from) && entry.from === entry.to, 'exact per-envelope sequence in the ledger');
-    // §15: the journal carries canonical sequence identity only.
-    for (const k of Object.keys(entry)) assert.ok(!/handle|citation_set|scratch/i.test(k), `journal key clean: ${k}`);
-    assert.ok(!JSON.stringify(entry).includes('cb_'), 'no CitationSet token in the journal');
-  }
-  await trace.store.coverage.flushPending();
-  const scoped = trace.store.coverage.statusFor('s1');
-  assert.equal(scoped.session_coverage.status, 'incomplete');
+  assert.equal(capture.status().dropped_total, 0);
+  assert.equal(capture.status().queue_depth, 2, 'memory queue remains bounded');
+  assert.ok(trace.store.findEntriesAll({ type: 'tool.after' }).length >= 3, 'spilled envelopes committed; worker startup may also replay admitted queued items');
   capture.paused = false;
   await capture.flush();
   const rec = await recovered(dir);
-  assert.equal(rec.events.length, 2, 'surviving envelopes persisted');
+  assert.equal(rec.events.length, 5, 'all admitted occurrences survive');
+  assert.equal(new Set(rec.events.map(row => row.seq)).size, 5);
 });
 
-test('G8: duplicate envelope delivery is idempotent (M3-adjacent)', async t => {
+test('G8: redelivery of one already allocated envelope is idempotent (not raw-event deduplication)', async t => {
   const { dir, trace, capture } = await fixture(t);
   capture.paused = true;
   await trace.after({ sessionID: 's1', messageID: 'm1', id: 'c1', agent: 'build', tool: 'shell', input: { command: 'g4' }, status: 'completed', result: { output: 'x' } });
@@ -328,10 +317,9 @@ test('G13: coverage correct after restart — gaps stay visible, persisted range
     await store2.reconcile();
     await store2.coverage.flushPending();
     const scoped = store2.coverage.statusFor('s1');
-    assert.equal(scoped.session_coverage.status, 'incomplete', 'overflow loss survives restart as incomplete coverage');
-    assert.ok((scoped.session_coverage.unresolved_seqs ?? 0) >= 2, 'dropped sequences stay unresolved');
-    const markers = store2.findEntriesAll({ type: 'trace.capture_gap' });
-    assert.ok(markers.length >= 1, 'gap markers durable across restart');
+    assert.equal(scoped.session_coverage.unresolved_seqs ?? 0, 0, 'admitted overflow sources recovered without missing sequence');
+    assert.equal(store2.findEntriesAll({ type: 'tool.after' }).length, 4);
+    assert.equal(store2.admissions.recovery.incomplete.length, 0);
   } finally { await store2.close(); }
 });
 
@@ -341,7 +329,7 @@ test('G14: typed provenance survives the async path', async t => {
   const { claim } = await trace.recordClaim({ subject: 'g14 gates green', scope: 'test_command_completed',
     receipt: { checkID: `chk_${'4'.repeat(32)}`, kind: 'test', status: 'passed', commandExitCode: 0, timedOut: false, signal: 'none', candidate: { commit: 'e'.repeat(64) }, output: { sha256: 'f'.repeat(64) } } },
     { sessionID: 's1', messageID: 'mc', id: 'cc', agent: 'build' });
-  assert.equal(claim.status, 'VERIFIED_MECHANICAL');
+  assert.equal(claim.status, 'CLAIMED');
   await capture.flush();
   await capture.stop();
   await trace.store.close();
@@ -350,7 +338,7 @@ test('G14: typed provenance survives the async path', async t => {
     const rows = store2.findEntriesAll({ type: 'trace.claim' });
     assert.equal(rows.length, 1);
     const payload = JSON.parse(await store2.readBlob(rows[0].payloadRef));
-    assert.equal(payload.claim_status, 'VERIFIED_MECHANICAL');
+    assert.equal(payload.claim_status, 'CLAIMED');
   } finally { await store2.close(); }
 });
 
@@ -462,11 +450,15 @@ test('G-W: worker tripwire — a poison envelope reaching the worker trips fatal
 
 // ---- S7.5 loss-accounting semantics (mission §4-§6, L1-L8) ----
 
-test('S7.5-L1+L2+L7: overflow losses produce exactly ONE marker per exact envelope range; ledger drain does not duplicate', async t => {
+test('S7.5-L1+L2+L7: historical unjournaled losses produce exactly ONE marker per exact envelope range; ledger drain does not duplicate', async t => {
   const { trace, capture } = await fixture(t, { captureQueueCap: 2 });
   capture.paused = true;
-  for (let i = 1; i <= 5; i++) {
-    await trace.after({ sessionID: 'ses_l', messageID: `m${i}`, id: `c${i}`, agent: 'build', tool: 'shell', input: { command: `l-${i}` }, status: 'completed', result: { output: 'x' } });
+  // Compatibility with pre-admission ledgers: these were allocated by the
+  // older producer but never journaled or committed. New capture never uses
+  // ACK loss/overflow as proof of physical loss.
+  for (let i = 1; i <= 3; i++) {
+    const allocated = await trace.store.sequences.allocate('ses_l', seq => `evt_${String(seq).padStart(64, '0')}`);
+    await capture.recordLoss({ at: Date.now(), session: 'ses_l', body: { session_seq: allocated.seq } }, 'legacy_queue_overflow');
   }
   // The AUTHORITATIVE lost-seq set is the durable ledger (physical truth);
   // markers must correspond 1:1 to it regardless of allocation interleaving
@@ -519,7 +511,7 @@ test('S7.5-L1+L2+L7: overflow losses produce exactly ONE marker per exact envelo
     return out;
   };
   const before = await exactRangeMarkers(trace.store.findEntriesAll({ type: 'trace.capture_gap', session: 'ses_l' }));
-  assert.equal(before.length, ledgerSeqs.size, 'host immediate recordLoss noteGap: one marker per exact lost envelope seq');
+  assert.equal(before.length, ledgerSeqs.size, 'host immediate recordLoss noteGap: one marker per exact lost envelope seq; ' + JSON.stringify(before.map(row => ({ ref: row.marker.ref, ...row.p }))));
   capture.paused = false;
   await capture.flush();
   // Drain the durable ledger: every loss is already represented by the
@@ -546,26 +538,20 @@ test('S7.5-L1+L2+L7: overflow losses produce exactly ONE marker per exact envelo
   for (const { marker } of after) await trace.store.readBlob(marker.payloadRef);
 });
 
-test('S7.5-L3+L4: separate losses and writer-death losses stay separate markers (no false dedupe)', async t => {
-  const { trace, capture } = await fixture(t, { captureQueueCap: 1 });
-  capture.paused = true;
-  // ses_la seq 1 is ADMITTED (cap 1); ses_lb seq 1 and ses_la seq 2 overflow
-  // — two separate loss identities across two sessions (L3), and the drain
-  // must never merge them.
-  await trace.after({ sessionID: 'ses_la', messageID: 'm1', id: 'ca1', agent: 'build', tool: 'shell', input: { command: 'la-1' }, status: 'completed', result: { output: 'x' } });
-  await trace.after({ sessionID: 'ses_lb', messageID: 'm1', id: 'cb1', agent: 'build', tool: 'shell', input: { command: 'lb-1' }, status: 'completed', result: { output: 'x' } });
-  await trace.after({ sessionID: 'ses_la', messageID: 'm2', id: 'ca2', agent: 'build', tool: 'shell', input: { command: 'la-2' }, status: 'completed', result: { output: 'x' } });
+test('S7.5-L3+L4: historical losses in separate sessions retain separate markers', async t => {
+  const { trace, capture } = await fixture(t);
+  for (const session of ['ses_la', 'ses_lb']) {
+    const allocated = await trace.store.sequences.allocate(session, seq => `evt_${session === 'ses_la' ? 'a' : 'b'}${String(seq).padStart(63, '0')}`);
+    await capture.recordLoss({ at: Date.now(), session, body: { session_seq: allocated.seq } }, 'legacy_writer_lost');
+  }
   assert.equal(capture.status().dropped_total, 2);
   await trace.store.coverage.flushPending();
-  await new Promise(r => setTimeout(r, 50));
   const la = trace.store.findEntriesAll({ type: 'trace.capture_gap', session: 'ses_la' });
   const lb = trace.store.findEntriesAll({ type: 'trace.capture_gap', session: 'ses_lb' });
-  assert.equal(la.length, 1, 'session A gap (its seq 2)');
-  assert.equal(lb.length, 1, 'session B gap (its seq 1): never merged into A');
+  assert.equal(la.length, 1);
+  assert.equal(lb.length, 1);
   assert.notEqual(JSON.parse(await trace.store.readBlob(la[0].payloadRef)).marker_key,
     JSON.parse(await trace.store.readBlob(lb[0].payloadRef)).marker_key);
-  capture.paused = false;
-  await capture.flush().catch(() => {});
 });
 
 test('S7.5-L6: physical_loss_events equals allocated minus persisted after drain (ledger authoritative)', async t => {
@@ -584,8 +570,8 @@ test('S7.5-L6: physical_loss_events equals allocated minus persisted after drain
       if (line.trim()) { try { const e = JSON.parse(line); if (e.session === 'ses_l6') ledgered += e.count ?? 1; } catch {} }
     }
   }
-  assert.equal(ledgered, 3);
-  assert.equal(capture.status().physical_loss_events, 3, 'physical loss exact');
+  assert.equal(ledgered, 0);
+  assert.equal(capture.status().physical_loss_events, 0, 'overflow is recovered, not physical loss');
   assert.equal(5, persisted + ledgered, 'allocated = persisted + physical loss after drain');
 });
 

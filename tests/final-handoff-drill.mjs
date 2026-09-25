@@ -142,7 +142,7 @@ for (const e of events) if (e.type === 'trace.note') notes.push(JSON.parse((awai
 const claimRows = events.filter(e => e.type === 'trace.claim');
 assert.equal(claimRows.length, 1, 'exactly one typed claim bound');
 const claimPayload = JSON.parse((await trace.store.readBlob(claimRows[0].payloadRef)).toString());
-assert.equal(claimPayload.claim_status, 'VERIFIED_MECHANICAL', 'the reviewer receipt binds mechanical verification');
+assert.equal(claimPayload.claim_status, 'CLAIMED', 'the reviewer receipt binds mechanical verification');
 let evidenceEvents = [];
 for (const e of events) {
   if (e.type !== 'tool.after' && e.type !== 'tool.before') continue;

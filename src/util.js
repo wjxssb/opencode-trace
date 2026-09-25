@@ -2,6 +2,24 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
 
+const syncTimes = { file: [], directory: [] };
+const syncCounts = { file: 0, directory: 0 };
+const distribution = values => {
+  const sorted = [...values].sort((a, b) => a - b);
+  const at = p => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))] : null;
+  return { samples: sorted.length, p50: at(.5), p95: at(.95), p99: at(.99) };
+};
+export const storageTiming = () => ({ file_fsync: { count: syncCounts.file, ...distribution(syncTimes.file) },
+  directory_fsync: { count: syncCounts.directory, ...distribution(syncTimes.directory) },
+  unit: 'ms', scope: 'util.atomic calls in this process, last 512 successful syncs per kind; excludes lock and admission-link syncs' });
+async function sync(handle, kind) {
+  const started = performance.now();
+  await handle.sync();
+  syncCounts[kind]++;
+  syncTimes[kind].push(performance.now() - started);
+  if (syncTimes[kind].length > 512) syncTimes[kind].shift();
+}
+
 export function stable(value) {
   const visit = v => {
     if (v === undefined) return null;
@@ -58,7 +76,7 @@ export async function atomic(filename, data, immutable = false) {
   try {
     handle = await fs.open(temporary, 'wx', 0o600);
     await handle.writeFile(data);
-    await handle.sync();
+    await sync(handle, 'file');
     await handle.close(); handle = null;
     if (immutable) {
       try { await fs.link(temporary, filename); }
@@ -68,7 +86,7 @@ export async function atomic(filename, data, immutable = false) {
       }
     } else await fs.rename(temporary, filename);
     const dir = await fs.open(path.dirname(filename), 'r');
-    try { await dir.sync(); } finally { await dir.close(); }
+    try { await sync(dir, 'directory'); } finally { await dir.close(); }
   } finally {
     await handle?.close();
     await fs.unlink(temporary).catch(() => {});

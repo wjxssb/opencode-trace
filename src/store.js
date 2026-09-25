@@ -6,6 +6,7 @@ import { atomic, canonical, hash, stable, refPattern } from './util.js';
 import { SequenceAllocator } from './sequence.js';
 import { CoverageTracker } from './coverage.js';
 import { DerivedIndex } from './derived-index.js';
+import { AdmissionJournal, newOccurrence } from './admission.js';
 
 const keep = (items, item, limit) => [...items.filter(x => x.ref !== item.ref), item].sort((a, b) => a.at - b.at || a.ref.localeCompare(b.ref)).slice(-limit);
 
@@ -38,6 +39,7 @@ export class Store {
     this.sessions = new Map(); this.seen = new Set(); this.watchJobs = new Set();
     this.watchRefs = new Set(); this.maxWatchJobs = 16; this.missedWatchEvents = 0;
     this.watchFactory = options.watch ?? watch;
+    this.admissionOptions = options;
     this.watcherState = { mode: 'initializing', error: null };
     // Completed tool calls, rebuilt from every ingested tool.after event.
     // Terminal evidence must not depend on the bounded pending display window:
@@ -51,10 +53,11 @@ export class Store {
     // capped string hints; exact bytes always live in the blob store.
     this.index = new Map();
     // Phase B: durable per-session sequence allocator + replay guard
-    // (causality-free body hash -> ref) so duplicate delivery/retry never
-    // consumes a sequence number within this process.
+    // (causality-free body -> ref). Only sequential record() replays still
+    // present in this bounded, process-local cache reuse an earlier event.
+    // Concurrent callers, eviction, restart and capture enqueue are outside
+    // that guarantee; this is not raw-event exactly-once delivery.
     this.sequences = null;
-    this.replayGuard = new Map();
     // Phase C: measurable coverage state + durable gap markers.
     this.coverage = new CoverageTracker(this);
     // Phase D: persistent derived mirror (disposable; CAS authoritative).
@@ -70,6 +73,9 @@ export class Store {
     this.root = path.join(this.base, 'workspaces', this.workspaceID);
     for (const d of ['events', 'blobs', 'sessions', 'recall', 'intents', 'state', 'sequence']) await fs.mkdir(path.join(this.root, d), { recursive: true, mode: 0o700 });
     this.sequences = new SequenceAllocator(path.join(this.root, 'sequence'));
+    this.admissions = new AdmissionJournal(this, this.admissionOptions);
+    await this.admissions.init();
+    await this.admissions.recover();
     // Watch before recovery to cover concurrent writers during the one startup scan.
     const watcherFailed = error => {
       this.watcher?.close(); this.watcher = null;
@@ -97,10 +103,14 @@ export class Store {
       catch (error) { this.warning('recovery', error); }
     }
     recovered.sort((a, b) => a.at - b.at || a.ref.localeCompare(b.ref));
-    for (const event of recovered) {
-      try { await this.ingest(event); }
-      catch (error) { this.warning('recovery', error); }
-    }
+    this.recovering = true;
+    try {
+      for (const event of recovered) {
+        try { await this.ingest(event); }
+        catch (error) { this.warning('recovery', error); }
+      }
+    } finally { this.recovering = false; }
+    for (const sid of this.sessions.keys()) await this.writeProjection(sid);
     await this.coverage.rebuild(); // seed watermarks/markers; enables live gap detection
     // Phase D: open the persistent derived mirror; rebuild when it does not
     // match the recovered in-memory index (e.g. first run after upgrade or
@@ -111,6 +121,7 @@ export class Store {
       if (this.derivedIndex.staleVersion || this.derivedIndex.persistedCount !== this.index.size) await this.derivedIndex.rebuild();
     } else {
       // e.g. stale schema version refused by open(): wipe and start clean.
+      await this.derivedIndex.close();
       await fs.rm(path.join(this.root, 'derived'), { recursive: true, force: true });
       this.derivedIndex = new DerivedIndex(this, path.join(this.root, 'derived'));
       if (await this.derivedIndex.open()) await this.derivedIndex.rebuild();
@@ -118,13 +129,14 @@ export class Store {
     await atomic(path.join(this.root, 'state', 'schema.json'), stable({ schema: 1, workspace: this.workspace, workspaceID: this.workspaceID }));
     return this;
   }
-  close() {
+  async close() {
     this.closed = true; this.watcher?.close();
     // Drain in-flight coverage marker writes (bounded) so cleanup that
     // follows close() never races an unfinished evidence write.
     const settled = this.coverage?.flushPending(2).catch(() => {}) ?? Promise.resolve();
     const directory = this.reconcileDirectory; this.reconcileDirectory = null;
-    return Promise.allSettled([settled, directory?.close().catch(() => {})]);
+    await Promise.allSettled([settled, directory?.close().catch(() => {}), ...this.watchJobs]);
+    await this.derivedIndex?.close();
   }
   async flush() { await Promise.allSettled([...this.watchJobs]); }
   async ingest(event) {
@@ -137,6 +149,17 @@ export class Store {
     }
     this.reduce(event, hostCreated);
     await this.indexEvent(event);
+    if (!this.recovering) await this.writeProjection(event.host?.sessionID);
+  }
+  /**
+   * Documented read-only projection sessions/<sha256(sessionID)>.json for
+   * external readers (the inline reviewer's trace bridge). The in-memory
+   * projection stays authoritative; startup recovery writes each session once.
+   */
+  async writeProjection(sid) {
+    if (!sid || this.closed) return;
+    try { await atomic(path.join(this.root, 'sessions', `${hash(sid)}.json`), stable(this.session(sid))); }
+    catch (error) { this.warning('session_projection', error); }
   }
   // Bounded payload peek for search hints. Reads at most HINT_READ_BYTES of
   // the payload file, never the whole blob, and never serves content.
@@ -376,8 +399,9 @@ export class Store {
    * Phase G (writer side): persist a pre-built envelope idempotently — the
    * payload blob, every output blob (hash-verified against its claimed ref),
    * then the event file, then ingest (the writer owns coverage/derived-index
-   * state). Duplicate delivery is harmless: content-addressed writes are
-   * idempotent and an existing event file is reused, never rewritten.
+   * state). Re-delivery of the same allocated envelope is idempotent: an
+   * existing event file is reused, never rewritten. Re-enqueueing its raw
+   * host observation is different and can allocate a new event/ref.
    */
   async persistEnvelope(env) {
     await atomic(path.join(this.root, 'blobs', env.payload.sha256.slice(0, 2), env.payload.sha256), Buffer.from(env.encoded, 'utf8'), true);
@@ -388,14 +412,21 @@ export class Store {
       }
       await atomic(path.join(this.root, 'blobs', b.sha256.slice(0, 2), b.sha256), content, true);
     }
-    const event = { ...env.body, ref: env.ref, at: env.at };
+    // Sources are durable before the immutable event commit. Journal replay
+    // does not carry duplicate large output buffers; verify every CAS ref.
+    for (const output of env.outputs ?? []) await this.readBlob(output.ref);
+    let event = { ...env.body, ref: env.ref, at: env.at };
     const filename = path.join(this.root, 'events', `${env.ref}.json`);
     try { await atomic(filename, stable(event), true); }
     catch (writeError) {
       const existing = await this.readEvent(env.ref).catch(() => null);
       if (!existing) throw writeError;
+      if (stable({ ...existing, at: undefined }) !== stable({ ...event, at: undefined })) throw writeError;
+      event = existing;
     }
+    await this.admissions?.fault('after-event', { envelope: env });
     await this.ingest(event);
+    await this.admissions?.fault('after-index', { envelope: env });
     return event;
   }
   /**
@@ -437,7 +468,7 @@ export class Store {
         const reason = 'queue_overflow';
         const markerKey = `${entry.session}:${entry.from}:${to}:${reason}`;
         if (existingKeys.has(markerKey)) continue; // S7.5: one logical loss, one marker
-        const marker = await this.record('trace.capture_gap', { sessionID: entry.session }, {
+        const marker = await this.recordGap({ sessionID: entry.session }, {
           session: entry.session, reason, component: 'capture',
           status: 'detected', ranges: [{ from: entry.from, to }],
           unresolved_count: to - entry.from + 1,
@@ -506,52 +537,18 @@ export class Store {
     if (!refPattern.test(ref)) throw new Error(`Invalid source ref ${String(ref).slice(0, 80)}: expected evt_<64hex> or blob_<64hex>`);
     return ref.startsWith('evt_') ? this.readEvent(ref) : this.readBlob(ref);
   }
-  async record(type, host, data, extra = {}) {
-    const payload = await this.blob(data);
-    // Replay guard: an identical causality-free body (retry / duplicate
-    // delivery) dedupes to the earlier event WITHOUT consuming a sequence
-    // number. Bounded map; cross-process replays are documented as outside
-    // this guarantee (single-writer workspace is the norm).
-    const v1 = { schema: 1, workspaceID: this.workspaceID, type, host, payload, ...extra };
-    const replayKey = stable(v1);
-    const seenRef = this.replayGuard.get(replayKey);
-    if (seenRef) {
-      const prior = await this.readEvent(seenRef).catch(() => null);
-      if (prior) return prior;
-      this.replayGuard.delete(replayKey);
-    }
-    // Phase B causality: durable per-session sequence + chain link, allocated
-    // atomically so the event ref is derived inside the critical section.
-    // Crash after allocation but before persistence leaves a detectable
-    // sequence gap (Phase C coverage marks it; never rewritten).
-    let body = v1, ref = `evt_${hash(stable(body))}`;
-    if (this.sequences && host?.sessionID) {
-      const built = await this.sequences.allocate(host.sessionID, (session_seq, previous_event_ref) => {
-        const body2 = { ...v1, event_schema: 2, session_seq, ...(previous_event_ref ? { previous_event_ref } : {}) };
-        return { ref: `evt_${hash(stable(body2))}`, body: body2 };
-      });
-      body = built.body;
-      ref = built.ref;
-    }
-    if (this.replayGuard.size >= 1024) this.replayGuard.delete(this.replayGuard.keys().next().value);
-    this.replayGuard.set(replayKey, ref);
-    let event;
-    try { event = await this.readEvent(ref); }
-    catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-      event = { ...body, ref, at: Date.now() };
-      // Racing identical writers must reuse the first durable timestamp.
-      const filename = path.join(this.root, 'events', `${ref}.json`);
-      try { await atomic(filename, stable(event), true); }
-      catch (writeError) {
-        const existing = await this.readEvent(ref).catch(() => null);
-        if (!existing) throw writeError;
-        event = existing;
-      }
-    }
-    await this.ingest(event);
-    if (host.sessionID) await atomic(path.join(this.root, 'sessions', `${hash(host.sessionID)}.json`), stable(this.session(host.sessionID)));
-    return event;
+  async record(type, host, data, extra = {}, occurrence = newOccurrence()) {
+    const { envelope } = await this.admissions.admit({ type, host, data, extra }, occurrence);
+    return this.persistEnvelope(envelope);
+  }
+  async recordGap(host, data, extra = {}) {
+    // A detected discontinuity has a semantic identity (session/range/reason),
+    // unlike a raw host observation. Racing host/worker recovery retains the
+    // first durable marker and never duplicates that one logical gap.
+    if (typeof data.marker_key !== 'string' || data.status !== 'detected') throw new Error('Invalid gap identity');
+    const { envelope } = await this.admissions.admit({ type: 'trace.capture_gap', host, data, extra, gapDedupe: true },
+      `gap:${hash(data.marker_key)}`);
+    return this.persistEnvelope(envelope);
   }
   reduce(event, hostCreated = event.compact?.host_created_at) {
     if (this.seen.has(event.ref)) return;
@@ -560,6 +557,9 @@ export class Store {
     if (!sid) return;
     const s = this.session(sid), item = { ref: event.ref, type: event.type, at: event.at, tool: event.tool, status: event.status, source: event.source, outputs: event.outputs };
     s.recent = keep(s.recent, item, 32);
+    // Tool results get their own window: per-step message.persisted and per-turn context
+    // checkpoints must not push the evidence recall shows out of a shared 32-event window.
+    if (event.type === 'tool.after' && !event.tool?.startsWith('trace_')) s.recentTools = keep(s.recentTools ?? [], item, 32);
     // Deterministic precedence: observation time first, then the content-hash
     // ref as an explicit tie-break (same pattern as compaction ordering).
     // Arrival order is never treated as causality, so out-of-order watch,
@@ -620,6 +620,15 @@ export class Store {
       // Equal/missing times use an explicit deterministic tie-break, not a
       // claim that opaque IDs prove chronology.
       if (!s.compact || a > b || (a === b && candidate.host_message_id.localeCompare(s.compact.host_message_id) > 0)) s.compact = candidate;
+    }
+    // Review rounds are backtracking nodes: the raw review output stays one handle
+    // away even after the worker's own context was compacted.
+    if (event.type === 'tool.after' && event.tool === 'review') s.reviews = keep(s.reviews ?? [], { ...item, callID: event.callID ?? null }, 4);
+    if (event.type === 'acp.block' && event.acp_block?.key) {
+      // Deterministic order (observation time, then ref) so replay converges.
+      const block = { ...event.acp_block, event_ref: event.ref, at: event.at };
+      s.acpBlocks = [...(s.acpBlocks ?? []).filter(b => b.key !== block.key), block]
+        .sort((x, y) => x.at - y.at || x.event_ref.localeCompare(y.event_ref)).slice(-32);
     }
     if (event.type === 'session.lifecycle') {
       if (!s.observation || event.at > s.observation.at || (event.at === s.observation.at && event.ref.localeCompare(s.observation.ref) > 0)) {

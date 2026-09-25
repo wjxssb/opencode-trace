@@ -85,9 +85,9 @@ export function payloadIdentity(data) {
  * allocator at enqueue time so loss accounting stays exact.
  *
  * The body mirrors the synchronous record() path byte-for-byte (schema-1
- * base + schema-2 causal wrap), so an event ref is identical whether the
- * event travels the sync path or the capture path (idempotency + causal
- * chain integrity across paths).
+ * base + schema-2 causal wrap). Both paths derive the same ref only when
+ * given the same body, sequence and previous ref. A raw observation sent
+ * through either path again may allocate a new sequence and therefore ref.
  */
 export function buildCanonicalEnvelope({ workspace_id, session_id, event_type, host, data, extra = {}, seq, previous_event_ref = null }) {
   const payload = payloadIdentity(data);
@@ -110,6 +110,8 @@ export function buildCanonicalEnvelope({ workspace_id, session_id, event_type, h
     ...(extra.candidate_binding ? { candidate_binding: extra.candidate_binding } : {}),
     ...(extra.claim_binding ? { claim_binding: extra.claim_binding } : {}),
     ...(Array.isArray(extra.outputs) ? { outputs: extra.outputs.map(o => ({ ...o })) } : {}),
+    // Replay identity for this allocated envelope, not a pre-allocation
+    // identity capable of deduplicating raw host observations.
     idempotency_key: `${session_id}:${seq}:${ref.slice(4, 16)}`,
     created_at: Date.now(),
     // Persistence inputs (content, not identity — never scanned for vocabulary):

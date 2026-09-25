@@ -34,12 +34,13 @@ test('before/after pairing, exact outputs, immutable ID replay and restart', asy
   const { store, trace, dir } = await fixture(t);
   const e = { ...host(), tool: 'read', input: { filePath: path.join(dir, 'doc'), offset: 2, limit: 5 } };
   const before = await trace.before(e);
-  const after = await trace.after({ ...e, status: 'completed', result: { content: [{ type: 'text', text: 'original\n中' }] } });
+  const completed = { ...e, status: 'completed', result: { content: [{ type: 'text', text: 'original\n中' }] } };
+  const after = await trace.after(completed);
   assert.equal(before.callKey, after.callKey);
   assert.equal(after.host.messageID, 'm1');
   assert.equal(after.host.agent, 'build');
   assert.equal(after.source.offset, 2);
-  const replay = await trace.after({ ...e, status: 'completed', result: { content: [{ type: 'text', text: 'original\n中' }] } });
+  const replay = await trace.after(completed);
   assert.equal(replay.ref, after.ref); assert.equal(replay.at, after.at);
   const note = await trace.note({ kind: 'finding', text: 'observed original', source_refs: [after.ref] }, host());
   await fs.writeFile(path.join(dir, 'doc'), 'changed');
@@ -65,7 +66,7 @@ test('blob and event tampering detected, page bytes exact, partial temp ignored'
   await assert.rejects(store.expand('../../secret'));
 });
 
-test('valid compact recovery, malformed and absent maps record gaps and retain summary', async t => {
+test('valid compact recovery; malformed and absent maps fall back to a structural map, gaps only without facts', async t => {
   const { store } = await fixture(t);
   const source = await store.record('tool.after', host(), { exact: 'old' });
   const map = { important_refs: [source.ref] };
@@ -73,11 +74,20 @@ test('valid compact recovery, malformed and absent maps record gaps and retain s
   assert.deepEqual(await parseMap(summary, store), map);
   const good = await saveCompact(store, 's1', { id: 'compact1', summary, type: 'compaction', status: 'completed' });
   assert.deepEqual(good.compact.refs, [source.ref]);
-  for (const [id, text] of [['compact2', 'Native summary <opencode-trace-map-v1>{bad}</opencode-trace-map-v1>'], ['compact3', 'Native summary without map']]) {
-    const bad = await saveCompact(store, 's1', { id, summary: text });
-    assert.ok(bad.compact.recovery_gap);
-    assert.match((await store.expand(bad.ref)).exact_utf8, /Native summary/);
+  assert.equal(good.compact.map_source, 'model');
+  for (const [id, text, reason] of [['compact2', 'Native summary <opencode-trace-map-v1>{bad}</opencode-trace-map-v1>', 'invalid_json'], ['compact3', 'Native summary without map', 'missing_map']]) {
+    const bound = await saveCompact(store, 's1', { id, summary: text });
+    assert.equal(bound.compact.map_source, 'structural');
+    assert.equal(bound.compact.model_map_gap, reason);
+    assert.equal(bound.compact.recovery_gap, null);
+    assert.deepEqual(bound.compact.map.recent_refs, [source.ref]);
+    assert.match((await store.expand(bound.ref)).exact_utf8, /Native summary/);
   }
+  // A session with no Trace facts cannot be bound: that is a real recovery gap.
+  const empty = await saveCompact(store, 's-empty', { id: 'compact4', summary: 'Native summary without map' });
+  assert.equal(empty.compact.map, null);
+  assert.equal(empty.compact.recovery_gap, 'missing_map');
+  assert.match((await store.expand(empty.ref)).exact_utf8, /Native summary/);
 });
 
 test('note structural validation, workspace scope, supersession and dependency links', async t => {
@@ -202,4 +212,27 @@ test('plugin store failure never throws native hooks, removes tools, or binds pe
   assert.match(report.title, /trace_note failed/);
   assert.match(report.content, /native execution is unaffected/);
   await cleanup();
+});
+
+test('plugin disposal bounds a hung host lookup after durable prompt admission', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'trace-dispose-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  let announce;
+  const lookup = new Promise(resolve => { announce = resolve; });
+  const hooks = {};
+  const ctx = { options: { storeRoot: path.join(dir, 'store') }, location: { directory: dir },
+    session: { hook: async (name, fn) => { hooks[name] = fn; }, get: async () => { announce(); return new Promise(() => {}); } },
+    tool: { hook: async () => {}, transform: async () => {} }, agent: { transform: async () => {} },
+    event: { async *subscribe() {} } };
+  const cleanup = await plugin.setup(ctx);
+  const observation = hooks.prompt({ ...host(), prompt: 'durably admitted before the stuck lookup' });
+  await lookup;
+  let timer;
+  try {
+    await Promise.race([cleanup(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('unbounded disposal')), 3000); })]);
+  } finally { clearTimeout(timer); }
+  await observation;
+  const reopened = await new Store(dir, path.join(dir, 'store')).init();
+  try { assert.equal(reopened.findEntriesAll({ type: 'prompt.received' }).length, 1); }
+  finally { await reopened.close(); }
 });

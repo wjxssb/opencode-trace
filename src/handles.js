@@ -97,6 +97,15 @@ export function assignSnapshotHandles(view) {
   }
   if (view.compact?.ref) add('event', view.compact.ref, 'compaction checkpoint');
   for (const ref of view.compact?.refs ?? []) add('event', ref, 'compaction ref');
+  for (const review of view.reviews ?? []) {
+    add('event', review.ref, `review round · ${review.status ?? '?'}`);
+    for (const ref of review.outputs ?? []) add('blob', ref, 'review output');
+  }
+  // ACP derived blocks: the block record, then the original events it compresses.
+  for (const block of view.acp_blocks ?? []) {
+    add('event', block.event_ref, `acp block · ${block.block} · T${block.tier ?? '?'}`);
+    for (const ref of block.evidence_refs ?? []) add('event', ref, `acp evidence · ${block.block}`);
+  }
   // S4 §13: handle pressure is explicit, never silent. After the cap, a
   // citeable canonical ref would appear WITHOUT a handle — that must be a
   // loud, structured state that tells the model to retrieve before citing.

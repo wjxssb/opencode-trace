@@ -222,7 +222,7 @@ test('Z8: claim + review evidence — typed claim (n#) and old execution evidenc
   const claimOut = await tool(trace, 'trace_claim_receipt').execute(
     { subject: 'z8 gates green', scope: 'test_command_completed', receipt }, host());
   assert.equal(claimOut.metadata.raw.ok, true);
-  assert.equal(claimOut.metadata.raw.claim.status, 'VERIFIED_MECHANICAL');
+  assert.equal(claimOut.metadata.raw.claim.status, 'CLAIMED');
   assert.match(claimOut.metadata.raw.saved_as, /^n[0-9]+$/, 'the claim presents as n# (S3 write-return)');
   const claimRef = claimOut.metadata.raw.ref;
   // The claim event is handle-accessible via retrieve-to-cite (trace.claim is
@@ -239,7 +239,7 @@ test('Z8: claim + review evidence — typed claim (n#) and old execution evidenc
   assert.deepEqual(new Set(prep.metadata.raw.refs), new Set([execRow.ref, claimRef]),
     'the set resolves BOTH the execution evidence and the typed claim to canonical refs');
   const claimEntry = prep.metadata.raw.entries.find(e => e.ref === claimRef);
-  assert.equal(claimEntry.claim_state, 'VERIFIED_MECHANICAL', 'claim state rides in the set');
+  assert.equal(claimEntry.claim_state, 'CLAIMED', 'claim state rides in the set');
   const out = await tool(trace, 'trace_note').execute(
     { kind: 'handoff', text: 'z8 final handoff', citation_set: prep.metadata.raw.token,
       milestone: { kind: 'handoff', summary: 'z8 final handoff', current_state: 'verified' } }, host());
@@ -250,10 +250,11 @@ test('Z8: claim + review evidence — typed claim (n#) and old execution evidenc
   const bad = await tool(trace, 'trace_claim_receipt').execute(
     { subject: 'z8 gates green', scope: 'test_command_completed', receipt: { ...receipt, checkID: `chk_${'3'.repeat(32)}`, commandExitCode: 1 } }, host());
   assert.equal(bad.metadata.raw.ok, true);
-  assert.equal(bad.metadata.raw.claim.status, 'CONTRADICTED');
+  assert.equal(bad.metadata.raw.claim.status, 'CLAIMED');
+  assert.equal(bad.metadata.raw.claim.evidence.reported_outcome, 'failure');
   const badRow = (await tool(trace, 'trace_find').execute({ type: 'trace.claim' }, host()))
     .metadata.raw.results.find(r => r.ref === bad.metadata.raw.ref);
   const rejected = await tool(trace, 'trace_prepare_citations').execute({ handles: [badRow.handle] }, host());
-  assert.equal(rejected.metadata.raw.ok, false, 'a CONTRADICTED claim cannot enter a citation set');
-  assert.match(rejected.metadata.raw.error, /CONTRADICTED claim/);
+  assert.equal(rejected.metadata.raw.ok, false, 'even an unverified failure report cannot justify candidate success');
+  assert.match(rejected.metadata.raw.error, /receipt reports failure/);
 });

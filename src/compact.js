@@ -1,4 +1,4 @@
-import { messageID, unwrap, bytes } from './util.js';
+import { messageID, unwrap, bytes, refPattern } from './util.js';
 
 export const MAP_START = '<opencode-trace-map-v1>';
 export const MAP_END = '</opencode-trace-map-v1>';
@@ -28,14 +28,38 @@ export function compactions(messages) {
   });
 }
 
+/**
+ * The native summarizer never sees the Trace recall frame (runtime context is
+ * primary-request only), so a model-authored map is optional. The fact layer
+ * binds the summary to its own evidence instead: the session's intent,
+ * unsuperseded notes and latest tool results observed up to the compaction.
+ */
+export function structuralMap(store, sid, cutoff) {
+  const s = store.session(sid);
+  const upTo = item => typeof item?.ref === 'string' && refPattern.test(item.ref) && (!Number.isFinite(cutoff) || (item.at ?? 0) <= cutoff);
+  const superseded = new Set((s.notes ?? []).flatMap(n => (n.supersedes ?? []).concat(n.milestone?.supersedes ?? [])));
+  const notes = (s.notes ?? []).filter(n => upTo(n) && !superseded.has(n.ref));
+  const map = {
+    current_refs: upTo(s.intent) ? [s.intent.ref] : [],
+    unresolved_refs: notes.filter(n => n.kind === 'unresolved').slice(-8).map(n => n.ref),
+    important_refs: notes.filter(n => n.kind !== 'unresolved').slice(-8).map(n => n.ref),
+    recent_refs: (s.recentTools ?? []).filter(upTo).slice(-8).map(e => e.ref),
+  };
+  return Object.values(map).some(refs => refs.length) ? map : null;
+}
+
 export async function saveCompact(store, sid, row) {
-  let map = null, gap = null;
+  let map = null, modelGap = null;
   try { map = await parseMap(row.summary, store); }
-  catch (error) { gap = error instanceof SyntaxError ? 'invalid_json' : error.code === 'ENOENT' ? 'missing_ref' : error.message; }
-  const refs = [...new Set(Object.values(map ?? {}).flat())];
+  catch (error) { modelGap = error instanceof SyntaxError ? 'invalid_json' : error.code === 'ENOENT' ? 'missing_ref' : error.message; }
   const hostCreated = Number.isFinite(row.time?.created) ? row.time.created : null;
+  let source = map ? 'model' : null;
+  if (!map) { map = structuralMap(store, sid, hostCreated ?? undefined); if (map) source = 'structural'; }
+  // A gap now means neither the summary nor Trace's own facts could bind this compaction.
+  const gap = map ? null : modelGap ?? 'no_evidence';
+  const refs = [...new Set(Object.values(map ?? {}).flat())];
   const event = await store.record('compaction', { sessionID: sid, messageID: row.id }, row,
-    { compact: { map, refs, recovery_gap: gap, host_created_at: hostCreated } });
+    { compact: { map, refs, map_source: source, model_map_gap: modelGap, recovery_gap: gap, host_created_at: hostCreated } });
   if (gap) await store.record('recovery_gap', { sessionID: sid, messageID: row.id }, { reason: gap, source_ref: event.ref });
   return event;
 }

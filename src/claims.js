@@ -12,13 +12,10 @@
 // - PROSE CAN ONLY EVER PRODUCE CLAIMED. Any text — including text shaped
 //   like a receipt ("tests passed", fake JSON) — is a model assertion, never
 //   mechanical verification (F1/F4).
-// - VERIFIED_MECHANICAL is NARROW: a structurally complete host receipt
-//   (checkID, kind, mechanical status, command exit code, timeout/signal,
-//   candidate binding, output hashes) was bound to the claim. It means "this
-//   command, in this candidate, with this output hash, exited this way" —
-//   NEVER "the implementation is correct" (F2).
-// - A receipt whose command exit code is nonzero (or which timed out) cannot
-//   support a success claim; it CONTRADICTS it (F3).
+// - A structured receipt supplied by a model is also CLAIMED. Neither its
+//   shape nor matching CAS bytes establish host execution or candidate scope.
+//   This ingress has no host-attestation authority and never emits
+//   VERIFIED_MECHANICAL or CONTRADICTED from an unauthenticated receipt.
 // - Receipts bind to ONE candidate identity. A candidate-A receipt stays
 //   valid historical evidence for A and can never mechanically justify a
 //   candidate B (F5) — staleness is computed against the current candidate
@@ -110,35 +107,41 @@ export function claimFromProse({ subject, text, refs = [], supersedes = [] }) {
 }
 
 /**
- * Bind a structurally complete host CheckReceipt to a narrow claim.
- * - receipt reports exit 0 without timeout -> VERIFIED_MECHANICAL for the
- *   narrow `scope` (e.g. 'test_command_completed'), never implementation
- *   correctness.
- * - receipt reports a nonzero exit or a timeout -> the success claim is
- *   CONTRADICTED (F3): the mechanical evidence and the prose disagree, and
- *   the mechanical evidence wins for the narrow dimension while the
- *   contradiction stays visible.
+ * Retain a submitted receipt without upgrading its source authority. This
+ * function is reached by model tool arguments, not a host execution ledger.
+ * A well-formed chk_ value is a label, not a signature. Outcome is explicitly
+ * reported rather than verified, including negative/timeout assertions.
  */
 export function claimFromReceipt({ subject, scope, receipt, supersedes = [] }) {
   const r = validateReceipt(receipt);
   const passed = r.commandExitCode === 0 && !r.timedOut;
   return {
     subject: String(subject ?? '').trim(),
-    status: passed ? 'VERIFIED_MECHANICAL' : 'CONTRADICTED',
+    status: 'CLAIMED',
     scope: String(scope ?? 'mechanical_check'),
-    evidence: { kind: 'check_receipt', receipt: r },
-    meaning: passed
-      ? `structurally complete CheckReceipt bound: ${r.checkID} reports kind=${r.kind} command_exit_code=0 under `
-        + `candidate ${r.candidate.commit.slice(0, 12)} (output sha256 ${r.output.sha256.slice(0, 12)}). Receipt `
-        + 'authenticity is NOT established by this record — audit the checkID against reviewer records. Narrow '
-        + 'mechanical execution evidence for scope "' + r.kind + '" — never implementation correctness.'
-      : `CheckReceipt ${r.checkID} contradicts the claimed success: command_exit_code=${r.commandExitCode}`
-        + `${r.timedOut ? ', timed out' : ''}${r.signal !== 'none' ? `, signal=${r.signal}` : ''}. Receipt authenticity `
-        + 'is NOT established by this record. The prose claim and the receipt disagree; the contradiction stays visible.',
+    evidence: { kind: 'check_receipt', receipt: r, authenticity: 'unverified',
+      reported_outcome: passed ? 'success' : 'failure' },
+    meaning: `Submitted CheckReceipt ${r.checkID} reports kind=${r.kind}, command_exit_code=${r.commandExitCode}`
+      + `${r.timedOut ? ', timed out' : ''}${r.signal !== 'none' ? `, signal=${r.signal}` : ''}`
+      + ` for candidate ${r.candidate.commit.slice(0, 12)}. Receipt authenticity is NOT established by this record. `
+      + 'Matching output bytes verify content identity only; audit the checkID against actual host execution records. '
+      + 'This is a structured model claim, never mechanical verification or implementation correctness.',
     supersedes: (Array.isArray(supersedes) ? supersedes : []).filter(r2 => typeof r2 === 'string' && refPattern.test(r2)),
     review_effect: 'none',
     semantics,
   };
+}
+
+/** Older canonical claims remain immutable; readers must not inherit the old
+ * schema's execution-authority upgrade for model-submitted receipts. */
+export function effectiveClaimStatus(payload) {
+  if (payload?.evidence?.kind === 'check_receipt') return 'CLAIMED';
+  return payload?.claim_status ?? payload?.status ?? 'UNKNOWN';
+}
+
+export function reportedReceiptFailure(payload) {
+  const receipt = payload?.evidence?.kind === 'check_receipt' ? payload.evidence.receipt : null;
+  return receipt && (receipt.commandExitCode !== 0 || receipt.timedOut === true);
 }
 
 /**

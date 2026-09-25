@@ -217,14 +217,18 @@ test('Scenario 8: Compact survival - state preserved before compact and survives
     }
   }, host());
 
-  // Simulate compaction without trace map (causes recovery_gap: missing_map)
+  // Simulate compaction without a model-authored trace map
   await trace.observeMessages('worker', [
     { type: 'compaction', id: 'cmp_missing_map', summary: 'Regular summary without any opencode-trace-map tag', time: { created: Date.now() }, status: 'completed' }
   ]);
 
-  // Verify recovery_gap was created
+  // Trace binds the compaction to its own facts instead of recording a gap
   const gap = trace.store.findEntriesAll({ type: 'recovery_gap', session: 'worker' });
-  assert.ok(gap.length > 0, 'Compaction should produce recovery_gap on missing map');
+  assert.equal(gap.length, 0, 'facts exist, so the compaction is bound structurally');
+  const compact = trace.store.session('worker').compact;
+  assert.equal(compact.map_source, 'structural');
+  assert.equal(compact.model_map_gap, 'missing_map');
+  assert.ok(compact.refs.includes(ev.ref), 'structural map cites the observed tool result');
 
   // Next session / turn recall still successfully recovers critical milestone memory
   const view = parseRecall(trace.recall('worker'));
@@ -700,4 +704,15 @@ test('Scenario 18: to_worker/continuation_of agent-name matching must not bind s
   am = parseRecall(trace.recall('worker_css')).active_memory;
   assert.equal(am.handoff_source, undefined, 'Sibling must not bind via continuation_of agent name');
   assert.ok(am.next_action !== 'Run DB migration');
+});
+
+test('Scenario 19: an agent-name handoff never binds an unrelated top-level session', async t => {
+  const { trace } = await fixture(t);
+  const ev = await trace.after({ ...host('old_task'), tool: 'shell', input: { command: 'check' }, status: 'completed', result: { output: 'RC=0' } });
+  await trace.note({ kind: 'handoff', text: 'FINAL RESUME state of an old task', source_refs: [ev.ref],
+    milestone: { kind: 'handoff', summary: 'FINAL RESUME state of an old task', current_state: 'PASS', to_worker: 'build', evidence_refs: [ev.ref] } }, host('old_task'));
+  await trace.after({ ...host('new_task'), tool: 'read', input: { path: 'x' }, status: 'completed', result: { output: 'x' } });
+  const am = trace.computeActiveMemory(trace.store.session('new_task'));
+  assert.equal(am.handoff_source, undefined, 'unrelated session must not inherit an agent-name handoff');
+  assert.equal(am.goal, null);
 });

@@ -73,6 +73,7 @@ export class DerivedIndex {
     this.error = null;
     this.rebuilds = 0;
     this.persistedCount = 0;        // watermark: rows mirrored from CAS
+    this.transactions = 0; this.busyErrors = 0; this.transactionTimes = [];
   }
 
   async open() {
@@ -87,9 +88,13 @@ export class DerivedIndex {
       const version = this.db.prepare("SELECT v FROM meta WHERE k='schema_version'").get()?.v ?? null;
       this.persistedCount = Number(this.db.prepare("SELECT v FROM meta WHERE k='cas_count'").get()?.v ?? 0);
       this.staleVersion = version !== null && Number(version) !== SCHEMA_VERSION;
+      const rowCount = Number(this.db.prepare('SELECT count(*) AS n FROM events').get().n);
+      const ftsCount = Number(this.db.prepare('SELECT count(*) AS n FROM events_fts').get().n);
+      if (rowCount !== this.persistedCount || ftsCount !== rowCount) this.staleVersion = true;
       this.state = 'ready';
       return !this.staleVersion;
     } catch (error) {
+      try { this.db?.close(); } catch {}
       this.db = null; this.state = 'error'; this.error = String(error?.message ?? error).slice(0, 200);
       return false;
     }
@@ -101,22 +106,32 @@ export class DerivedIndex {
    *  cas_count watermark counts UNIQUE indexed refs, not upsert calls. */
   upsert(entry) {
     if (!this.db || this.state === 'error') return;
+    const started = performance.now();
     try {
       const row = indexRow(entry);
       if (row.ref == null) return; // refless entry cannot be indexed
       const text = searchableText(entry);
+      this.db.exec('BEGIN IMMEDIATE');
       const known = this.db.prepare('SELECT 1 FROM events WHERE ref = ?').get(row.ref);
       this.db.prepare('INSERT OR REPLACE INTO events (ref, session, seq, at, type, tool, status, path, caused_by, previous, parent, payload_ref, json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
         .run(row.ref, row.session, row.seq, row.at, row.type, row.tool, row.status, row.path,
           row.caused_by, row.previous, row.parent, row.payload_ref, row.json);
       this.db.prepare('DELETE FROM events_fts WHERE ref = ?').run(row.ref);
       this.db.prepare('INSERT INTO events_fts (ref, text) VALUES (?,?)').run(row.ref, text);
-      if (!known) this.persistedCount++; // unique indexed refs, never upsert-call count
-      this.db.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('cas_count', ?)").run(String(this.persistedCount));
+      const count = this.persistedCount + (known ? 0 : 1);
+      this.db.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('cas_count', ?)").run(String(count));
+      this.db.exec('COMMIT');
+      this.persistedCount = count;
+      this.transactions++;
     } catch (error) {
+      if (/SQLITE_BUSY|database is locked/.test(String(error?.code ?? '') + ' ' + String(error?.message ?? ''))) this.busyErrors++;
+      try { this.db?.exec('ROLLBACK'); } catch {}
       this.state = 'error'; this.error = String(error?.message ?? error).slice(0, 200);
       try { this.db?.close(); } catch {}
       this.db = null; // degrade honestly; memory index remains authoritative for queries
+    } finally {
+      this.transactionTimes.push(performance.now() - started);
+      if (this.transactionTimes.length > 512) this.transactionTimes.shift();
     }
   }
 
@@ -125,11 +140,11 @@ export class DerivedIndex {
     if (!this.db) return { rebuilt: false, reason: this.error ?? 'index unavailable' };
     this.state = 'rebuilding';
     try {
-      this.db.exec('DELETE FROM events; DELETE FROM events_fts;');
       const insert = this.db.prepare('INSERT OR REPLACE INTO events (ref, session, seq, at, type, tool, status, path, caused_by, previous, parent, payload_ref, json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)');
       const fts = this.db.prepare('INSERT OR REPLACE INTO events_fts (ref, text) VALUES (?,?)');
       this.db.exec('BEGIN');
       try {
+        this.db.exec('DELETE FROM events; DELETE FROM events_fts;');
         let n = 0;
         for (const entry of this.store.index.values()) {
           const row = indexRow(entry);
@@ -192,11 +207,16 @@ export class DerivedIndex {
     // Last-known mirror watermark (in-memory, survives db handle loss) so a
     // suppressed/failing writer still reports honest lag instead of null.
     const persisted = this.persistedCount ?? null;
+    const times = [...this.transactionTimes].sort((a, b) => a - b);
+    const at = p => times.length ? times[Math.min(times.length - 1, Math.floor(p * times.length))] : null;
     return {
       enabled: !!this.db, state: this.state, error: this.error, rebuilds: this.rebuilds,
       indexed_through: persisted, memory_events: memory,
       index_lag: persisted == null ? null : Math.max(0, memory - persisted),
       backend: 'node:sqlite (FTS5)',
+      transactions: this.transactions, busy_errors: this.busyErrors, busy_timeout_ms: 2000,
+      transaction_ms: { p50: at(.5), p95: at(.95), p99: at(.99), samples: times.length,
+        meaning: 'wall duration including any SQLite busy wait; wait is not separately attributed' },
       meaning: 'derived mirror only; CAS is authoritative; FTS results are candidates, evidence via trace_expand',
     };
   }

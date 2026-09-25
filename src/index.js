@@ -11,7 +11,14 @@ export default {
       try { disposables.push(await fn()); }
       catch (error) { trace.warning(`register ${name}`, error); }
     };
-    await register('prompt', () => ctx.session.hook('prompt', e => trace.safe('prompt', () => trace.prompt(e))));
+    const observation = (phase, event, fn) => {
+      // Assign identity synchronously, before safe() awaits startup or queues
+      // asynchronous work. Same object delivery retries retain this identity;
+      // distinct observations get new IDs even when their bytes are identical.
+      const occurrence = trace.occurrence(event, phase);
+      return trace.safe(phase, () => fn(event, occurrence));
+    };
+    await register('prompt', () => ctx.session.hook('prompt', e => observation('prompt', e, (e, id) => trace.prompt(e, id))));
     await register('context', () => ctx.session.hook('context', async e => {
       const requestData = usesRequestData(e, ctx.options);
       const runtime = usesRuntimeContext(e, ctx.options);
@@ -39,8 +46,8 @@ export default {
         else append('OPENCODE_TRACE_RECALL_UNAVAILABLE: Trace could not prepare recall for this request within its observer budget. Historical evidence may be missing from this prompt; this does not mean there is no history or that prior work is resolved. Use native conversation records and trace_status/trace_find as needed. Native execution continues.');
       }
     }));
-    await register('before', () => ctx.tool.hook('execute.before', e => trace.safe('before', () => trace.before(e))));
-    await register('after', () => ctx.tool.hook('execute.after', e => trace.safe('after', () => trace.after(e))));
+    await register('before', () => ctx.tool.hook('execute.before', e => observation('before', e, (e, id) => trace.before(e, id))));
+    await register('after', () => ctx.tool.hook('execute.after', e => observation('after', e, (e, id) => trace.after(e, id))));
     await register('agents', () => ctx.agent.transform(editor => trace.safe('agents', async () => {
       const agents = editor.list().map(a => ({ id: a.id, name: a.name, description: a.description, mode: a.mode, model: a.model }));
       await trace.store.record('agents.snapshot', {}, agents);
@@ -54,13 +61,22 @@ export default {
       } catch (error) { if (!abort.signal.aborted) trace.warning('subscription', error); }
     })();
     return async () => {
-      abort.abort(); trace.store.close();
+      trace.closing = true;
+      abort.abort();
       for (const d of disposables.reverse()) {
         try { if (typeof d === 'function') await d(); else await d?.dispose?.(); }
         catch (error) { trace.warning('dispose', error); }
       }
       // Host subscriptions cancel on abort; do not await a host iterator indefinitely.
       void subscription;
+      let drainTimer;
+      try {
+        await Promise.race([Promise.allSettled([...trace.observerJobs]), new Promise(resolve => {
+          drainTimer = setTimeout(() => { trace.warning('dispose', { code: 'OBSERVER_DRAIN_TIMEOUT' }); resolve(); }, 1000);
+        })]);
+      } finally { clearTimeout(drainTimer); }
+      await trace.capture?.stop();
+      await trace.store.close();
     };
   }
 };

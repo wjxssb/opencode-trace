@@ -66,7 +66,7 @@ assert.ok(hRow, 'evidence discoverable');
 const claimOut = await byName['trace_claim_receipt'].execute({ subject: 's8 gates green', scope: 'test_command_completed',
   receipt: { checkID: `chk_${'8'.repeat(32)}`, kind: 'test', status: 'passed', commandExitCode: 0, timedOut: false, signal: 'none', candidate: { commit: 'a'.repeat(64) }, output: { sha256: 'b'.repeat(64) } } },
   { sessionID: sid, agent: 'build', id: 'cc', messageID: 'mc' });
-assert.equal(claimOut.metadata.raw.claim.status, 'VERIFIED_MECHANICAL');
+assert.equal(claimOut.metadata.raw.claim.status, 'CLAIMED');
 check('F typed claim (n#)', /^n[0-9]+$/.test(claimOut.metadata.raw.saved_as ?? ''));
 const claimRow = trace.store.findEntriesAll({ type: 'trace.claim', session: sid }, null, 1)[0];
 const registered = trace.gateway.registerEvidence(sid, [hRow.ref, claimRow.ref]);

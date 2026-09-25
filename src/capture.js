@@ -8,28 +8,19 @@
 // G. This module never imports the handle registry and never matches handle/token
 // vocabulary (see the §13 dependency test); it only knows canonical refs.
 //
-// Host critical path: validate canonical -> allocate session sequence AT
-// ENQUEUE through the durable per-session allocator -> build the
-// CanonicalCaptureEnvelopeV1 in memory -> validate the envelope -> queue or
-// record the exact loss -> return. Loss accounting is EXACT: an envelope
-// lost to overflow or writer death has a known session_seq.
-//
-// Failure domain: the writer is a worker thread (src/capture-worker.js) that
-// owns persistence and the derived index (single writer — the host suppresses
-// its own index writes while the worker is alive). Writer death never blocks
-// the host: in-flight envelopes are recorded as exact losses in a durable
-// JSONL ledger OUTSIDE the queue, capture reports degraded, and a new
-// generation spawns with backoff. The next writer generation drains the
-// ledger into trace.capture_gap markers (reason=queue_overflow); duplicate
-// markers are harmless because coverage dedupes by marker key.
-//
-// No silent loss: every drop path ends in either the ledger (durable,
-// outside the queue) or a durable coverage marker — usually both.
+// The host assigns an occurrence before asynchronous delivery. Admission
+// fsyncs source CAS and an intent fixing sequence/ref; the worker receives
+// only that admitted envelope. Memory overflow spills the same event, and
+// lost ACKs/worker death replay it without allocating another identity.
+// Accepted intents survive host restart. A host failure before admission is
+// outside that guarantee and must never be called exactly-once delivery.
+// Historical loss ledgers remain readable; they are not used to label an
+// unacknowledged but possibly committed new event as physically lost.
 import { Worker } from 'node:worker_threads';
 import path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { atomic, refPattern } from './util.js';
-import { buildCanonicalEnvelope, assertCanonicalEnvelope } from './canonical-envelope.js';
+import { assertCanonicalEnvelope } from './canonical-envelope.js';
 
 const MAX_QUEUE = 256;
 const MAX_QUEUE_BYTES = 8 * 1024 * 1024;
@@ -140,15 +131,15 @@ export class CaptureCoordinator {
   /** Proven owner liveness: /proc/<pid> present AND its /proc starttime AND
    *  boot id match the lease — PID reuse and machine reboot both fail this. */
   async #ownerAlive(lease) {
-    if (!lease || typeof lease !== 'object' || !Number.isInteger(lease.pid) || lease.pid <= 0) return false;
-    if (!lease.starttime || !lease.boot_id) return false; // incomplete identity: never steal blindly either; report unknown
+    if (!lease || typeof lease !== 'object' || !Number.isInteger(lease.pid) || lease.pid <= 0) return null;
+    if (!lease.starttime || !lease.boot_id) return null;
     try {
       const raw = await fs.readFile(`/proc/${lease.pid}/stat`, 'utf8');
       const after = raw.slice(raw.lastIndexOf(')') + 2);
       const startTicks = after.split(' ')[19];
       const bootId = (await fs.readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim();
       return startTicks === lease.starttime && bootId === lease.boot_id;
-    } catch { return false; } // /proc entry gone: owner is dead
+    } catch (error) { return error.code === 'ENOENT' ? false : null; }
   }
 
   async #readLease() {
@@ -157,6 +148,10 @@ export class CaptureCoordinator {
   }
 
   async acquireOwnership() {
+    return this.trace.store.sequences.withLock('_capture-owner', () => this.acquireOwnershipLocked());
+  }
+
+  async acquireOwnershipLocked() {
     const leasePath = this.leasePath();
     const identity = await this.#processStartIdentity();
     const payload = { ...identity, workspaceID: this.trace.store.workspaceID,
@@ -169,6 +164,8 @@ export class CaptureCoordinator {
       if (error?.code !== 'EEXIST') { this.ownership = false; this.ownershipReason = `lease-write-${error?.code ?? 'error'}`; return false; }
     }
     const existing = await this.#readLease();
+    const alive = await this.#ownerAlive(existing);
+    if (alive === null) { this.ownership = false; this.ownershipReason = 'owner-identity-unknown'; return false; }
     // Idempotent re-acquire: OUR OWN live lease (same pid + start identity)
     // is not a conflict — e.g. start() called twice in one process.
     if (existing && existing.pid === process.pid
@@ -199,11 +196,12 @@ export class CaptureCoordinator {
 
   renewOwnership() {
     if (this.ownership !== true) return;
-    fs.readFile(this.leasePath(), 'utf8').then(text => {
+    this.trace.store.sequences.withLock('_capture-owner', async () => {
+      const text = await fs.readFile(this.leasePath(), 'utf8');
       const lease = JSON.parse(text);
       if (lease.pid !== process.pid) return; // lost the lease; do not renew foreign files
       lease.heartbeat_at = Date.now(); lease.generation = this.generation;
-      return fs.writeFile(this.leasePath(), JSON.stringify(lease), { mode: 0o600 });
+      return atomic(this.leasePath(), JSON.stringify(lease));
     }).catch(() => { /* lease lost; death/stop paths own recovery */ });
   }
 
@@ -211,8 +209,10 @@ export class CaptureCoordinator {
     if (this.leaseTimer) { clearInterval(this.leaseTimer); this.leaseTimer = null; }
     if (this.ownership !== true) { this.ownership = null; return; }
     try {
-      const lease = await this.#readLease();
-      if (lease && lease.pid === process.pid) await fs.rm(this.leasePath(), { force: true });
+      await this.trace.store.sequences.withLock('_capture-owner', async () => {
+        const lease = await this.#readLease();
+        if (lease && lease.pid === process.pid) await fs.rm(this.leasePath(), { force: true });
+      });
     } catch { /* release best-effort; stale lease is stealable by design */ }
     this.ownership = null; this.ownershipReason = null;
   }
@@ -264,16 +264,26 @@ export class CaptureCoordinator {
   onWorkerMessage(message, isCurrent) {
     if (!isCurrent()) return; // stale generation: already handled by the death path
     if (message.type === 'ack') {
-      for (const id of message.ids) {
+      if (message.storageTiming) this.workerStorageTiming = message.storageTiming;
+      if (message.indexState) this.workerIndexState = message.indexState;
+      let acknowledged = 0;
+      for (const id of Array.isArray(message.ids) ? message.ids : []) {
         const env = this.inFlight.get(id);
-        if (env) { this.queueBytes -= env.bytes; this.inFlight.delete(id); }
+        if (!env) continue;
+        this.queueBytes -= env.bytes;
+        this.inFlight.delete(id);
+        acknowledged++;
+        const session = env.session ?? '_';
+        const seq = env.body?.session_seq;
+        if (Number.isSafeInteger(seq) && seq >= 0)
+          this.lastPersisted.set(session, Math.max(this.lastPersisted.get(session) ?? 0, seq));
       }
-      for (const [session, seq] of Object.entries(message.persisted ?? {})) {
-        this.lastPersisted.set(session, Math.max(this.lastPersisted.get(session) ?? 0, seq));
-      }
-      this.lastIndexed = message.indexed ?? this.lastIndexed;
-      this.persistedEventCount += message.ids?.length ?? 0;
-      this.indexedEventCount = this.persistedEventCount; // persist + index are one atomic step in the worker
+      // An ACK is evidence only for this generation's known in-flight
+      // envelopes. Replayed/unknown IDs and advertised maxima are not new work.
+      if (acknowledged === 0) return;
+      this.lastIndexed = acknowledged;
+      this.persistedEventCount += acknowledged;
+      this.indexedEventCount = this.persistedEventCount; // worker in-memory ingestion acknowledged; SQLite is separate
       void this.lastIndexed; // legacy field superseded by the S7.5 counts; kept only to avoid breaking external readers until S8 release
       if (Number.isFinite(message.latencyMs)) {
         this.latencies.push(message.latencyMs);
@@ -293,11 +303,10 @@ export class CaptureCoordinator {
     // both fire; a replaced worker's death never touches a healthy successor.
     if (this.stopped || this.worker !== worker) return;
     this.worker = null;
-    // Writer death is loss the host can SEE: every posted-but-unacked
-    // envelope has an exact allocated sequence — record it in the durable
-    // ledger (outside any queue) and in coverage immediately. Surviving
-    // queued envelopes stay in host memory and drain to the successor.
-    for (const env of this.inFlight.values()) this.recordLoss(env, 'writer_lost');
+    // Lack of ACK does not establish loss: immutable events may already have
+    // committed. Retry the same admitted envelopes; the journal also survives
+    // death of this host. Never allocate new identities on worker retry.
+    this.queue.unshift(...this.inFlight.values());
     this.inFlight.clear();
     this.degraded = true;
     try { worker.terminate(); } catch { /* already gone */ }
@@ -330,15 +339,9 @@ export class CaptureCoordinator {
     }
   }
 
-  /**
-   * Enqueue one capture job: canonical pre-admission gate, then allocate the
-   * session sequence (durable), build the CanonicalCaptureEnvelopeV1 in
-   * memory, validate the envelope, then either queue it or record the exact
-   * loss. Returns immediately after allocation — persistence happens on the
-   * writer.
-   */
+  /** Durably admit once per occurrence, then dispatch its fixed envelope. */
   async enqueue(job) {
-    if (this.stopped) throw new Error('capture writer stopped');
+    if (this.stopped || this.stopping) throw new Error('capture writer stopped');
     // §14: unresolved identities never enter G — and never consume a seq.
     assertCanonicalJob(job);
     // P2-A: a non-owner process must not enqueue into its own (unowned)
@@ -348,17 +351,8 @@ export class CaptureCoordinator {
     if (this.ownership === false) return { enqueued: false, dropped: true, ownership: false, reason: this.ownershipReason ?? 'owner-unavailable' };
     const session = job.host?.sessionID ?? null;
     const store = this.trace.store;
-    let built;
-    const allocation = await store.sequences.allocate(session, (seq, previous) => {
-      built = buildCanonicalEnvelope({
-        workspace_id: store.workspaceID, session_id: session,
-        event_type: job.type, host: job.host, data: job.data, extra: job.extra ?? {},
-        seq, previous_event_ref: previous,
-      });
-      return { ref: built.event_ref, body: built.body };
-    });
-    const blobs = (job.blobs ?? []).map(b => ({ ...b }));
-    const bytes = built.encoded.length + blobs.reduce((n, b) => n + (Buffer.isBuffer(b.content) ? b.content.length : 0), 0);
+    const { envelope: built, replayed } = await store.admissions.admit(job, job.occurrence);
+    const bytes = Buffer.byteLength(built.encoded);
     // The queued object IS the CanonicalCaptureEnvelopeV1 plus persistence
     // inputs (ref aliases event_ref for the worker-side primitive; bytes and
     // env_id are transport metadata). The validator ignores extra fields, so
@@ -366,18 +360,25 @@ export class CaptureCoordinator {
     const envelope = {
       ...built,
       ref: built.event_ref,
-      env_id: `${this.generation}-${allocation.seq}-${built.event_ref.slice(4, 12)}`,
-      at: Date.now(), session, blobs, bytes,
+      env_id: built.event_ref,
+      session, bytes,
     };
     // Defense in depth: the built envelope re-validates before admission.
     assertCanonicalEnvelope(envelope);
+    if (replayed && (this.inFlight.has(envelope.env_id) || this.queue.some(env => env.env_id === envelope.env_id)))
+      return { enqueued: true, ref: built.event_ref, replayed: true };
+    if (replayed && await store.exists(built.event_ref))
+      return { enqueued: false, ref: built.event_ref, replayed: true, persisted: true };
     if (this.queue.length >= this.queueCap || this.queueBytes + bytes > MAX_QUEUE_BYTES) {
-      await this.recordLoss(envelope, 'queue_overflow');
-      return { enqueued: false, ref: built.event_ref, dropped: true };
+      // Admission is durable even when the memory queue is full. Complete the
+      // same event directly, with host index writes suppressed when the worker
+      // owns it. The outer observer budget remains fail-open for native work.
+      await store.persistEnvelope(envelope);
+      return { enqueued: false, ref: built.event_ref, spilled: true, persisted: true };
     }
     this.queue.push(envelope);
     this.queueBytes += bytes;
-    this.lastEnqueued.set(session, Math.max(this.lastEnqueued.get(session) ?? 0, allocation.seq));
+    this.lastEnqueued.set(session, Math.max(this.lastEnqueued.get(session) ?? 0, built.session_seq));
     this.drain();
     return { enqueued: true, ref: built.event_ref };
   }
@@ -401,13 +402,24 @@ export class CaptureCoordinator {
   }
 
   async stop() {
+    this.stopping = true;
+    try { await this.flush(); } catch { /* accepted intents remain recoverable on restart */ }
     this.stopped = true;
-    try { await this.flush(); } catch { /* degraded: losses already ledgered on death paths */ }
     const worker = this.worker;
     this.worker = null;
     this.active = false;
     this.trace.store.suppressDerivedWrites = false;
-    if (worker) { try { await worker.terminate(); } catch { /* already gone */ } }
+    if (worker) {
+      const exited = await new Promise(resolve => {
+        let settled = false;
+        const finish = value => { if (settled) return; settled = true; clearTimeout(timer); worker.off('exit', onExit); resolve(value); };
+        const onExit = () => finish(true);
+        const timer = setTimeout(() => finish(false), 2000);
+        worker.once('exit', onExit);
+        try { worker.postMessage({ type: 'shutdown' }); } catch { finish(false); }
+      });
+      if (!exited) { try { await worker.terminate(); } catch { /* already gone */ } }
+    }
     // P2-A: release the workspace owner lease (id-checked; stale leases are
     // stealable by design, so a failed release never wedges the workspace).
     await this.releaseOwnership();
@@ -435,9 +447,11 @@ export class CaptureCoordinator {
       persisted_event_count: this.persistedEventCount,
       indexed_event_count: this.indexedEventCount,
       index_lag_events: this.persistedEventCount - this.indexedEventCount,
-      persist_latency_ms: { p50: pick(0.5), p95: pick(0.95), last: latencies.at(-1) ?? null },
+      persist_latency_ms: { p50: pick(0.5), p95: pick(0.95), p99: pick(0.99), last: latencies.at(-1) ?? null },
+      worker_storage: this.workerStorageTiming ?? null,
+      worker_index: this.workerIndexState ?? null,
       respawn_attempts: this.respawnAttempts,
-      meaning: 'non-blocking capture: physical_loss_events is the exact lost-envelope count from the enqueue-side allocator (ledger-backed); persisted/indexed_event_count are cumulative acked-envelope counts (persist and index are one atomic worker step, so index_lag_events is 0 after acks); sequence watermarks are per-session maxima; degraded means the writer died and unacknowledged envelopes were recorded as exact losses in the durable ledger; loss never blocks the host',
+      meaning: 'Durable admission fixes occurrence identity before worker dispatch. Memory overflow and missing ACKs do not prove physical loss. Persisted/indexed counts track acknowledged envelopes and worker in-memory ingestion, not an atomic SQLite commit; durable index state is reported separately. Historical loss-ledger counters exclude recoverable admitted work. Native work remains fail-open before admission.',
     };
   }
 }

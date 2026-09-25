@@ -45,31 +45,33 @@ test('F1: prose "tests passed" without a receipt -> CLAIMED (never mechanical)',
   assert.match(claim.meaning, /never mechanical verification/);
 });
 
-test('F2: a valid CheckReceipt binds a NARROW VERIFIED_MECHANICAL (never implementation correctness)', async t => {
+test('F2: a well-formed submitted receipt remains CLAIMED without host attestation', async t => {
   const { trace } = await fixture(t);
   const { claim } = await trace.recordClaim({ subject: 'tests passed', scope: 'test_command_completed', receipt: validReceipt() }, host());
-  assert.equal(claim.status, 'VERIFIED_MECHANICAL');
+  assert.equal(claim.status, 'CLAIMED');
   assert.equal(claim.evidence.kind, 'check_receipt');
   assert.equal(claim.evidence.receipt.commandExitCode, 0);
-  assert.match(claim.meaning, /structurally complete CheckReceipt bound/);
+  assert.match(claim.meaning, /Submitted CheckReceipt/);
   assert.match(claim.meaning, /authenticity is NOT established by this record/);
-  assert.match(claim.meaning, /never implementation correctness/);
+  assert.match(claim.meaning, /never mechanical verification or implementation correctness/);
   // The durable event carries the receipt verbatim for audit.
   const rows = trace.store.findEntriesAll({ type: 'trace.claim' });
   assert.equal(rows.length, 1);
   const payload = JSON.parse(await trace.store.readBlob(rows[0].payloadRef));
-  assert.equal(payload.claim_status, 'VERIFIED_MECHANICAL');
+  assert.equal(payload.claim_status, 'CLAIMED');
   assert.equal(payload.evidence.receipt.checkID, validReceipt().checkID);
 });
 
-test('F3: nonzero exit contradicts a pass claim (mechanical evidence wins, contradiction visible)', async t => {
+test('F3: reported nonzero exit and timeout remain unverified, with failure visible', async t => {
   const { trace } = await fixture(t);
   const { claim } = await trace.recordClaim({ subject: 'tests passed', receipt: validReceipt(COMMIT_A, 1) }, host());
-  assert.equal(claim.status, 'CONTRADICTED');
-  assert.match(claim.meaning, /contradicts the claimed success/);
+  assert.equal(claim.status, 'CLAIMED');
+  assert.equal(claim.evidence.reported_outcome, 'failure');
+  assert.match(claim.meaning, /command_exit_code=1/);
   const timedOut = { ...validReceipt(), timedOut: true };
   const { claim: c2 } = await trace.recordClaim({ subject: 'tests passed', receipt: timedOut }, host());
-  assert.equal(c2.status, 'CONTRADICTED');
+  assert.equal(c2.status, 'CLAIMED');
+  assert.equal(c2.evidence.reported_outcome, 'failure');
 });
 
 test('F4: forged stdout / fake receipt JSON cannot verify', async t => {
@@ -83,17 +85,15 @@ test('F4: forged stdout / fake receipt JSON cannot verify', async t => {
   assert.throws(() => validateReceipt({ checkID: 'nope', kind: 'test', status: 'passed', commandExitCode: 0, timedOut: false, signal: 'none', candidate: { commit: COMMIT_A }, output: { sha256: 'd'.repeat(64) } }), TypeError);
   assert.throws(() => claimFromReceipt({ subject: 'x', receipt: null }), TypeError);
   assert.throws(() => claimFromReceipt({ subject: 'x', receipt: { ...validReceipt(), candidate: { commit: 'short' } } }), TypeError);
-  // A WELL-FORMED fabricated receipt does bind VERIFIED_MECHANICAL (the
-  // binding path cannot authenticate receipts) — the durable meaning must
-  // therefore never assert host provenance and must carry the authenticity
-  // caveat auditable via checkID (reviewer-prescribed honesty contract).
+  // A fabricated receipt stays CLAIMED even when every schema field is valid.
   const forged = await trace.recordClaim({
     subject: 'tests passed', scope: 'test_command_completed',
     receipt: { ...validReceipt(), checkID: `chk_${'e'.repeat(32)}` },
   }, host());
-  assert.equal(forged.claim.status, 'VERIFIED_MECHANICAL');
+  assert.equal(forged.claim.status, 'CLAIMED');
+  assert.equal(forged.claim.evidence.authenticity, 'unverified');
   assert.match(forged.claim.meaning, /authenticity is NOT established by this record/);
-  assert.match(forged.claim.meaning, /audit the checkID against reviewer records/);
+  assert.match(forged.claim.meaning, /audit the checkID against actual host execution records/);
   assert.doesNotMatch(forged.claim.meaning, /host-measured/);
   const rows = trace.store.findEntriesAll({ type: 'trace.claim' });
   const forgedPayload = JSON.parse(await trace.store.readBlob(rows.find(r => r.ref === forged.ref).payloadRef));
@@ -116,13 +116,13 @@ test('F7b: a receipt citing a mismatched CAS blob is rejected at binding time', 
 test('F5: a candidate-A receipt stays historical for A and cannot justify candidate B', async t => {
   const { trace } = await fixture(t);
   const { claim } = await trace.recordClaim({ subject: 'tests passed', receipt: validReceipt(COMMIT_A) }, host());
-  assert.equal(claim.status, 'VERIFIED_MECHANICAL');
+  assert.equal(claim.status, 'CLAIMED');
   const stale = claimStaleness(claim, { commit: COMMIT_B });
   assert.equal(stale.stale, true, 'candidate changed: receipt is stale for B');
   assert.equal(stale.applies_to.commit, COMMIT_A, 'the receipt remains bound to candidate A');
   // Same candidate: not stale. Persisted status is never rewritten either way.
   assert.equal(claimStaleness(claim, { commit: COMMIT_A }).stale, false);
-  assert.equal(claim.status, 'VERIFIED_MECHANICAL');
+  assert.equal(claim.status, 'CLAIMED');
 });
 
 test('F6: restart preserves typed claims (durable CAS events)', async t => {
@@ -135,7 +135,7 @@ test('F6: restart preserves typed claims (durable CAS events)', async t => {
     assert.equal(rows.length, 1);
     assert.equal(rows[0].ref, ref);
     const payload = JSON.parse(await store2.readBlob(rows[0].payloadRef));
-    assert.equal(payload.claim_status, 'VERIFIED_MECHANICAL');
+    assert.equal(payload.claim_status, 'CLAIMED');
     assert.equal(payload.evidence.receipt.candidate.commit, COMMIT_A);
   } finally { store2.close(); }
 });
@@ -164,13 +164,13 @@ test('F8: claim status and capture coverage are independent dimensions', async t
   await store.ingest(event);
   await store.coverage.flushPending();
   assert.equal(store.coverage.statusFor('s1').session_coverage.status, 'incomplete');
-  // A mechanical claim is still mechanical while capture coverage is incomplete.
+  // Receipt claims retain their unverified status while coverage is incomplete.
   const { claim } = await trace.recordClaim({ subject: 'tests passed', receipt: validReceipt() }, host());
-  assert.equal(claim.status, 'VERIFIED_MECHANICAL');
+  assert.equal(claim.status, 'CLAIMED');
   const rows = store.findEntriesAll({ type: 'trace.claim' });
   const payload2 = JSON.parse(await store.readBlob(rows[0].payloadRef));
   assert.equal(payload2.capture_coverage.session_coverage.status, 'incomplete', 'incomplete capture coverage stays visible on the claim');
-  assert.equal(payload2.claim_status, 'VERIFIED_MECHANICAL', 'mechanical status independent of coverage');
+  assert.equal(payload2.claim_status, 'CLAIMED', 'unverified claim stays unverified independently of coverage');
 });
 
 test('F9+F10: claims never approve reviews, never clear obligations, never override needs_context', async t => {
@@ -184,13 +184,15 @@ test('F9+F10: claims never approve reviews, never clear obligations, never overr
   assert.equal(payload.review_effect, 'none');
 });
 
-test('F11: the read surface distinguishes model assertions from mechanical facts', async t => {
+test('F11: the read surface distinguishes prose and receipt claims without inventing authority', async t => {
   const { trace } = await fixture(t);
   const prose = await trace.recordClaim({ subject: 'tests passed', text: 'tests passed' }, host());
   const mech = await trace.recordClaim({ subject: 'tests passed', receipt: validReceipt() }, host());
-  assert.notEqual(prose.claim.status, mech.claim.status);
+  assert.equal(prose.claim.status, mech.claim.status);
+  assert.notEqual(prose.claim.evidence.kind, mech.claim.evidence.kind);
+  assert.equal(mech.claim.evidence.authenticity, 'unverified');
   assert.match(prose.claim.meaning, /declaration/);
-  assert.match(mech.claim.meaning, /structurally complete CheckReceipt bound/);
+  assert.match(mech.claim.meaning, /Submitted CheckReceipt/);
   // Tool path exposes the same distinction with the required receipt fields.
   const tool = definitions(trace).find(d => d.name === 'trace_claim');
   const out = await tool.execute({ subject: 'search works', text: 'search works, I saw hits' }, host());
@@ -211,7 +213,7 @@ test('F12: superseding a claim preserves the full superseded evidence history', 
   const payloads = [];
   for (const r of rows) payloads.push(JSON.parse(await trace.store.readBlob(r.payloadRef)));
   assert.ok(payloads.some(p => p.claim_status === 'CLAIMED'), 'superseded prose claim still retrievable');
-  assert.ok(payloads.some(p => p.claim_status === 'VERIFIED_MECHANICAL'), 'superseding receipt claim retrievable');
+  assert.ok(payloads.some(p => p.claim_status === 'CLAIMED' && p.evidence.kind === 'check_receipt'), 'superseding receipt claim retrievable without authority upgrade');
 });
 
 test('F-tool: trace_claim_receipt rejects malformed receipts through the tool surface', async t => {

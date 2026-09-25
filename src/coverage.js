@@ -24,6 +24,8 @@ export class CoverageTracker {
     this.pending = new Set();  // in-flight marker writes
     this.retryQueue = [];      // entries whose write failed
     this.lastSeq = new Map();  // session -> max ingested session_seq
+    this.observedSequences = new Map();
+    this.sequenceChecks = new Map();
     this.seeding = true;       // recovery ingest must not flag historical jumps
     this.counters = { dropped_total: 0, missed_watcher_total: 0 };
   }
@@ -52,7 +54,7 @@ export class CoverageTracker {
   }
 
   #writeMarker(entry, k, extra) {
-    const write = this.store.record('trace.capture_gap', { sessionID: entry.session },
+    const write = this.store.recordGap({ sessionID: entry.session },
       this.#markerPayload(entry, k, extra),
       { session: entry.session ?? undefined }).then(event => {
         // A completed write IS detection (range-less watcher losses stay
@@ -72,7 +74,9 @@ export class CoverageTracker {
   /** Retry unwritten markers (bounded); resolves when the queue settles. */
   async flushPending(attempts = 3) {
     for (let i = 0; i <= attempts; i++) {
-      await Promise.allSettled([...this.pending]);   // in-flight writes settle FIRST
+      // A sequence check can enqueue marker writes while the awaited batch
+      // settles. Drain those descendants too before reporting a flush.
+      while (this.pending.size) await Promise.allSettled([...this.pending]);
       if (!this.retryQueue.length) return;
       const batch = this.retryQueue.splice(0);
       for (const entry of batch) {
@@ -80,7 +84,7 @@ export class CoverageTracker {
         if (this.markers.get(k)?.status === 'detected') continue;
         await this.#writeMarker(entry, k, null).catch(() => {});
       }
-      await Promise.allSettled([...this.pending]);
+      while (this.pending.size) await Promise.allSettled([...this.pending]);
     }
   }
 
@@ -90,6 +94,7 @@ export class CoverageTracker {
    * the affected entry or null. Follow-up evidence is recorded (awaited).
    */
   async noteReconciled(session, seq, awaited = true) {
+    let first = null;
     for (const [k, entry] of this.markers) {
       if (entry.session !== session || !entry.ranges.length) continue;
       const idx = entry.ranges.findIndex(r => seq >= r.from && seq <= r.to);
@@ -112,18 +117,42 @@ export class CoverageTracker {
       }, { session }).then(event => { entry.last_followup_ref = event.ref; return event; }).catch(() => {});
       if (awaited) await write.catch(() => {});
       else { this.pending.add(write); write.finally(() => this.pending.delete(write)).catch(() => {}); }
-      return entry;
+      first ??= entry;
     }
-    return null;
+    return first;
+  }
+
+  checkSequenceGap(session, from, to) {
+    this.sequenceChecks.set(session, (this.sequenceChecks.get(session) ?? 0) + 1);
+    // A sequence may be durably admitted while its event awaits the worker.
+    // Neither asynchronous observer order nor a missing ACK proves loss.
+    const check = (async () => {
+      let start = null;
+      for (let seq = from; seq <= to; seq++) {
+        const known = this.observedSequences.get(session)?.has(seq) || await this.store.admissions?.hasSequence(session, seq);
+        if (!known && !this.observedSequences.get(session)?.has(seq)) start ??= seq;
+        else if (start !== null) { this.noteGap({ session, from_seq: start, to_seq: seq - 1, reason: 'capture_gap', component: 'sequence' }); start = null; }
+      }
+      if (start !== null) this.noteGap({ session, from_seq: start, to_seq: to, reason: 'capture_gap', component: 'sequence' });
+    })().catch(error => this.store.warning('sequence_coverage', error));
+    this.pending.add(check);
+    check.finally(() => {
+      this.pending.delete(check);
+      const left = (this.sequenceChecks.get(session) ?? 1) - 1;
+      if (left) this.sequenceChecks.set(session, left); else this.sequenceChecks.delete(session);
+    }).catch(() => {});
   }
 
   /** Sequence-continuity observation for one ingested event (Phase B seq). */
   ingestSeq(session, seq, type) {
-    if (this.seeding || seq == null || !session) return;
+    if (seq == null || !session) return;
+    if (!this.observedSequences.has(session)) this.observedSequences.set(session, new Set());
+    this.observedSequences.get(session).add(seq);
+    if (this.seeding) return;
     const last = this.lastSeq.get(session);
     const isMarker = type === 'trace.capture_gap';
     if (last != null) {
-      if (seq > last + 1 && !isMarker) this.noteGap({ session, from_seq: last + 1, to_seq: seq - 1, reason: 'capture_gap', component: 'sequence' });
+      if (seq > last + 1 && !isMarker) this.checkSequenceGap(session, last + 1, seq - 1);
       else if (seq <= last && !isMarker) this.noteReconciled(session, seq, false);
     }
     // Markers are durable events: the watermark advances THROUGH them, so the
@@ -150,10 +179,15 @@ export class CoverageTracker {
             ? data.ranges.map(r => ({ ...r }))
             : (data.from_seq != null ? [{ from: data.from_seq, to: data.to_seq ?? data.from_seq }] : []);
           this.markers.set(k, { session: data.session, ranges, reason: data.reason, component: data.component,
-            status: ranges.length ? 'detected' : 'reconciled', marker_ref: entry.ref, observed_at: data.observed_at });
+            status: 'detected', marker_ref: entry.ref, observed_at: data.observed_at });
         }
       } catch { /* unreadable marker: store integrity paths report it */ }
     }
+    // The index may enumerate newest first. Apply each session's durable
+    // follow-ups in sequence order so an older partial record cannot undo a
+    // later complete reconciliation.
+    followups.sort((a, b) => (a.entry.seq ?? 0) - (b.entry.seq ?? 0)
+      || (a.entry.at ?? 0) - (b.entry.at ?? 0));
     for (const { data } of followups) {
       // F3 (review advisory): a follow-up must shrink EXACTLY the marker it
       // reconciles. Match by reconciles_marker (marker event ref) first, then
@@ -166,7 +200,7 @@ export class CoverageTracker {
       }
       if (!target && data.marker_key) target = this.markers.get(data.marker_key) ?? null;
       if (!target) continue;
-      if ((data.remaining ?? []).length) target.ranges = data.remaining.map(r => ({ ...r }));
+      if (Array.isArray(data.remaining)) target.ranges = data.remaining.map(r => ({ ...r }));
       target.status = target.ranges.length ? 'partially_reconciled' : 'reconciled';
     }
     this.seeding = false;
@@ -208,8 +242,10 @@ export class CoverageTracker {
     // only as trustworthy as the whole workspace's capture health.
     const external = [...this.markers.values()].filter(m => m.session !== session);
     const ownSum = summarize(own), extSum = summarize(external);
-    const ownBad = ownSum.known_gaps + ownSum.pending_writes > 0;
-    const extBad = extSum.known_gaps + extSum.pending_writes > 0;
+    ownSum.pending_sequence_checks = this.sequenceChecks.get(session) ?? 0;
+    extSum.pending_sequence_checks = [...this.sequenceChecks].reduce((n, [sid, count]) => n + (sid === session ? 0 : count), 0);
+    const ownBad = ownSum.known_gaps + ownSum.pending_writes + ownSum.pending_sequence_checks > 0;
+    const extBad = extSum.known_gaps + extSum.pending_writes + extSum.pending_sequence_checks > 0;
     return {
       session, session_coverage: { status: ownBad ? 'incomplete' : 'complete', ...ownSum },
       workspace_global: { status: extBad ? 'incomplete' : 'complete', ...extSum,
@@ -220,11 +256,15 @@ export class CoverageTracker {
   }
 
   status() {
-    const scoped = this.statusFor(null);
     let known = 0;
-    for (const m of this.markers.values()) if (m.ranges.length || m.status === 'pending_write') known++;
+    let pending = 0;
+    for (const m of this.markers.values()) {
+      if (m.status === 'pending_write') pending++;
+      else if (m.ranges.length || m.status === 'detected') known++;
+    }
     return {
-      status: known > 0 ? 'incomplete' : 'complete', known_gaps: known,
+      status: known + pending + this.sequenceChecks.size > 0 ? 'incomplete' : 'complete', known_gaps: known, pending_writes: pending,
+      pending_sequence_checks: [...this.sequenceChecks.values()].reduce((a, b) => a + b, 0),
       dropped_total: this.counters.dropped_total, missed_watcher_total: this.counters.missed_watcher_total,
       scoped: true,
       meaning: 'workspace-level summary; use statusFor(session)/find(session=...) for session-scoped semantics',

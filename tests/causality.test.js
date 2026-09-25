@@ -117,18 +117,21 @@ test('B8: legacy v1 events (no causal fields) remain valid and readable', async 
   assert.equal(verdict.ok, true, 'legacy events do not break chain verification');
 });
 
-test('B9: missing chain node (deleted event) is detected with seq gap + missing link', async t => {
+test('B9: lost event and source are visibly incomplete despite durable admission', async t => {
   const { store, dir } = await fixture(t);
   const refs = [];
   for (let i = 0; i < 3; i++) refs.push((await store.record('probe.a', { sessionID: 's1' }, { i })).ref);
   const eventsDir = path.join(store.root, 'events'); // store.root = <storeRoot>/workspaces/<workspaceHash>
-  store.close();
+  const missing = await store.readEvent(refs[1]);
+  await store.close();
   await fs.unlink(path.join(eventsDir, `${refs[1]}.json`)); // seq 2 disappears
+  await fs.unlink(path.join(store.root, 'blobs', missing.payload.sha256.slice(0, 2), missing.payload.sha256));
   const store2 = await new Store(path.join(dir), path.join(dir, 'store')).init();
   try {
     const trace2 = new Trace({ location: { directory: dir } }, { storeRoot: path.join(dir, 'store') });
     await trace2.ready;
     const verdict = await trace2.verifyChain('s1');
+    assert.equal(store2.admissions.recovery.incomplete.length, 1);
     assert.equal(verdict.ok, false);
     assert.deepEqual(verdict.gaps, [[2, 2]], 'the unpersisted/deleted sequence is reported as a gap');
     assert.ok(verdict.missing.length >= 1, 'the child pointing at the deleted node reports a missing link');

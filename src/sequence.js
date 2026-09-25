@@ -7,27 +7,19 @@
 // callback that derives the event ref from (seq, previous_ref) while the
 // lock is held, and the state file is advanced in the same critical section.
 //
-// Documented failure semantics (honest, covered by Phase C gap markers):
-// - crash AFTER the state file is written but BEFORE the event is persisted:
-//   that sequence number has no event -> a detectable sequence gap and a
-//   missing chain node. Never rewritten, never renumbered.
-// - crash BEFORE the state file is written: the sequence number is simply
-//   reused by the next allocation (no gap).
-// - duplicate delivery of the same logical event: the replay guard in
-//   Store.record dedupes by the causality-free body hash before allocation,
-//   so a replay never consumes a new sequence number in the same process.
-//   Cross-process replays are outside this guarantee (single-writer
-//   workspace is the norm) and are documented.
-// - retry: a failed allocation releases the lock and the next caller
-//   proceeds; nothing is consumed.
+// Store.record and capture use AdmissionJournal under this shared lock:
+// an fsynced intent fixes occurrence/sequence/ref before advancing state,
+// so a crash after admission replays the same immutable envelope. Legacy
+// allocate callers lack that intent and can leave honest detectable gaps.
+// Unknown lock ownership is not evidence of death and is never age-stolen.
 
 import path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { atomic, hash, stable } from './util.js';
 
-const LOCK_STALE_MS = 10_000;
 const LOCK_RETRIES = 40;
 const LOCK_RETRY_MS = 5;
+const localLocks = new Map();
 
 export class SequenceAllocator {
   constructor(dir) {
@@ -38,20 +30,61 @@ export class SequenceAllocator {
   lockPath(sessionID) { return path.join(this.dir, `${hash(sessionID)}.lock`); }
 
   async withLock(sessionID, fn) {
+    const key = this.lockPath(sessionID);
+    const prior = localLocks.get(key) ?? Promise.resolve();
+    let release;
+    const done = new Promise(resolve => { release = resolve; });
+    localLocks.set(key, done);
+    await prior;
+    try { return await this.withDiskLock(sessionID, fn); }
+    finally { release(); if (localLocks.get(key) === done) localLocks.delete(key); }
+  }
+
+  async withDiskLock(sessionID, fn) {
     await fs.mkdir(this.dir, { recursive: true, mode: 0o700 });
     const lockPath = this.lockPath(sessionID);
     let handle = null;
     for (let i = 0; i < LOCK_RETRIES && !handle; i++) {
-      try { handle = await fs.open(lockPath, 'wx', 0o600); }
+      try {
+        handle = await fs.open(lockPath, 'wx', 0o600);
+        const stat = await fs.readFile('/proc/self/stat', 'utf8');
+        const boot = (await fs.readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim();
+        await handle.writeFile(stable({ pid: process.pid, start: stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19], boot }));
+        await handle.sync();
+      }
       catch (error) {
+        if (handle) {
+          await handle.close().catch(() => {}); handle = null;
+          await fs.unlink(lockPath).catch(() => {});
+        }
         if (error?.code !== 'EEXIST') throw error;
+        let recoveryHandle;
         try {
-          const stat = await fs.stat(lockPath);
-          if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
-            await fs.unlink(lockPath).catch(() => {}); // stale lock from a dead writer
+          // Serialize stale-owner removal. Two reapers must not both inspect
+          // the old owner and let the second unlink a newly acquired lock.
+          // A crashed reaper leaves an explicit fail-closed recovery guard;
+          // it is never guessed dead by age.
+          recoveryHandle = await fs.open(`${lockPath}.recovery`, 'wx', 0o600);
+          const original = await fs.readFile(lockPath, 'utf8');
+          const owner = JSON.parse(original);
+          if (!Number.isInteger(owner.pid) || !owner.start || !owner.boot) throw new Error('unknown lock owner');
+          let dead = false;
+          try {
+            const stat = await fs.readFile(`/proc/${owner.pid}/stat`, 'utf8');
+            const boot = (await fs.readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim();
+            dead = owner.start !== stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19] || owner.boot !== boot;
+          } catch (probe) { if (probe.code === 'ENOENT') dead = true; }
+          if (dead && await fs.readFile(lockPath, 'utf8') === original) {
+            await fs.unlink(lockPath).catch(() => {});
             continue;
           }
-        } catch { continue; }
+        } catch { /* unknown owner is not evidence of death */ }
+        finally {
+          if (recoveryHandle) {
+            await recoveryHandle.close().catch(() => {});
+            await fs.unlink(`${lockPath}.recovery`).catch(() => {});
+          }
+        }
         await new Promise(resolve => setTimeout(resolve, LOCK_RETRY_MS + Math.floor(Math.random() * 4)));
       }
     }
