@@ -224,6 +224,43 @@ test('D19: schema version bump forces the disposable rebuild', async t => {
   const { store } = await fixture(t);
   await store.record('probe.a', { sessionID: 'sV' }, { i: 1 });
   await store.derivedIndex.rebuild();
-  assert.equal(store.derivedIndex.db.prepare("SELECT v FROM meta WHERE k='schema_version'").get().v, '3');
+  assert.equal(store.derivedIndex.db.prepare("SELECT v FROM meta WHERE k='schema_version'").get().v, '4');
+});
+
+test('D20: CJK words inside longer runs, multi-word and mixed queries (schema 4 bigram expansion)', async t => {
+  const { store } = await fixture(t);
+  await store.record('probe.note', { sessionID: 's1' }, { text: '交流退磁方法已验证，清理残留单元后上下文压缩正常' });
+  await store.record('probe.note', { sessionID: 's1' }, { text: 'runParseJob 超时后执行清理' });
+  await store.record('probe.note', { sessionID: 's1' }, { text: 'unrelated english only' });
+  await store.derivedIndex.rebuild();
+  const refs = q => store.derivedIndex.ftsCandidates(q).length;
+  assert.equal(refs('退磁'), 1, 'two-character word inside a run');
+  assert.equal(refs('上下文 压缩'), 1, 'multi-word CJK: every word must match');
+  assert.equal(refs('清理'), 2);
+  assert.equal(refs('runParseJob 超时'), 1, 'mixed Latin + CJK');
+  assert.equal(refs('退磁 english'), 0, 'implicit AND across words');
+  assert.equal(refs('磁退'), 0, 'bigram order matters (no bag-of-characters false hits)');
+  assert.deepEqual(store.derivedIndex.ftsCandidates('— 。'), [], 'punctuation-only query');
+  assert.equal(refs('退'), 0, 'single CJK characters are not indexed (documented limit)');
+});
+
+test('D21: FTS candidates are bm25-ranked', async t => {
+  const { store } = await fixture(t);
+  const weak = await store.record('probe.note', { sessionID: 's1' }, { text: '一次清理 记录 filler filler filler filler filler' });
+  const strong = await store.record('probe.note', { sessionID: 's1' }, { text: '清理 清理 清理 残留' });
+  await store.derivedIndex.rebuild();
+  const ranked = store.derivedIndex.ftsCandidates('清理');
+  assert.equal(ranked.length, 2);
+  assert.equal(ranked[0], strong.ref ?? strong, 'denser match first');
+  assert.equal(ranked[1], weak.ref ?? weak);
+});
+
+test('D22: trace.find recalls a multi-word CJK query the hint substring path misses', async t => {
+  const { trace, store } = await fixture(t);
+  await store.record('probe.note', { sessionID: 's1' }, { text: '本轮上下文已完成压缩，残留单元已清理' });
+  await store.derivedIndex.rebuild();
+  const found = await trace.find({ text: '上下文 压缩' });
+  assert.equal(found.results.length, 1, 'found through the FTS fallback');
+  assert.match(found.results[0].hit?.snippet ?? '', /上下文/, 'snippet anchored on a query word');
 });
 
