@@ -2201,6 +2201,19 @@ export class Trace {
       const messages = unwrap(await this.ctx.session.context({ sessionID: sid }));
       await this.observeMessages(sid, messages);
     }
+    // Background shell/subagent outcomes and restart notices arrive as host synthetic messages.
+    // Keep their structured facts (state, exit, signal, pid, restart outcome) as their own
+    // searchable event; message persistence alone keeps only the rendered text.
+    if (event.type === 'session.synthetic' && ['shell', 'subagent', 'restart'].includes(data.metadata?.source)) {
+      const m = data.metadata;
+      const status = typeof m.signal === 'string' ? `signal:${m.signal}`
+        : Number.isInteger(m.exit) ? `exit:${m.exit}`
+          : m.timeout === true ? 'timeout'
+            : [m.state, m.reason, m.process].filter(v => typeof v === 'string').join(':') || null;
+      await this.store.record('background.outcome', { ...identity(data), sessionID: sid },
+        { text: data.text, description: data.description ?? null, metadata: m },
+        { tool: m.source, status, hostEventID: event.id });
+    }
     if (['session.created', 'session.updated', 'session.deleted', 'session.forked', 'session.agent.selected', 'session.model.selected', 'session.idle', 'session.status', 'session.compacted', 'session.compaction.ended', 'session.execution.started', 'session.execution.succeeded', 'session.execution.failed', 'session.execution.interrupted'].includes(event.type))
       await this.store.record('session.lifecycle', { ...identity(data), sessionID: sid }, data, { lifecycle: event.type, hostEventID: event.id });
   }
