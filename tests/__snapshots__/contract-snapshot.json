@@ -242,7 +242,7 @@
     },
     {
       "name": "trace_find",
-      "description": "Search all ingested history; return snippets/refs for trace_expand. text searches capped hints; deep scans exact bytes with a budget and resumable cursor. Results carry short discovery handles usable this turn. External operations may be absent; no match does not prove absence.",
+      "description": "Search all ingested history; return snippets/refs for trace_expand. text searches capped hints; deep scans exact bytes with a budget and resumable cursor. Results carry short discovery handles usable this turn. External operations may be absent; no match does not prove absence. A write/edit tool.before hit lists in rels the file's bytes before that call (preimages), even outside git.",
       "input": {
         "type": "object",
         "properties": {

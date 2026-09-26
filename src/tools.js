@@ -98,7 +98,7 @@ export function definitions(trace) {
       }), (i, h) => trace.note(i, h)),
     tool('trace_expand', 'Read exact stored evidence, not current files. ref accepts a canonical evt_/blob_ ref or this turn\'s short evidence handle (e1/b1/n1). metadata_only inspects refs; text_blobs hold tool text, payload_ref the event JSON. Default 2048 bytes, max 24000. Follow next_offset until null; repeated pages add nothing. SHA-256 verifies the whole blob; base64 preserves split byte boundaries.',
       schema({ ref: str, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 24000 }, metadata_only: { type: 'boolean' } }, ['ref']), (i, h) => trace.expandTool(i, h)),
-    tool('trace_find', 'Search all ingested history; return snippets/refs for trace_expand. text searches capped hints; deep scans exact bytes with a budget and resumable cursor. Results carry short discovery handles usable this turn. External operations may be absent; no match does not prove absence.',
+    tool('trace_find', 'Search all ingested history; return snippets/refs for trace_expand. text searches capped hints; deep scans exact bytes with a budget and resumable cursor. Results carry short discovery handles usable this turn. External operations may be absent; no match does not prove absence. A write/edit tool.before hit lists in rels the file\'s bytes before that call (preimages), even outside git.',
       schema({
         type: { anyOf: [{ type: 'string' }, { type: 'array', items: str, maxItems: 8 }] },
         session: { ...str, description: 'Host sessionID whose captured event history to search, including another worker session.' }, agent: str, tool: str, status: str,

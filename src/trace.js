@@ -14,6 +14,9 @@ import { EvidenceGateway } from './evidence-gateway.js';
 import { claimFromProse, claimFromReceipt, claimStaleness } from './claims.js';
 import { TokenCounter, DEFAULT_TOKEN_BUDGET } from './tokens.js';
 
+/** How long the host waits for one observer hook before it continues without it. */
+const OBSERVER_BUDGET_MS = 1000;
+
 const NOTE_KINDS = ['fact', 'finding', 'decision', 'unresolved', 'handoff', 'correction'];
 const MILESTONE_KINDS = ['decision', 'state_change', 'verification', 'blocker', 'correction', 'handoff', 'baseline'];
 const STRONG_STATE_REGEX = /\b(verified|pass|passed|fixed|confirmed|production\s+baseline)\b/i;
@@ -298,14 +301,17 @@ export class Trace {
       return undefined;
     }
     let timer;
-    const job = (async () => { await this.ready; if (!this.closing) return fn(); })();
+    // The host waits for this observer until the job settles or the budget
+    // expires; work that finishes before the deadline precedes the host's next step.
+    const deadline = Date.now() + OBSERVER_BUDGET_MS;
+    const job = (async () => { await this.ready; if (!this.closing) return fn(deadline); })();
     this.observerJobs.add(job);
     const release = () => this.observerJobs.delete(job);
     job.then(release, release);
     // Bounded waiting for this observer, never a prerequisite for execution.
     try {
       return await Promise.race([job, new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error('observer_timeout')), 1000); timer.unref?.();
+        timer = setTimeout(() => reject(new Error('observer_timeout')), OBSERVER_BUDGET_MS); timer.unref?.();
       })]);
     } catch (error) { this.noteObserverDrop(where); this.warning(where, error); return undefined; }
     finally { clearTimeout(timer); }
@@ -445,12 +451,39 @@ export class Trace {
     this.latestRequests.set(sid, value);
     return value;
   }
-  async before(e, occurrence = this.occurrence(e, 'before')) {
+  async before(e, occurrence = this.occurrence(e, 'before'), deadline = Infinity) {
     const paths = await mutationPaths(e.tool, e.input, this.store.workspace);
+    const preimages = paths ? await this.preimages(paths, deadline) : null;
     const event = await this.store.record('tool.before', identity(e), { id: e.id, tool: e.tool, input: e.input },
-      { tool: e.tool, callID: e.id ?? null, callKey: callKey(e), source: locator(e.input), paths: paths ?? 'unknown' }, occurrence);
+      { tool: e.tool, callID: e.id ?? null, callKey: callKey(e), source: locator(e.input), paths: paths ?? 'unknown',
+        ...(preimages ? { preimages } : {}) }, occurrence);
     if (paths) await this.conflicts(e.sessionID, paths, [], event.ref);
     return event;
+  }
+  /**
+   * Pre-images: each mutation target's bytes as they were before the tool ran,
+   * kept in the blob store (identical versions share one blob). The host runs
+   * the tool only after this hook settles or its deadline passes, so bytes
+   * read before the deadline predate the tool's write. A later read could
+   * already see the new bytes; it is reported, never stored as a pre-image.
+   * existed:false records that the tool created the file.
+   */
+  async preimages(paths, deadline = Infinity) {
+    const out = [];
+    for (const file of paths) {
+      try {
+        const info = await fs.stat(file);
+        if (!info.isFile()) { out.push({ path: file, existed: true, captured: false, reason: 'not_regular_file' }); continue; }
+        const data = await fs.readFile(file);
+        if (Date.now() >= deadline) { out.push({ path: file, existed: true, captured: false, reason: 'observer_deadline' }); continue; }
+        const blob = await this.store.blob(data, 'bytes');
+        out.push({ path: file, existed: true, captured: true, ref: blob.ref, sha256: blob.sha256, bytes: blob.bytes, mtime_ms: info.mtimeMs });
+      } catch (error) {
+        out.push(error?.code === 'ENOENT' ? { path: file, existed: false }
+          : { path: file, captured: false, reason: String(error?.code ?? 'read_error') });
+      }
+    }
+    return out;
   }
   /** Router: the capture writer owns tool.after persistence when active; otherwise the synchronous path. */
   async after(e, occurrence = this.occurrence(e, 'after')) {

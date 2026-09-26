@@ -16,7 +16,7 @@ export default {
       // asynchronous work. Same object delivery retries retain this identity;
       // distinct observations get new IDs even when their bytes are identical.
       const occurrence = trace.occurrence(event, phase);
-      return trace.safe(phase, () => fn(event, occurrence));
+      return trace.safe(phase, deadline => fn(event, occurrence, deadline));
     };
     await register('prompt', () => ctx.session.hook('prompt', e => observation('prompt', e, (e, id) => trace.prompt(e, id))));
     await register('context', () => ctx.session.hook('context', async e => {
@@ -46,7 +46,7 @@ export default {
         else append('OPENCODE_TRACE_RECALL_UNAVAILABLE: Trace could not prepare recall for this request within its observer budget. Historical evidence may be missing from this prompt; this does not mean there is no history or that prior work is resolved. Use native conversation records and trace_status/trace_find as needed. Native execution continues.');
       }
     }));
-    await register('before', () => ctx.tool.hook('execute.before', e => observation('before', e, (e, id) => trace.before(e, id))));
+    await register('before', () => ctx.tool.hook('execute.before', e => observation('before', e, (e, id, deadline) => trace.before(e, id, deadline))));
     await register('after', () => ctx.tool.hook('execute.after', e => observation('after', e, (e, id) => trace.after(e, id))));
     await register('agents', () => ctx.agent.transform(editor => trace.safe('agents', async () => {
       const agents = editor.list().map(a => ({ id: a.id, name: a.name, description: a.description, mode: a.mode, model: a.model }));

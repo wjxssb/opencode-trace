@@ -180,7 +180,7 @@ export class Store {
   async indexEvent(event) {
     const rels = [...new Set([
       ...(event.note?.source_refs ?? []), ...(event.note?.supersedes ?? []), ...(event.note?.depends_on ?? []),
-      ...(event.intent?.related_refs ?? []), ...(event.compact?.refs ?? []),
+      ...(event.intent?.related_refs ?? []), ...(event.compact?.refs ?? []), ...(event.preimages ?? []).map(p => p.ref),
     ].flat().filter(r => typeof r === 'string' && refPattern.test(r)))];
     const payloadHints = await this.readPayloadHints(event);
     // Explicit structured relations and attempt addressing for mailbox and
@@ -675,7 +675,7 @@ export class Store {
     const inlineRels = [
       event?.payload.ref, ...(event?.outputs ?? []).map(x => x.ref),
       ...(event?.note?.source_refs ?? []), ...(event?.note?.supersedes ?? []), ...(event?.note?.depends_on ?? []),
-      ...(event?.intent?.related_refs ?? []), ...(event?.compact?.refs ?? []),
+      ...(event?.intent?.related_refs ?? []), ...(event?.compact?.refs ?? []), ...(event?.preimages ?? []).map(p => p.ref),
     ];
     const structured = { 'trace.message': ['source_refs'], 'trace.step': ['result_ref', 'worker_source_refs'], 'trace.step.result': ['source_refs', 'binding_ref'] }[event?.type];
     if (structured && (event.payload?.bytes ?? Infinity) <= 65536) {
