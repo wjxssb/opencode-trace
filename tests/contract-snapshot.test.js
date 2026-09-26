@@ -11,7 +11,7 @@ import { definitions } from '../src/tools.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const SNAP = path.join(here, '__snapshots__', 'contract-snapshot.json');
-const REVIEWER_SCHEMA = '/home/frank/.local/share/opencode-runtime/releases/2.0.7-runtime-context-2a158a9d1ea5/plugins/inline-reviewer/src/schema.js';
+const REVIEWER_SCHEMA = '/home/frank/.local/share/opencode-runtime/current/plugins/inline-reviewer/src/schema.js';
 
 test('contract snapshot matches blessed model-visible surface', async () => {
   const blessed = JSON.parse(await fs.readFile(SNAP, 'utf8'));

@@ -838,10 +838,24 @@
                 "anyOf": [
                   {
                     "type": "string",
-                    "maxLength": 1000
+                    "maxLength": 4000
                   },
                   {
-                    "type": "object"
+                    "type": "object",
+                    "properties": {
+                      "question": {
+                        "type": "string",
+                        "maxLength": 4000
+                      },
+                      "text": {
+                        "type": "string",
+                        "maxLength": 4000
+                      },
+                      "q": {
+                        "type": "string",
+                        "maxLength": 4000
+                      }
+                    }
                   }
                 ]
               },
@@ -849,10 +863,10 @@
             },
             {
               "type": "string",
-              "maxLength": 4000
+              "maxLength": 64000
             }
           ],
-          "description": "Questions or open trade-offs you want the reviewer's judgment on (optional)"
+          "description": "Questions or open trade-offs you want the reviewer's judgment on (optional; keep each question atomic, at most 1000 characters)"
         },
         "claims": {
           "anyOf": [
@@ -862,10 +876,24 @@
                 "anyOf": [
                   {
                     "type": "string",
-                    "maxLength": 1000
+                    "maxLength": 4000
                   },
                   {
-                    "type": "object"
+                    "type": "object",
+                    "properties": {
+                      "claim": {
+                        "type": "string",
+                        "maxLength": 4000
+                      },
+                      "text": {
+                        "type": "string",
+                        "maxLength": 4000
+                      },
+                      "c": {
+                        "type": "string",
+                        "maxLength": 4000
+                      }
+                    }
                   }
                 ]
               },
@@ -873,168 +901,413 @@
             },
             {
               "type": "string",
-              "maxLength": 4000
+              "maxLength": 64000
             }
           ],
-          "description": "Verify-me list of facts you believe hold that the reviewer should verify (optional)"
+          "description": "Verify-me list of facts you believe hold that the reviewer should verify (optional; keep each claim atomic, at most 1000 characters)"
+        },
+        "changesSincePrevious": {
+          "type": "string",
+          "maxLength": 16000,
+          "description": "Round 2+ optional detailed change context the host does not record durably: what you changed since the previous review round, what you deferred and why, and what specifically to re-verify. Host-recorded history (previous verdict, findings, candidate git HEAD) is delivered to the Reviewer automatically — do not restate it here."
         },
         "questions0": {
           "anyOf": [
             {
-              "type": "string"
+              "type": "string",
+              "maxLength": 4000
             },
             {
-              "type": "object"
+              "type": "object",
+              "properties": {
+                "question": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "text": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "q": {
+                  "type": "string",
+                  "maxLength": 4000
+                }
+              }
             }
           ]
         },
         "questions1": {
           "anyOf": [
             {
-              "type": "string"
+              "type": "string",
+              "maxLength": 4000
             },
             {
-              "type": "object"
+              "type": "object",
+              "properties": {
+                "question": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "text": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "q": {
+                  "type": "string",
+                  "maxLength": 4000
+                }
+              }
             }
           ]
         },
         "questions2": {
           "anyOf": [
             {
-              "type": "string"
+              "type": "string",
+              "maxLength": 4000
             },
             {
-              "type": "object"
+              "type": "object",
+              "properties": {
+                "question": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "text": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "q": {
+                  "type": "string",
+                  "maxLength": 4000
+                }
+              }
             }
           ]
         },
         "questions3": {
           "anyOf": [
             {
-              "type": "string"
+              "type": "string",
+              "maxLength": 4000
             },
             {
-              "type": "object"
+              "type": "object",
+              "properties": {
+                "question": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "text": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "q": {
+                  "type": "string",
+                  "maxLength": 4000
+                }
+              }
             }
           ]
         },
         "questions4": {
           "anyOf": [
             {
-              "type": "string"
+              "type": "string",
+              "maxLength": 4000
             },
             {
-              "type": "object"
+              "type": "object",
+              "properties": {
+                "question": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "text": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "q": {
+                  "type": "string",
+                  "maxLength": 4000
+                }
+              }
             }
           ]
         },
         "questions5": {
           "anyOf": [
             {
-              "type": "string"
+              "type": "string",
+              "maxLength": 4000
             },
             {
-              "type": "object"
+              "type": "object",
+              "properties": {
+                "question": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "text": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "q": {
+                  "type": "string",
+                  "maxLength": 4000
+                }
+              }
             }
           ]
         },
         "questions6": {
           "anyOf": [
             {
-              "type": "string"
+              "type": "string",
+              "maxLength": 4000
             },
             {
-              "type": "object"
+              "type": "object",
+              "properties": {
+                "question": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "text": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "q": {
+                  "type": "string",
+                  "maxLength": 4000
+                }
+              }
             }
           ]
         },
         "questions7": {
           "anyOf": [
             {
-              "type": "string"
+              "type": "string",
+              "maxLength": 4000
             },
             {
-              "type": "object"
+              "type": "object",
+              "properties": {
+                "question": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "text": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "q": {
+                  "type": "string",
+                  "maxLength": 4000
+                }
+              }
             }
           ]
         },
         "claims0": {
           "anyOf": [
             {
-              "type": "string"
+              "type": "string",
+              "maxLength": 4000
             },
             {
-              "type": "object"
+              "type": "object",
+              "properties": {
+                "claim": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "text": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "c": {
+                  "type": "string",
+                  "maxLength": 4000
+                }
+              }
             }
           ]
         },
         "claims1": {
           "anyOf": [
             {
-              "type": "string"
+              "type": "string",
+              "maxLength": 4000
             },
             {
-              "type": "object"
+              "type": "object",
+              "properties": {
+                "claim": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "text": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "c": {
+                  "type": "string",
+                  "maxLength": 4000
+                }
+              }
             }
           ]
         },
         "claims2": {
           "anyOf": [
             {
-              "type": "string"
+              "type": "string",
+              "maxLength": 4000
             },
             {
-              "type": "object"
+              "type": "object",
+              "properties": {
+                "claim": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "text": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "c": {
+                  "type": "string",
+                  "maxLength": 4000
+                }
+              }
             }
           ]
         },
         "claims3": {
           "anyOf": [
             {
-              "type": "string"
+              "type": "string",
+              "maxLength": 4000
             },
             {
-              "type": "object"
+              "type": "object",
+              "properties": {
+                "claim": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "text": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "c": {
+                  "type": "string",
+                  "maxLength": 4000
+                }
+              }
             }
           ]
         },
         "claims4": {
           "anyOf": [
             {
-              "type": "string"
+              "type": "string",
+              "maxLength": 4000
             },
             {
-              "type": "object"
+              "type": "object",
+              "properties": {
+                "claim": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "text": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "c": {
+                  "type": "string",
+                  "maxLength": 4000
+                }
+              }
             }
           ]
         },
         "claims5": {
           "anyOf": [
             {
-              "type": "string"
+              "type": "string",
+              "maxLength": 4000
             },
             {
-              "type": "object"
+              "type": "object",
+              "properties": {
+                "claim": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "text": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "c": {
+                  "type": "string",
+                  "maxLength": 4000
+                }
+              }
             }
           ]
         },
         "claims6": {
           "anyOf": [
             {
-              "type": "string"
+              "type": "string",
+              "maxLength": 4000
             },
             {
-              "type": "object"
+              "type": "object",
+              "properties": {
+                "claim": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "text": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "c": {
+                  "type": "string",
+                  "maxLength": 4000
+                }
+              }
             }
           ]
         },
         "claims7": {
           "anyOf": [
             {
-              "type": "string"
+              "type": "string",
+              "maxLength": 4000
             },
             {
-              "type": "object"
+              "type": "object",
+              "properties": {
+                "claim": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "text": {
+                  "type": "string",
+                  "maxLength": 4000
+                },
+                "c": {
+                  "type": "string",
+                  "maxLength": 4000
+                }
+              }
             }
           ]
         },
