@@ -87,6 +87,18 @@ test('P4C-C4: redundant form accepted through the model-facing tool wrapper too'
   assert.equal(out.metadata.raw.note.milestone.kind, 'baseline');
 });
 
+test('a milestone without kind takes the top-level note kind; without either it names the missing field', async t => {
+  const { trace } = await fixture(t);
+  // Production 2026-09-26 shape: top-level kind and text, milestone fields but no milestone.kind.
+  const { note } = await trace.note({ kind: 'finding', text: 'gate live; 4 files uncommitted', summary: 'gate live',
+    milestone: { summary: 'gate live', current_state: 'enabled', next_action: 'check the 14:00 run' } }, host());
+  assert.equal(note.kind, 'finding');
+  assert.equal(note.milestone.kind, 'state_change');
+  assert.equal(note.milestone.next_action, 'check the 14:00 run');
+  assert.equal((await trace.note({ kind: 'unresolved', text: 'b', milestone: { summary: 'b' } }, host())).note.milestone.kind, 'blocker');
+  await assert.rejects(() => trace.note({ milestone: { summary: 'no kind anywhere' } }, host()), /milestone\.kind is required/);
+});
+
 test('P4C-C5: invalid milestone.kind rejected with actionable error (both shapes)', async t => {
   const { trace } = await fixture(t);
   await assert.rejects(
