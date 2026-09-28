@@ -90,6 +90,7 @@ const formatters = {
       ms?.do_not_repeat?.length ? `**do not repeat**: ${ms.do_not_repeat.join('; ')}` : null,
       note.source_refs?.length ? `**source refs**: ${refList(note.source_refs)}` : null,
       note.supersedes?.length ? `**supersedes**: ${refList(note.supersedes)}` : null,
+      value?.folded?.length ? `**kept in text**: ${value.folded.join(', ')} (not note fields; next time put them in text)` : null,
       note.depends_on?.length ? `**depends on**: ${refList(note.depends_on)}` : null,
       value.ref ? `**ref**: \`${value.ref}\`` : null,
     ]);

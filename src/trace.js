@@ -8,7 +8,7 @@ import { newOccurrence } from './admission.js';
 import { atomic, bytes, stable, hash, identity, callKey, locator, mutationPaths, canonical, overlaps, messageID, messageRole, messageContentFingerprint, textFromMessage, refPattern, unwrap } from './util.js';
 import { compactions, saveCompact } from './compact.js';
 import { normalizeTraceIntentInput } from './normalization.js';
-import { validateNoteInput, isAffirmativeState, hasExplicitFailure } from './note-validation.js';
+import { foldExtraFields, validateNoteInput, isAffirmativeState, hasExplicitFailure } from './note-validation.js';
 import { HandleRegistry, assignSnapshotHandles, renderEvidenceHandles, renderHandlePressure, HANDLE_PATTERN, handleFailureMessage } from './handles.js';
 import { EvidenceGateway } from './evidence-gateway.js';
 import { claimFromProse, claimFromReceipt, claimStaleness } from './claims.js';
@@ -613,6 +613,8 @@ export class Trace {
   }
   async note(input, host) {
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('trace_note: input must be an object');
+    let folded;
+    ({ input, folded } = foldExtraFields(input));
     validateNoteInput(input);
     input = { ...input };
     // P4-C: one canonical milestone contract. A redundant top-level
@@ -742,7 +744,7 @@ export class Trace {
       ...(milestone ? { milestone } : {})
     };
     const event = await this.store.record('trace.note', identity(host), note, { callID: host.id, note });
-    return { ref: event.ref, note };
+    return { ref: event.ref, note, ...(folded.length ? { folded } : {}) };
   }
   /**
    * Phase F: record a typed provenance claim (durable `trace.claim` event).

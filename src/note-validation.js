@@ -6,6 +6,43 @@ const textLimits = {
 };
 const lists = ['evidence_refs', 'supersedes', 'depends_on', 'unresolved', 'do_not_repeat'];
 const topFields = new Set(['kind', 'text', 'summary', 'source_refs', 'supersedes', 'depends_on', 'milestone']);
+/**
+ * Extra simple top-level fields (string, number, boolean) become `key: value` lines of the note
+ * body instead of failing the whole note: nothing is dropped and no retry is needed. Production
+ * 2026-09-28 21:30: a worker's handoff with `status: "waiting"` was rejected and cost a retry on a
+ * local model. Objects and arrays are still refused, since a line would not carry them faithfully.
+ * Returns a new input (the caller's object is left as it was) and the folded keys.
+ */
+export function foldExtraFields(input) {
+  const extra = Object.keys(input).filter(key => !topFields.has(key));
+  if (extra.length === 0) return { input, folded: [] };
+  for (const key of extra) {
+    const v = input[key];
+    // A misspelled note field is a mistake to correct, not extra content to keep.
+    const near = [...topFields].find(f => editDistance(f, key) <= 2);
+    if (near) throw new Error(`trace_note: unknown field ${key}; did you mean ${near}?`);
+    if (v !== null && typeof v === 'object') throw new Error(`trace_note: unknown field ${key}; use text for the note body`);
+  }
+  const lines = extra.filter(key => input[key] !== undefined && input[key] !== null && String(input[key]).trim() !== '').map(key => `${key}: ${String(input[key]).trim()}`);
+  const out = { ...input };
+  for (const key of extra) delete out[key];
+  if (lines.length) {
+    const body = typeof out.text === 'string' && out.text.trim() ? out.text : typeof out.summary === 'string' && out.summary.trim() ? out.summary : '';
+    out.text = body ? `${body}\n${lines.join('\n')}` : lines.join('\n');
+  }
+  return { input: out, folded: extra };
+}
+
+function editDistance(a, b) {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
 export function validateNoteInput(input) {
   for (const key of Object.keys(input)) {
     if (!topFields.has(key)) throw new Error(`trace_note: unknown field ${key}; use text for the note body`);

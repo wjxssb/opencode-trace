@@ -56,6 +56,30 @@ test('bad inputs fail clearly without saving a note; UTF-8 byte limit is enforce
   assert.equal(both.ok, true);
 });
 
+test('extra simple fields are kept as lines of the note body, not rejected (production 2026-09-28 21:30)', async t => {
+  const { trace, tool } = await fixture(t);
+  const input = Object.freeze({ kind: 'handoff', summary: '312-321 built, audit requested', text: 'batch 312-321: obs uploaded, build passed', status: 'waiting', attempt: 2, final: false });
+  const out = await tool.execute(input, host);
+  assert.equal(out.metadata.raw.ok, true);
+  const note = trace.store.session(host.sessionID).notes.at(-1);
+  assert.equal(note.text, 'batch 312-321: obs uploaded, build passed\nstatus: waiting\nattempt: 2\nfinal: false');
+  assert.equal(note.summary, '312-321 built, audit requested');
+  assert.deepEqual(out.metadata.raw.folded, ['status', 'attempt', 'final']);
+  assert.match(out.output, /kept in text\*\*: status, attempt, final/);
+  assert.equal(input.status, 'waiting'); // the caller's object is untouched
+  // Only extra fields and no body: the lines are the body.
+  const only = (await tool.execute({ kind: 'fact', status: 'blocked on audit' }, host)).metadata.raw;
+  assert.equal(only.ok, true);
+  assert.equal(trace.store.session(host.sessionID).notes.at(-1).text, 'status: blocked on audit');
+  // Objects, arrays and near-misses of real fields are still refused, with nothing saved.
+  const before = trace.store.session(host.sessionID).notes.length;
+  for (const [extra, error] of [[{ status: { a: 1 } }, /unknown field status; use text/], [{ tags: ['x'] }, /unknown field tags; use text/], [{ sumary: 'x' }, /did you mean summary\?/]]) {
+    const r = (await tool.execute({ kind: 'finding', text: 'body', ...extra }, host)).metadata.raw;
+    assert.equal(r.ok, false); assert.match(r.error, error);
+  }
+  assert.equal(trace.store.session(host.sessionID).notes.length, before);
+});
+
 test('invalid structured notes are rejected rather than coerced, dropped or truncated', async t => {
   const { trace, tool } = await fixture(t);
   for (const extra of [
