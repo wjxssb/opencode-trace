@@ -8,7 +8,7 @@ import { newOccurrence } from './admission.js';
 import { atomic, bytes, stable, hash, identity, callKey, locator, mutationPaths, canonical, overlaps, messageID, messageRole, messageContentFingerprint, textFromMessage, refPattern, unwrap } from './util.js';
 import { compactions, saveCompact } from './compact.js';
 import { normalizeTraceIntentInput } from './normalization.js';
-import { foldExtraFields, validateNoteInput, isAffirmativeState, hasExplicitFailure } from './note-validation.js';
+import { foldExtraFields, validateNoteInput, isAffirmativeState, hasExplicitFailure, MILESTONE_KIND_FOR_NOTE, NOTE_KIND_FOR_MILESTONE } from './note-validation.js';
 import { HandleRegistry, assignSnapshotHandles, renderEvidenceHandles, renderHandlePressure, HANDLE_PATTERN, handleFailureMessage } from './handles.js';
 import { EvidenceGateway } from './evidence-gateway.js';
 import { claimFromProse, claimFromReceipt, claimStaleness } from './claims.js';
@@ -385,11 +385,7 @@ export class Trace {
   }
   async autoRecordMilestone(sid, ms, host = {}) {
     const s = this.store.session(sid);
-    const kindMap = {
-      decision: 'decision', state_change: 'finding', verification: 'finding',
-      blocker: 'unresolved', correction: 'correction', handoff: 'handoff', baseline: 'fact'
-    };
-    const kind = kindMap[ms.kind] ?? 'finding';
+    const kind = NOTE_KIND_FOR_MILESTONE[ms.kind] ?? 'finding';
     const text = ms.summary;
     const source_refs = ms.evidence_refs ?? [];
     const note = {
@@ -645,20 +641,13 @@ export class Trace {
       // the milestone fields (next_action, current_state) from its handoff.
       // A note kind given as milestone.kind maps the same way. Production 2026-10-01: milestone.kind
       // "finding" beside top-level kind "finding" cost a local-model retry.
-      const asMilestone = {
-        fact: 'baseline', finding: 'state_change', decision: 'decision', unresolved: 'blocker', correction: 'correction', handoff: 'handoff',
-      };
       const given = input.milestone.kind;
-      if (given === undefined && NOTE_KINDS.includes(input.kind)) input.milestone = { ...input.milestone, kind: asMilestone[input.kind] };
-      else if (!MILESTONE_KINDS.includes(given) && NOTE_KINDS.includes(given)) input.milestone = { ...input.milestone, kind: asMilestone[given] };
+      if (given === undefined && NOTE_KINDS.includes(input.kind)) input.milestone = { ...input.milestone, kind: MILESTONE_KIND_FOR_NOTE[input.kind] };
+      else if (!MILESTONE_KINDS.includes(given) && NOTE_KINDS.includes(given)) input.milestone = { ...input.milestone, kind: MILESTONE_KIND_FOR_NOTE[given] };
       const ms = input.milestone;
       if (ms.kind === undefined) throw new Error(`trace_note: milestone.kind is required (one of ${MILESTONE_KINDS.join(', ')}), or give a top-level kind`);
       if (!MILESTONE_KINDS.includes(ms.kind)) throw new Error(`trace_note: invalid milestone.kind: ${ms.kind} (one of ${MILESTONE_KINDS.join(', ')})`);
-      const kindMap = {
-        decision: 'decision', state_change: 'finding', verification: 'finding',
-        blocker: 'unresolved', correction: 'correction', handoff: 'handoff', baseline: 'fact'
-      };
-      if (input.kind === undefined) input.kind = kindMap[ms.kind] ?? 'finding';
+      if (input.kind === undefined) input.kind = NOTE_KIND_FOR_MILESTONE[ms.kind] ?? 'finding';
       if (input.text === undefined && ms.summary) input.text = ms.summary;
       if (!ms.summary && noteSummary) ms.summary = noteSummary;
       if (!input.source_refs && ms.evidence_refs) input.source_refs = ms.evidence_refs;

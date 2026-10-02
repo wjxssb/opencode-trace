@@ -6,6 +6,68 @@ const textLimits = {
 };
 const lists = ['evidence_refs', 'supersedes', 'depends_on', 'unresolved', 'do_not_repeat'];
 const topFields = new Set(['kind', 'text', 'summary', 'source_refs', 'supersedes', 'depends_on', 'milestone']);
+
+/** Note kind -> the milestone kind it stands for, and back. One table for note() and coerce. */
+export const MILESTONE_KIND_FOR_NOTE = {
+  fact: 'baseline', finding: 'state_change', decision: 'decision', unresolved: 'blocker', correction: 'correction', handoff: 'handoff',
+};
+export const NOTE_KIND_FOR_MILESTONE = {
+  decision: 'decision', state_change: 'finding', verification: 'finding', blocker: 'unresolved', correction: 'correction', handoff: 'handoff', baseline: 'fact',
+};
+const isNoteKind = kind => typeof kind === 'string' && Object.hasOwn(MILESTONE_KIND_FOR_NOTE, kind);
+const isMilestoneKind = kind => typeof kind === 'string' && Object.hasOwn(NOTE_KIND_FOR_MILESTONE, kind);
+const line = (key, value) => `${key}: ${value !== null && typeof value === 'object' ? JSON.stringify(value) : String(value).trim()}`;
+const present = value => value !== undefined && value !== null && String(value).trim() !== '';
+
+/**
+ * trace_note's coerce, the host's pre-validation repair (Claude Code's coerceInput). The host
+ * validates trace_note against its schema, which rejects unknown kinds and silently strips
+ * unknown fields, so the shapes note() has always accepted from models are repaired here first:
+ * kind mix-ups map through the tables above, and unknown fields become `key: value` lines of the
+ * text instead of disappearing. `fields`/`milestoneFields` are the schema's property names.
+ * Returns null when nothing applies; never mutates `raw` (host tool-call state is frozen).
+ */
+export function coerceNoteInput(raw, fields, milestoneFields) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const input = { ...raw }, repairs = [], notes = [], lines = [];
+  const ms = input.milestone && typeof input.milestone === 'object' && !Array.isArray(input.milestone) ? { ...input.milestone } : null;
+  if (input.kind === 'milestone' && ms) { delete input.kind; repairs.push('kind_milestone_dropped'); }
+  if (isMilestoneKind(input.kind) && !isNoteKind(input.kind)) {
+    notes.push(`kind "${input.kind}" is a milestone kind, saved as note kind "${NOTE_KIND_FOR_MILESTONE[input.kind]}"`);
+    input.kind = NOTE_KIND_FOR_MILESTONE[input.kind];
+    repairs.push('note_kind_from_milestone_kind');
+  }
+  if (ms) {
+    if (ms.kind === undefined && isNoteKind(input.kind)) {
+      ms.kind = MILESTONE_KIND_FOR_NOTE[input.kind];
+      repairs.push('milestone_kind_from_note_kind');
+    } else if (!isMilestoneKind(ms.kind) && isNoteKind(ms.kind)) {
+      notes.push(`milestone.kind "${ms.kind}" is a note kind, saved as milestone kind "${MILESTONE_KIND_FOR_NOTE[ms.kind]}"`);
+      ms.kind = MILESTONE_KIND_FOR_NOTE[ms.kind];
+      repairs.push('milestone_kind_note_alias');
+    }
+    const extra = Object.keys(ms).filter(key => !milestoneFields.includes(key));
+    for (const key of extra) { if (present(ms[key])) lines.push(line(`milestone.${key}`, ms[key])); delete ms[key]; }
+    if (extra.length) notes.push(`milestone has no field ${extra.map(k => `\`${k}\``).join(', ')}, kept as text lines`);
+    input.milestone = ms;
+  }
+  const extra = Object.keys(input).filter(key => !fields.includes(key));
+  lines.unshift(...extra.filter(key => present(input[key])).map(key => line(key, input[key])));
+  for (const key of extra) delete input[key];
+  if (extra.length) notes.push(`trace_note has no field ${extra.map(k => `\`${k}\``).join(', ')}, kept as text lines`);
+  if (extra.length || lines.length) repairs.push('extra_fields_to_text');
+  if (lines.length) {
+    const body = typeof input.text === 'string' && input.text.trim() ? input.text
+      : typeof input.summary === 'string' && input.summary.trim() ? input.summary : '';
+    input.text = body ? `${body}\n${lines.join('\n')}` : lines.join('\n');
+  }
+  if (!repairs.length) return null;
+  return {
+    input,
+    shapeClass: repairs.join('+'),
+    ...(notes.length ? { note: `Note: trace_note input was repaired: ${notes.join('; ')}.` } : {}),
+  };
+}
 /**
  * Extra simple top-level fields (string, number, boolean) become `key: value` lines of the note
  * body instead of failing the whole note: nothing is dropped and no retry is needed. Production

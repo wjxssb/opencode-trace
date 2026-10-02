@@ -161,3 +161,41 @@ test('completed tool envelopes with explicit command failure cannot corroborate 
   const ev = await trace.store.record('trace.step.result', host, { outcome: 'worker_reported_failure' }, { status: 'completed' });
   assert.equal(await trace.isVerifiedEvidence(ev.ref), false);
 });
+
+// The host validates trace_note against its schema (2026-10-02), which rejects unknown kinds and
+// silently strips unknown fields. coerce (the host's pre-validation repair) keeps every shape the
+// note path accepted from models in the 14 days before that change.
+test('coerce repairs accepted model shapes into the schema and loses nothing', async t => {
+  const { tool } = await fixture(t);
+  const props = tool.input.properties, msProps = tool.input.properties.milestone.properties;
+  const fits = input => {
+    for (const key of Object.keys(input)) assert.ok(key in props, `top-level ${key} is in the schema`);
+    if (input.kind !== undefined) assert.ok(props.kind.enum.includes(input.kind), `kind ${input.kind}`);
+    if (input.milestone) {
+      for (const key of Object.keys(input.milestone)) assert.ok(key in msProps, `milestone.${key} is in the schema`);
+      assert.ok(msProps.kind.enum.includes(input.milestone.kind), `milestone.kind ${input.milestone.kind}`);
+    }
+  };
+  assert.equal(tool.coerce({ kind: 'finding', text: 'canonical' }), null, 'canonical input is not rewritten');
+  assert.equal(tool.coerce({ milestone: { kind: 'handoff', summary: 'h' } }), null);
+  const deepFreeze = v => { if (v && typeof v === 'object') { Object.values(v).forEach(deepFreeze); Object.freeze(v); } return v; };
+  for (const [raw, shapeClass] of [
+    [{ kind: 'milestone', text: 't', milestone: { kind: 'verification', summary: 's' } }, 'kind_milestone_dropped'],
+    [{ kind: 'state_change', text: 't' }, 'note_kind_from_milestone_kind'],
+    [{ kind: 'finding', text: 't', milestone: { summary: 's', next_action: 'n' } }, 'milestone_kind_from_note_kind'],
+    [{ kind: 'finding', text: 't', milestone: { kind: 'finding', summary: 's' } }, 'milestone_kind_note_alias'],
+    [{ kind: 'handoff', summary: 'wait', status: 'waiting', meta: { a: 1 }, milestone: { kind: 'handoff', summary: 'x', mood: 'ok' } }, 'extra_fields_to_text'],
+  ]) {
+    const frozen = deepFreeze(structuredClone(raw));
+    const out = tool.coerce(frozen);
+    assert.equal(out.shapeClass, shapeClass);
+    assert.deepEqual(frozen, raw, 'the host input is not mutated');
+    fits(out.input);
+    const saved = await tool.execute(out.input, host);
+    assert.equal(saved.metadata.raw.ok, true, `${shapeClass}: ${saved.metadata.raw.error}`);
+  }
+  const folded = tool.coerce({ kind: 'handoff', summary: 'wait', status: 'waiting', meta: { a: 1 }, milestone: { kind: 'handoff', summary: 'x', mood: 'ok' } });
+  assert.equal(folded.input.text, 'wait\nstatus: waiting\nmeta: {"a":1}\nmilestone.mood: ok');
+  assert.match(folded.note, /no field `status`, `meta`/);
+  assert.match(tool.coerce({ kind: 'state_change', text: 't' }).note, /saved as note kind "finding"/);
+});

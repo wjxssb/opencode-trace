@@ -4,6 +4,7 @@ const schema = (properties, required = []) => ({ type: 'object', properties, req
 import { present, boundedRaw } from './present.js';
 import { normalizeTraceIntentInput } from './normalization.js';
 import { refPattern, callKey } from './util.js';
+import { coerceNoteInput } from './note-validation.js';
 // P1 presentation: content is human Markdown + a fenced machine block (the
 // host persists content and the model reads it — Phase 0 spike); the raw
 // structured value rides in metadata.raw, size-bounded for host delivery.
@@ -22,9 +23,17 @@ const result = async (name, value, trace) => {
   return { title: shown.title, output: content, content, metadata: { opencode_trace: true, title: shown.title, ...retrieval, raw: boundedRaw(value, json) } };
 };
 
+// Host pre-validation repairs (Claude Code's coerceInput), built from the tool's own schema. The
+// host validates every call against `input`; these keep accepted model shapes from being rejected
+// or stripped first.
+const coercers = {
+  trace_note: (raw, input) => coerceNoteInput(raw, Object.keys(input.properties), Object.keys(input.properties.milestone.properties)),
+};
+
 export function definitions(trace) {
   const tool = (name, description, input, fn) => ({ name, description, input, output: { type: 'object', additionalProperties: true },
     options: { codemode: false, permission: name },
+    ...(coercers[name] ? { coerce: raw => coercers[name](raw, input) } : {}),
     async execute(input, host) {
       try {
         await trace.ready;
