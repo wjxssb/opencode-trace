@@ -14,6 +14,12 @@ const keep = (items, item, limit) => [...items.filter(x => x.ref !== item.ref), 
 // derived index. The hint read never replaces the authoritative expand path,
 // which always returns hash-verified bytes from the blob store.
 const HINT_READ_BYTES = 8192, HINT_MAX_STRINGS = 8, HINT_STRING_CAP = 200;
+// A hint must not keep its source alive. A slice or match() result shares the storage of the
+// string it came from (JSC and V8 both do this), so each indexed event pinned its whole payload
+// prefix for the life of the process. Measured 2026-10-02 on a 161k-event workspace under Bun:
+// init peak RSS 2162 -> 844 MB, RSS after GC 1526 -> 689 MB. The JSON round trip copies exactly,
+// lone surrogates included.
+const own = s => JSON.parse(JSON.stringify(s));
 
 function collectStrings(value, out) {
   if (out.length >= HINT_MAX_STRINGS) return;
@@ -172,8 +178,8 @@ export class Store {
         const chunk = Buffer.alloc(Math.min(HINT_READ_BYTES, event.payload.bytes ?? HINT_READ_BYTES));
         const { bytesRead } = await handle.read(chunk, 0, chunk.length, 0);
         const raw = chunk.subarray(0, bytesRead).toString('utf8');
-        try { const parsed = JSON.parse(raw); const out = []; collectStrings(parsed, out); return out; }
-        catch { const out = raw.match(/"([^"\\]{4,120})"/g) ?? []; return out.slice(0, HINT_MAX_STRINGS).map(s => s.slice(1, -1)); }
+        try { const parsed = JSON.parse(raw); const out = []; collectStrings(parsed, out); return out.map(own); }
+        catch { const out = raw.match(/"([^"\\]{4,120})"/g) ?? []; return out.slice(0, HINT_MAX_STRINGS).map(s => own(s.slice(1, -1))); }
       } finally { await handle.close(); }
     } catch (error) { this.warning('index_hints', error); return []; }
   }
