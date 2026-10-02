@@ -33,8 +33,12 @@ export function definitions(trace) {
         // store validation; unknown/expired/foreign handles reject clearly.
         // Optional call keeps test stubs and legacy hosts working unchanged.
         const rawCallKey = callKey({ sessionID: host.sessionID, id: host.id, tool: name, input });
-        const resolvedHandles = await trace.resolveInputHandles?.(input, host.sessionID, name, host, rawCallKey);
-        const value = { ok: true, ...await fn(input, host) };
+        // Normalization rewrites fields (handles -> refs, milestone defaults). The host keeps
+        // tool-call state in immer, which deep-freezes it, so work on a private copy; the raw
+        // input stays the audit record.
+        const own = structuredClone(input);
+        const resolvedHandles = await trace.resolveInputHandles?.(own, host.sessionID, name, host, rawCallKey);
+        const value = { ok: true, ...await fn(own, host) };
         if (resolvedHandles?.length) value.handles_resolved = resolvedHandles;
         // S3 handle-first: a successful write registers its durable ref as a
         // fresh current-generation handle and presents it handle-first

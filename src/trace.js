@@ -643,14 +643,17 @@ export class Trace {
       // below). Production 2026-09-26: {kind: "finding", milestone: {summary, ...}} failed with
       // "invalid milestone.kind: undefined", read as a serialization fault, and the model dropped
       // the milestone fields (next_action, current_state) from its handoff.
-      if (input.milestone.kind === undefined && NOTE_KINDS.includes(input.kind)) {
-        input.milestone = { ...input.milestone, kind: {
-          fact: 'baseline', finding: 'state_change', decision: 'decision', unresolved: 'blocker', correction: 'correction', handoff: 'handoff',
-        }[input.kind] };
-      }
+      // A note kind given as milestone.kind maps the same way. Production 2026-10-01: milestone.kind
+      // "finding" beside top-level kind "finding" cost a local-model retry.
+      const asMilestone = {
+        fact: 'baseline', finding: 'state_change', decision: 'decision', unresolved: 'blocker', correction: 'correction', handoff: 'handoff',
+      };
+      const given = input.milestone.kind;
+      if (given === undefined && NOTE_KINDS.includes(input.kind)) input.milestone = { ...input.milestone, kind: asMilestone[input.kind] };
+      else if (!MILESTONE_KINDS.includes(given) && NOTE_KINDS.includes(given)) input.milestone = { ...input.milestone, kind: asMilestone[given] };
       const ms = input.milestone;
       if (ms.kind === undefined) throw new Error(`trace_note: milestone.kind is required (one of ${MILESTONE_KINDS.join(', ')}), or give a top-level kind`);
-      if (!MILESTONE_KINDS.includes(ms.kind)) throw new Error(`trace_note: invalid milestone.kind: ${ms.kind}`);
+      if (!MILESTONE_KINDS.includes(ms.kind)) throw new Error(`trace_note: invalid milestone.kind: ${ms.kind} (one of ${MILESTONE_KINDS.join(', ')})`);
       const kindMap = {
         decision: 'decision', state_change: 'finding', verification: 'finding',
         blocker: 'unresolved', correction: 'correction', handoff: 'handoff', baseline: 'fact'

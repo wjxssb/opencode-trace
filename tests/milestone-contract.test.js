@@ -99,6 +99,16 @@ test('a milestone without kind takes the top-level note kind; without either it 
   await assert.rejects(() => trace.note({ milestone: { summary: 'no kind anywhere' } }, host()), /milestone\.kind is required/);
 });
 
+test('a note kind given as milestone.kind maps to its milestone kind', async t => {
+  const { trace } = await fixture(t);
+  // Production 2026-10-01 shape: milestone.kind "finding" beside top-level kind "finding".
+  const { note } = await trace.note({ kind: 'finding', text: 'leak fixed', milestone: { kind: 'finding', summary: 'leak fixed' } }, host());
+  assert.equal(note.kind, 'finding');
+  assert.equal(note.milestone.kind, 'state_change');
+  assert.equal((await trace.note({ milestone: { kind: 'unresolved', summary: 'b' } }, host())).note.milestone.kind, 'blocker');
+  await assert.rejects(() => trace.note({ milestone: { kind: 'not_a_kind', summary: 'x' } }, host()), /one of decision, state_change/);
+});
+
 test('P4C-C5: invalid milestone.kind rejected with actionable error (both shapes)', async t => {
   const { trace } = await fixture(t);
   await assert.rejects(

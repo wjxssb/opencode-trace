@@ -189,3 +189,32 @@ test('S4-3: handle pressure is loud and structured when the cap is reached (neve
   assert.match(pressure, /trace_find \/ trace_expand/, 'the trailer directs retrieve-to-cite');
   assert.equal(renderHandlePressure({ handles_truncated: false }), '', 'no noise when the cap is not reached');
 });
+
+// Production 2026-10-01: the host keeps tool-call state in immer, which deep-freezes it, and
+// copies only the top level before execute. Every milestone.evidence_handles citation then failed
+// with "Attempting to define property on object that is not extensible.", as did a milestone
+// without its own summary beside a differing top-level summary.
+test('S3-6: a host-frozen nested input is normalized without writing into it', async t => {
+  const { trace } = await fixture(t);
+  await trace.after({ sessionID: 's1', messageID: 'm1', id: 'c1', agent: 'build',
+    tool: 'shell', input: { command: 'frozen-input-check' }, status: 'completed', result: { output: 'ok' } });
+  const { snapshot } = trace.recallSnapshot('s1');
+  trace.handles.newGeneration('s1', trace.recallSnapshot('s1').assignments);
+  const canonical = snapshot.recent.at(-1).ref;
+  const deepFreeze = value => {
+    if (value && typeof value === 'object') { Object.values(value).forEach(deepFreeze); Object.freeze(value); }
+    return value;
+  };
+  const hostInput = raw => ({ ...deepFreeze(raw) });
+  const cited = hostInput({ kind: 'finding', text: 'body', evidence: ['e1'],
+    milestone: { kind: 'state_change', summary: 'cited', evidence_handles: ['e1'] } });
+  const out = await tool(trace, 'trace_note').execute(cited, host());
+  assert.equal(out.metadata.raw.ok, true, out.metadata.raw.error);
+  assert.deepEqual(out.metadata.raw.note.milestone.evidence_refs, [canonical]);
+  assert.deepEqual(cited.milestone.evidence_handles, ['e1'], 'the host input is left as it was');
+  const summarized = hostInput({ kind: 'finding', text: 'longer body', summary: 'headline',
+    milestone: { kind: 'state_change', what_changed: 'w' } });
+  const second = await tool(trace, 'trace_note').execute(summarized, host());
+  assert.equal(second.metadata.raw.ok, true, second.metadata.raw.error);
+  assert.equal(second.metadata.raw.note.milestone.summary, 'headline');
+});
