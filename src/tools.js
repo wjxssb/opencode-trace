@@ -39,10 +39,11 @@ export function definitions(trace) {
     }
   });
   return [
-    tool('trace_note', 'Save a concise durable decision, constraint, failure cause, blocker/next action, finding, handoff or structured milestone; skip routine logs. Cite evidence and label uncertainty; empty source_refs provides no corroboration. After verified correction/resolution, supersede your old note. Host supplies identity.',
+    tool('trace_note', 'Save a concise durable decision, constraint, failure cause, blocker/next action, finding, handoff or structured milestone; skip routine logs. Cite evidence and label uncertainty; empty source_refs provides no corroboration. After verified correction/resolution, supersede your old note. Host supplies identity. Supply kind and text (summary is a compatibility alias), or milestone.kind and milestone.summary.',
       schema({
         kind: { enum: ['fact', 'finding', 'decision', 'unresolved', 'handoff', 'correction'] },
-        text: { ...str, maxLength: 4096 },
+        text: { ...str, maxLength: 4096, description: 'Note body, at most 4096 UTF-8 bytes.' },
+        summary: { ...str, maxLength: 4096, description: 'Compatibility alias for text. Prefer text; if both are supplied they must match.' },
         source_refs: refs,
         supersedes: { ...refs, description: 'Your prior note refs, verified corrected/resolved. Hides from active recall, preserves history; never close still-open issues.' },
         depends_on: refs,
@@ -56,7 +57,7 @@ export function definitions(trace) {
           evidence_refs: refs,
           unresolved: { type: 'array', items: str, maxItems: 16 },
           next_action: { ...str, maxLength: 2048 },
-          do_not_repeat: { type: 'array', items: str, maxItems: 16 },
+          do_not_repeat: { type: 'array', items: { ...str, maxLength: 256 }, maxItems: 16 },
           supersedes: refs,
           depends_on: refs,
           to_session: { ...str, maxLength: 256, description: 'Explicit target session ID for handoff.' },
@@ -64,7 +65,7 @@ export function definitions(trace) {
           task_ref: { ...str, maxLength: 256, description: 'Shared task ID or plan ID for handoff binding.' },
           handoff_id: { ...str, maxLength: 256, description: 'Shared handoff token or transfer ID.' },
           continuation_of: { ...str, maxLength: 256, description: 'Session ID or note ref this session continues.' }
-        })
+        }, ['kind'])
       }), (i, h) => trace.note(i, h)),
     tool('trace_expand', 'Read exact stored evidence, not current files. metadata_only inspects refs; text_blobs hold tool text, payload_ref the event JSON. Default 2048 bytes, max 24000. Follow next_offset until null; repeated pages add nothing. SHA-256 verifies the whole blob; base64 preserves split byte boundaries.',
       schema({ ref: str, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 24000 }, metadata_only: { type: 'boolean' } }, ['ref']), i => trace.store.expand(i.ref, i.offset, i.limit, i.metadata_only)),

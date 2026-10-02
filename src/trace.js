@@ -5,10 +5,11 @@ import { Store } from './store.js';
 import { atomic, bytes, stable, hash, identity, callKey, locator, mutationPaths, canonical, overlaps, messageID, messageRole, messageContentFingerprint, textFromMessage, refPattern, unwrap } from './util.js';
 import { compactGuidance, compactions, saveCompact } from './compact.js';
 import { normalizeTraceIntentInput } from './normalization.js';
+import { validateNoteInput, isAffirmativeState, hasExplicitFailure } from './note-validation.js';
 
 const NOTE_KINDS = ['fact', 'finding', 'decision', 'unresolved', 'handoff', 'correction'];
 const MILESTONE_KINDS = ['decision', 'state_change', 'verification', 'blocker', 'correction', 'handoff', 'baseline'];
-const STRONG_STATE_REGEX = /\b(verified|pass|fixed|confirmed|production\s+baseline)\b/i;
+const STRONG_STATE_REGEX = /\b(verified|pass|passed|fixed|confirmed|production\s+baseline)\b/i;
 const GENERIC_BAD_DNR = [
   /^(不要|do not|don't)\s*(再|)(运行|run|exec|execute|测试|test|check|investigate|调查|排查)\s*$/i,
   /^(不要|do not|don't)\s*(测试|test)\b/i,
@@ -21,7 +22,7 @@ function sanitizeDoNotRepeat(items) {
   if (!Array.isArray(items)) return [];
   return items
     .map(x => String(x ?? '').trim())
-    .filter(x => x.length > 0 && x.length <= 256)
+    .filter(x => x.length > 0 && [...x].length <= 256)
     .filter(x => !GENERIC_BAD_DNR.some(p => p.test(x)))
     .slice(0, 16);
 }
@@ -30,13 +31,37 @@ function isVerificationCommand(cmd) {
   return /\b(test|check|verify|spec|pytest|cargo\s+test|npm\s+test|node\s+--test|vitest|jest|mocha)\b/i.test(cmd);
 }
 function detectVerificationOutcome(e) {
-  const isErr = e.status === 'error' || Boolean(e.error);
-  const out = String(e.result?.output ?? (e.result?.content ?? []).map(c => c?.text ?? '').join(' '));
+  const isErr = hasExplicitFailure(e);
+  const content = e.result?.content;
+  const out = String(e.result?.output ?? (Array.isArray(content) ? content.map(c => c?.text ?? '').join(' ') : content ?? ''));
   const hasFail = isErr || /\b(FAIL|failed|failing|AssertionError|ERR!|error:)\b/i.test(out);
   const hasPass = /\b(PASS|passed|passing|✔|ok\b|success)\b/i.test(out);
   if (hasFail) return 'FAIL';
   if (hasPass && !isErr) return 'PASS';
   return isErr ? 'FAIL' : 'UNKNOWN';
+}
+function isProjectionCheckpoint(note, index) {
+  // Legacy generated snapshots predate the marker. They summarize other notes
+  // and must not become independent claims which outlive those source notes.
+  const ms = note.milestone;
+  if (ms?.projection_snapshot === true) return true;
+  const source = index?.get(note.ref);
+  const fields = new Set(['kind', 'summary', 'current_state', 'decision', 'unresolved', 'next_action', 'do_not_repeat', 'evidence_refs']);
+  return source?.messageID === null && source?.callID === null
+    && ms?.kind === 'state_change' && typeof ms.current_state === 'string'
+    && Object.keys(ms).every(key => fields.has(key))
+    && (ms.summary === `Compaction checkpoint: ${ms.current_state}`
+      || (ms.current_state === 'CHECKPOINTED' && ms.summary === 'Compaction checkpoint: active state preserved'))
+    && Array.isArray(ms.unresolved) && Array.isArray(ms.do_not_repeat) && Array.isArray(ms.evidence_refs)
+    && note.kind === 'finding' && note.text === ms.summary
+    && stable(note.source_refs) === stable(ms.evidence_refs)
+    && Array.isArray(note.supersedes) && note.supersedes.length === 0
+    && Array.isArray(note.depends_on) && note.depends_on.length === 0;
+}
+function sessionNotes(session) {
+  const notes = new Map();
+  for (const note of [...(session.milestones ?? []), ...(session.notes ?? [])]) notes.set(note.ref, note);
+  return [...notes.values()].sort((a, b) => a.at - b.at || a.ref.localeCompare(b.ref));
 }
 const ACTIVE = new Set(['active', 'waiting']);
 const selectedModel = value => value && typeof value.providerID === 'string' && value.providerID && typeof value.id === 'string' && value.id
@@ -263,7 +288,7 @@ export class Trace {
       milestone: ms
     };
     const event = await this.store.record('trace.note', { sessionID: sid, ...host }, note, { callID: host.id, note });
-    if (s.lastVerification) s.lastVerification.milestone_ref = event.ref;
+    if (s.lastVerification && ms.kind === 'state_change' && !ms.projection_snapshot) s.lastVerification.milestone_ref = event.ref;
     return event;
   }
   async ensureCompactionCheckpoint(sid) {
@@ -278,6 +303,7 @@ export class Trace {
 
     const milestone = {
       kind: 'state_change',
+      projection_snapshot: true,
       summary: `Compaction checkpoint: ${am.current_state ?? 'active state preserved'}`,
       current_state: am.current_state ?? am.verified_state ?? 'CHECKPOINTED',
       decision: am.latest_decisions?.[0],
@@ -312,7 +338,7 @@ export class Trace {
       const outcome = detectVerificationOutcome(e);
       if (outcome !== 'UNKNOWN') {
         const s = this.store.session(e.sessionID);
-        const prev = s.lastVerification;
+        const prev = s.lastVerification?.command === cmd ? s.lastVerification : null;
         s.lastVerification = { outcome, at: event.at, ref: event.ref, command: cmd };
         if (prev?.outcome === 'FAIL' && outcome === 'PASS') {
           await this.autoRecordMilestone(e.sessionID, {
@@ -366,34 +392,51 @@ export class Trace {
     }
     if (!entry) return false;
     if (entry.type === 'tool.after') {
-      return entry.status === 'completed' || entry.status === 'success';
+      if (!['completed', 'success'].includes(entry.status)) return false;
+      try {
+        const ev = await this.store.readEvent(ref);
+        const data = JSON.parse((await this.store.readBlob(ev.payload.ref)).toString());
+        return !hasExplicitFailure(data);
+      } catch { return false; }
     }
     if (entry.type === 'trace.step.result') {
       try {
         const ev = await this.store.readEvent(ref);
         const data = JSON.parse((await this.store.readBlob(ev.payload.ref)).toString());
-        return data?.outcome === 'worker_reported_success' || entry.status === 'completed' || entry.status === 'success';
+        return data?.outcome === 'worker_reported_success';
       } catch {
-        return entry.status === 'completed' || entry.status === 'success';
+        return false;
       }
     }
     return false;
   }
   async note(input, host) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('trace_note: input must be an object');
+    validateNoteInput(input);
+    input = { ...input };
+    if (Object.hasOwn(input, 'summary')) {
+      if (typeof input.summary !== 'string' || !input.summary.trim()) throw new Error('trace_note: summary must be a non-empty string');
+      if (input.text !== undefined && input.text !== input.summary) throw new Error('trace_note: text and summary conflict; supply text only or identical values');
+      if (input.text === undefined) input.text = input.summary;
+      delete input.summary;
+    }
     if (input.milestone) {
       const ms = input.milestone;
-      if (!MILESTONE_KINDS.includes(ms.kind)) throw new Error(`Invalid milestone kind: ${ms.kind}`);
+      if (!MILESTONE_KINDS.includes(ms.kind)) throw new Error(`trace_note: invalid milestone.kind: ${ms.kind}`);
       const kindMap = {
         decision: 'decision', state_change: 'finding', verification: 'finding',
         blocker: 'unresolved', correction: 'correction', handoff: 'handoff', baseline: 'fact'
       };
-      if (!input.kind) input.kind = kindMap[ms.kind] ?? 'finding';
-      if (!input.text && ms.summary) input.text = ms.summary;
+      if (input.kind === undefined) input.kind = kindMap[ms.kind] ?? 'finding';
+      if (input.text === undefined && ms.summary) input.text = ms.summary;
       if (!input.source_refs && ms.evidence_refs) input.source_refs = ms.evidence_refs;
       if (!input.supersedes && ms.supersedes) input.supersedes = ms.supersedes;
       if (!input.depends_on && ms.depends_on) input.depends_on = ms.depends_on;
     }
-    if (!NOTE_KINDS.includes(input.kind) || typeof input.text !== 'string' || !input.text.trim() || bytes(input.text) > 4096 || bytes(input) > 16000) throw new Error('Invalid note schema or size');
+    if (!NOTE_KINDS.includes(input.kind)) throw new Error(`trace_note: kind must be one of ${NOTE_KINDS.join(', ')} (or provide milestone.kind)`);
+    if (typeof input.text !== 'string' || !input.text.trim()) throw new Error('trace_note: text must be a non-empty string; use {kind, text}, {kind, summary}, or {milestone: {kind, summary}}');
+    if (bytes(input.text) > 4096) throw new Error('trace_note: text exceeds 4096 UTF-8 bytes; shorten or split the note');
+    if (bytes(input) > 16000) throw new Error('trace_note: normalized input exceeds 16000 UTF-8 bytes');
     const source_refs = await this.refs(input.source_refs, 'source_refs');
     const supersedes = await this.refs(input.supersedes, 'supersedes');
     const depends_on = await this.refs(input.depends_on, 'depends_on');
@@ -405,7 +448,7 @@ export class Trace {
       const msSupersedes = ms.supersedes ? await this.refs(ms.supersedes, 'milestone.supersedes') : [];
       const msDependsOn = ms.depends_on ? await this.refs(ms.depends_on, 'milestone.depends_on') : [];
 
-      let current_state = ms.current_state ? String(ms.current_state).slice(0, 1024) : undefined;
+      let current_state = ms.current_state || undefined;
       const candidateRefs = [...new Set([...msEvidence, ...source_refs])];
       let hasVerifiedEvidence = false;
       for (const r of candidateRefs) {
@@ -414,7 +457,7 @@ export class Trace {
           break;
         }
       }
-      if (current_state && STRONG_STATE_REGEX.test(current_state)) {
+      if (current_state && STRONG_STATE_REGEX.test(current_state.replace(/_/g, ' '))) {
         if (!hasVerifiedEvidence) {
           current_state = 'CLAIMED / UNVERIFIED';
         }
@@ -422,36 +465,31 @@ export class Trace {
 
       milestone = {
         kind: ms.kind,
-        summary: ms.summary ? String(ms.summary).slice(0, 2048) : input.text,
-        ...(ms.what_changed ? { what_changed: String(ms.what_changed).slice(0, 2048) } : {}),
-        ...(ms.why_it_matters ? { why_it_matters: String(ms.why_it_matters).slice(0, 2048) } : {}),
+        summary: ms.summary || input.text,
+        ...(ms.what_changed ? { what_changed: ms.what_changed } : {}),
+        ...(ms.why_it_matters ? { why_it_matters: ms.why_it_matters } : {}),
         ...(current_state ? { current_state } : {}),
-        ...(ms.decision ? { decision: String(ms.decision).slice(0, 2048) } : {}),
+        ...(ms.decision ? { decision: ms.decision } : {}),
         evidence_refs: candidateRefs,
-        ...(Array.isArray(ms.unresolved) ? { unresolved: ms.unresolved.map(String).slice(0, 16) } : {}),
-        ...(ms.next_action ? { next_action: String(ms.next_action).slice(0, 2048) } : {}),
+        ...(Array.isArray(ms.unresolved) ? { unresolved: [...ms.unresolved] } : {}),
+        ...(ms.next_action ? { next_action: ms.next_action } : {}),
         ...(Array.isArray(ms.do_not_repeat) ? { do_not_repeat: sanitizeDoNotRepeat(ms.do_not_repeat) } : {}),
         supersedes: [...new Set([...msSupersedes, ...supersedes])],
         depends_on: [...new Set([...msDependsOn, ...depends_on])],
-        ...(ms.to_session ? { to_session: String(ms.to_session).slice(0, 256) } : {}),
-        ...(ms.to_worker ? { to_worker: String(ms.to_worker).slice(0, 256) } : {}),
-        ...(ms.task_ref ? { task_ref: String(ms.task_ref).slice(0, 256) } : {}),
-        ...(ms.handoff_id ? { handoff_id: String(ms.handoff_id).slice(0, 256) } : {}),
-        ...(ms.continuation_of ? { continuation_of: String(ms.continuation_of).slice(0, 256) } : {}),
+        ...(ms.to_session ? { to_session: ms.to_session } : {}),
+        ...(ms.to_worker ? { to_worker: ms.to_worker } : {}),
+        ...(ms.task_ref ? { task_ref: ms.task_ref } : {}),
+        ...(ms.handoff_id ? { handoff_id: ms.handoff_id } : {}),
+        ...(ms.continuation_of ? { continuation_of: ms.continuation_of } : {}),
       };
-
-      if (milestone.kind === 'baseline' && host.sessionID) {
-        const s = this.store.session(host.sessionID);
-        const allSessionNotes = (s.milestones ?? []).concat(s.notes ?? []);
-        const priorBaselines = allSessionNotes
-          .filter(n => (n.milestone?.kind === 'baseline' || (n.kind === 'fact' && /baseline/i.test(n.text))) && !supersedes.includes(n.ref))
-          .map(n => n.ref);
-        if (priorBaselines.length) {
-          milestone.supersedes = [...new Set([...milestone.supersedes, ...priorBaselines])];
-        }
-      }
     }
 
+    for (const ref of milestone?.supersedes ?? supersedes) {
+      const prior = await this.store.exists(ref);
+      if (prior.type !== 'trace.note' || prior.host?.sessionID !== host.sessionID) {
+        throw new Error('trace_note: supersedes must reference a note from your own session');
+      }
+    }
     const note = {
       kind: input.kind,
       text: input.text,
@@ -526,12 +564,9 @@ export class Trace {
     return result;
   }
   computeActiveMemory(s) {
-    const rawNotes = (s.milestones ?? []).concat(s.notes ?? []);
-    const noteMap = new Map();
-    for (const n of rawNotes) noteMap.set(n.ref, n);
-    const allNotes = [...noteMap.values()].sort((a, b) => a.at - b.at || a.ref.localeCompare(b.ref));
+    const allNotes = sessionNotes(s);
     const superseded = new Set(allNotes.flatMap(n => (n.supersedes ?? []).concat(n.milestone?.supersedes ?? [])));
-    const activeNotes = allNotes.filter(n => !superseded.has(n.ref));
+    const activeNotes = allNotes.filter(n => !superseded.has(n.ref) && !isProjectionCheckpoint(n, this.store.index));
 
     let goal = s.intent && ACTIVE.has(s.intent.status) ? s.intent.summary : null;
 
@@ -549,9 +584,11 @@ export class Trace {
       const n = activeNotes[i];
       if (n.milestone?.current_state) {
         current_state = current_state ?? clip(n.milestone.current_state, 100);
-        if (/verified|pass/i.test(n.milestone.current_state)) {
+        if (isAffirmativeState(n.milestone.current_state)) {
           verified_state = verified_state ?? `${clip(n.milestone.current_state, 60)}: ${clip(n.milestone.summary ?? n.text, 120)}`;
         }
+        // An older passing state is historical once a newer state is recorded.
+        break;
       }
     }
 
@@ -598,7 +635,7 @@ export class Trace {
       let latestHandoff = null;
       for (const [peerId, peer] of this.store.sessions) {
         if (peerId === s.sessionID) continue;
-        const peerNotes = (peer.milestones ?? []).concat(peer.notes ?? []);
+        const peerNotes = sessionNotes(peer);
         const peerSuperseded = new Set(peerNotes.flatMap(n => (n.supersedes ?? []).concat(n.milestone?.supersedes ?? [])));
         for (const n of peerNotes) {
           if (!peerSuperseded.has(n.ref) && (n.kind === 'handoff' || n.milestone?.kind === 'handoff')) {
@@ -614,9 +651,11 @@ export class Trace {
       if (latestHandoff) {
         const ms = latestHandoff.milestone ?? {};
         if (!goal && (ms.summary || latestHandoff.text)) goal = clip(ms.summary ?? latestHandoff.text, 140);
-        if (!current_state && ms.current_state) current_state = clip(ms.current_state, 100);
-        if (!verified_state && current_state && /verified|pass/i.test(current_state)) {
-          verified_state = `${clip(current_state, 60)}: ${clip(ms.summary ?? latestHandoff.text, 120)}`;
+        if (!current_state && ms.current_state) {
+          current_state = clip(ms.current_state, 100);
+          if (isAffirmativeState(ms.current_state)) {
+            verified_state = `${clip(current_state, 60)}: ${clip(ms.summary ?? latestHandoff.text, 120)}`;
+          }
         }
         if (!next_action && ms.next_action) next_action = clip(ms.next_action, 140);
         if (blockerSet.size === 0 && Array.isArray(ms.unresolved)) {
@@ -657,7 +696,8 @@ export class Trace {
     if (am.handoff_source) lines.push(`• Inherited handoff from ${am.handoff_source.sessionID}: ${clip(am.current_state ?? am.handoff_source.summary, 120)}`);
     if (am.goal) lines.push(`• Goal: ${clip(am.goal, 160)}`);
     if (am.baseline) lines.push(`• Current baseline: ${clip(am.baseline, 160)}`);
-    if (am.verified_state || am.current_state) lines.push(`• Current verified state: ${clip(am.verified_state ?? am.current_state, 160)}`);
+    if (am.current_state) lines.push(`• Current state: ${clip(am.current_state, 160)}`);
+    if (am.verified_state) lines.push(`• Verified state: ${clip(am.verified_state, 160)}`);
     if (am.latest_decisions?.length) lines.push(`• Latest decisions: ${am.latest_decisions.map(d => clip(d, 120)).join('; ')}`);
     if (am.open_blockers?.length) lines.push(`• Open blockers: ${am.open_blockers.map(b => clip(b, 100)).join('; ')}`);
     else lines.push('• Open blockers: (none)');
@@ -668,22 +708,23 @@ export class Trace {
   }
   projection(sid, peerOffset = 0, peerLimit = 8) {
     const s = this.store.session(sid);
-    const superseded = new Set(s.notes.flatMap(n => (n.supersedes ?? []).concat(n.milestone?.supersedes ?? [])));
+    const superseded = new Set(sessionNotes(s).flatMap(n => (n.supersedes ?? []).concat(n.milestone?.supersedes ?? [])));
     const peers = [...this.store.sessions.values()].filter(p => p.sessionID !== sid).sort((a, b) => b.lastActivity - a.lastActivity || a.sessionID.localeCompare(b.sessionID));
-    const retained = s.notes.filter(n => !superseded.has(n.ref));
+    const retained = s.notes.filter(n => !superseded.has(n.ref) && !isProjectionCheckpoint(n, this.store.index));
     const historicalNotes = this.store.findEntriesAll({ type: 'trace.note', session: sid }).length;
     return { schema: 1, workspace: this.store.workspace, sessionID: sid, agent: s.agent ?? null, parentID: s.parentID ?? null,
       active_memory: this.computeActiveMemory(s),
-      current_intent: s.intent, intent_conflicts: (s.intent_conflicts ?? []).slice(-4), observation: observation(s), unresolved: s.notes.filter(n => n.kind === 'unresolved' && !superseded.has(n.ref)).slice(-8),
-      notes: s.notes.filter(n => n.kind !== 'unresolved' && !superseded.has(n.ref)).slice(-8), compact: s.compact,
+      current_intent: s.intent, intent_conflicts: (s.intent_conflicts ?? []).slice(-4), observation: observation(s), unresolved: retained.filter(n => n.kind === 'unresolved').slice(-8),
+      notes: retained.filter(n => n.kind !== 'unresolved').slice(-8), compact: s.compact,
       recent: s.recent.filter(e => e.type === 'tool.after' && !e.tool?.startsWith('trace_')).slice(-8),
       advisories: s.conflicts.slice(-4).map(a => ({ ...a, peer_observations: a.peers.filter(id => id !== sid).map(id => ({ sessionID: id, ...observation(this.store.session(id)) })) })),
       peers: peers.slice(peerOffset, peerOffset + peerLimit).map(p => {
-        const replaced = new Set(p.notes.flatMap(note => (note.supersedes ?? []).concat(note.milestone?.supersedes ?? [])));
-        const current = p.notes.filter(note => !replaced.has(note.ref));
+        const allPeerNotes = sessionNotes(p);
+        const replaced = new Set(allPeerNotes.flatMap(note => (note.supersedes ?? []).concat(note.milestone?.supersedes ?? [])));
+        const current = p.notes.filter(note => !replaced.has(note.ref) && !isProjectionCheckpoint(note, this.store.index));
         const historical = p.notes.filter(note => replaced.has(note.ref));
         let peerHandoff = null;
-        for (const n of (p.milestones ?? p.notes)) {
+        for (const n of allPeerNotes) {
           if (!replaced.has(n.ref) && (n.kind === 'handoff' || n.milestone?.kind === 'handoff')) {
             if (!peerHandoff || n.at > peerHandoff.at) {
               peerHandoff = n;
@@ -1559,7 +1600,7 @@ export class Trace {
     await this.autoRecordMilestone(host.sessionID, {
       kind: input.status === 'success' ? 'verification' : 'blocker',
       summary: summary || `Step ${binding.step}: ${input.status}`,
-      current_state: input.status === 'success' ? 'VERIFIED' : 'FAILED',
+      current_state: input.status === 'success' ? 'WORKER_REPORTED_SUCCESS' : 'WORKER_REPORTED_FAILURE',
       evidence_refs: source_refs
     }, identity(host));
     return { ok: true, plan_id: binding.plan_id, step: binding.step, status: input.status, result_ref: event.ref,

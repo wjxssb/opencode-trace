@@ -156,6 +156,7 @@ export class Store {
       ref: event.ref, at: event.at ?? 0, type: event.type,
       sessionID: event.host?.sessionID ?? null, messageID: event.host?.messageID ?? null, agent: event.host?.agent ?? null,
       tool: event.tool ?? null, status: event.status ?? null, callKey: event.callKey ?? null,
+      callID: event.callID ?? null,
       thread: typeof event.thread_id === 'string' ? event.thread_id : null,
       mailID: typeof event.message_id === 'string' ? event.message_id : null,
       plan: typeof event.plan_id === 'string' ? event.plan_id : null,
@@ -410,7 +411,7 @@ export class Store {
       s.notes = keep(s.notes, noteItem, 64);
       if (!s.milestones) s.milestones = [];
       const isMilestone = Boolean(
-        event.note?.milestone ||
+        event.note?.milestone || event.note?.supersedes?.length ||
         ['decision', 'unresolved', 'baseline', 'handoff', 'correction', 'blocker', 'verification', 'state_change'].includes(event.note?.kind)
       );
       if (isMilestone) {
